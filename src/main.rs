@@ -11,6 +11,11 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // Must run before any `egui::Image` is rendered.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            cc.egui_ctx.style_mut(|s| {
+                for (_, font_id) in s.text_styles.iter_mut() {
+                    font_id.family = egui::FontFamily::Monospace;
+                }
+            });
             Ok(Box::new(TwelfApp::new()))
         }),
     )
