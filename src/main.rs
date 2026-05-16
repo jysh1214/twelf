@@ -16,31 +16,66 @@ fn main() -> eframe::Result {
 }
 
 struct TwelfApp {
-    root: Option<PathBuf>,
-    entries: Vec<String>,
+    root_node: Option<TreeNode>,
     selected_image: Option<PathBuf>,
 }
 
 impl TwelfApp {
     fn new() -> Self {
         Self {
-            root: None,
-            entries: Vec::new(),
+            root_node: None,
             selected_image: None,
         }
     }
 }
 
-fn list_entries(root: &Path) -> Vec<String> {
+struct TreeNode {
+    path: PathBuf,
+    name: String,
+    kind: NodeKind,
+}
+
+enum NodeKind {
+    File,
+    Dir {
+        children: Option<Vec<TreeNode>>,
+    },
+}
+
+impl TreeNode {
+    fn root(path: PathBuf) -> Self {
+        let name = path.display().to_string();
+        Self {
+            path,
+            name,
+            kind: NodeKind::Dir { children: None },
+        }
+    }
+
+    fn child(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = if path.is_dir() {
+            NodeKind::Dir { children: None }
+        } else {
+            NodeKind::File
+        };
+        Self { path, name, kind }
+    }
+}
+
+fn list_children(root: &Path) -> Vec<TreeNode> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = entries
+    let mut nodes: Vec<TreeNode> = entries
         .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .map(|e| TreeNode::child(e.path()))
         .collect();
-    names.sort();
-    names
+    nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    nodes
 }
 
 fn is_image(path: &Path) -> bool {
@@ -53,6 +88,40 @@ fn is_image(path: &Path) -> bool {
     )
 }
 
+fn render_tree(
+    ui: &mut egui::Ui,
+    node: &mut TreeNode,
+    is_root: bool,
+    selected_image: &Option<PathBuf>,
+    new_selection: &mut Option<Option<PathBuf>>,
+) {
+    match &mut node.kind {
+        NodeKind::File => {
+            let is_selected = selected_image.as_ref() == Some(&node.path);
+            if ui.selectable_label(is_selected, &node.name).clicked() {
+                let p = node.path.clone();
+                *new_selection = Some(if is_image(&p) { Some(p) } else { None });
+            }
+        }
+        NodeKind::Dir { children } => {
+            let path = node.path.clone();
+            egui::CollapsingHeader::new(&node.name)
+                .id_salt(&node.path)
+                .default_open(is_root)
+                .show(ui, |ui| {
+                    if children.is_none() {
+                        *children = Some(list_children(&path));
+                    }
+                    if let Some(children) = children {
+                        for child in children {
+                            render_tree(ui, child, false, selected_image, new_selection);
+                        }
+                    }
+                });
+        }
+    }
+}
+
 impl eframe::App for TwelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -60,8 +129,7 @@ impl eframe::App for TwelfApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Folder").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.entries = list_entries(&path);
-                            self.root = Some(path);
+                            self.root_node = Some(TreeNode::root(path));
                             self.selected_image = None;
                         }
                         ui.close();
@@ -70,22 +138,12 @@ impl eframe::App for TwelfApp {
             });
         });
         egui::SidePanel::left("entries").show(ctx, |ui| {
-            if let Some(root) = &self.root {
-                ui.heading(root.display().to_string());
-                ui.separator();
-            }
             // Outer = a click happened; inner = the new selection (Some=show, None=clear).
-            // Deferred to dodge the borrow on `&self.entries`.
+            // Deferred to dodge the borrow on `&mut self.root_node`.
             let mut new_selection: Option<Option<PathBuf>> = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for name in &self.entries {
-                    let full = self.root.as_ref().map(|r| r.join(name));
-                    let is_selected = full.as_deref() == self.selected_image.as_deref();
-                    if ui.selectable_label(is_selected, name).clicked() {
-                        if let Some(p) = full {
-                            new_selection = Some(if is_image(&p) { Some(p) } else { None });
-                        }
-                    }
+                if let Some(root_node) = &mut self.root_node {
+                    render_tree(ui, root_node, true, &self.selected_image, &mut new_selection);
                 }
             });
             if let Some(sel) = new_selection {
