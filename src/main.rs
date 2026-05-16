@@ -77,15 +77,17 @@ impl eframe::App for TwelfApp {
             // Outer = a click happened; inner = the new selection (Some=show, None=clear).
             // Deferred to dodge the borrow on `&self.entries`.
             let mut new_selection: Option<Option<PathBuf>> = None;
-            for name in &self.entries {
-                let full = self.root.as_ref().map(|r| r.join(name));
-                let is_selected = full.as_deref() == self.selected_image.as_deref();
-                if ui.selectable_label(is_selected, name).clicked() {
-                    if let Some(p) = full {
-                        new_selection = Some(if is_image(&p) { Some(p) } else { None });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for name in &self.entries {
+                    let full = self.root.as_ref().map(|r| r.join(name));
+                    let is_selected = full.as_deref() == self.selected_image.as_deref();
+                    if ui.selectable_label(is_selected, name).clicked() {
+                        if let Some(p) = full {
+                            new_selection = Some(if is_image(&p) { Some(p) } else { None });
+                        }
                     }
                 }
-            }
+            });
             if let Some(sel) = new_selection {
                 self.selected_image = sel;
             }
