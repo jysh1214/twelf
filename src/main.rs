@@ -1,4 +1,5 @@
 mod fonts;
+mod heic;
 mod sidebar;
 
 use eframe::egui;
@@ -12,6 +13,8 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // Must run before any `egui::Image` is rendered.
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            cc.egui_ctx
+                .add_image_loader(std::sync::Arc::new(heic::HeicLoader::new()));
             fonts::apply_fonts(&cc.egui_ctx);
             Ok(Box::new(TwelfApp::new()))
         }),
