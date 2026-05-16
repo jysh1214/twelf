@@ -1,3 +1,4 @@
+mod fonts;
 mod sidebar;
 
 use eframe::egui;
@@ -11,33 +12,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // Must run before any `egui::Image` is rendered.
             egui_extras::install_image_loaders(&cc.egui_ctx);
-
-            // Register a CJK-capable mono fallback so Chinese filenames render
-            // instead of tofu. Hack (egui's bundled mono) has no CJK glyphs.
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "noto_mono_cjk_sc".to_owned(),
-                std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-                    "../assets/NotoSansMonoCJKsc-Regular.otf"
-                ))),
-            );
-            fonts
-                .families
-                .get_mut(&egui::FontFamily::Monospace)
-                .unwrap()
-                .push("noto_mono_cjk_sc".to_owned());
-            fonts
-                .families
-                .get_mut(&egui::FontFamily::Proportional)
-                .unwrap()
-                .push("noto_mono_cjk_sc".to_owned());
-            cc.egui_ctx.set_fonts(fonts);
-
-            cc.egui_ctx.style_mut(|s| {
-                for (_, font_id) in s.text_styles.iter_mut() {
-                    font_id.family = egui::FontFamily::Monospace;
-                }
-            });
+            fonts::apply_fonts(&cc.egui_ctx);
             Ok(Box::new(TwelfApp::new()))
         }),
     )
