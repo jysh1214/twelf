@@ -1,6 +1,7 @@
 mod config;
 mod fonts;
 mod heic;
+mod menu_bar;
 mod nav;
 mod remote;
 mod sftp_loader;
@@ -129,38 +130,7 @@ impl eframe::App for TwelfApp {
             self.navigate_image(delta);
         }
 
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Folder").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.root_node = Some(sidebar::TreeNode::root(path));
-                            self.selected_image = None;
-                            self.scroll_target = None;
-                            self.remote_root = None;
-                            self.selected_remote = None;
-                            *self.session_holder.lock().unwrap() = None;
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Connect SSH").clicked() {
-                        self.ssh_dialog.open = true;
-                        ui.close();
-                    }
-                });
-                let status = match &self.ssh {
-                    ssh::SshState::Disconnected => String::new(),
-                    ssh::SshState::Connecting => "Connecting…".to_string(),
-                    ssh::SshState::Connected { info, .. } => {
-                        format!("Connected: {}@{}:{}", info.user, info.host, info.port)
-                    }
-                    ssh::SshState::Failed { error } => format!("SSH error: {error}"),
-                };
-                if !status.is_empty() {
-                    ui.label(status);
-                }
-            });
-        });
+        menu_bar::render(self, ctx);
 
         let mut connect_clicked = false;
         let mut dialog_open = self.ssh_dialog.open;
