@@ -1,3 +1,4 @@
+mod config;
 mod fonts;
 mod heic;
 mod nav;
@@ -55,7 +56,7 @@ impl TwelfApp {
             nav: nav::Navigator::new(),
             ssh: ssh::SshState::Disconnected,
             ssh_rx: None,
-            ssh_dialog: ssh::ConnectDialog::new(),
+            ssh_dialog: ssh::ConnectDialog::from_settings(config::load().ssh),
             remote_root: None,
             selected_remote: None,
             remote_listings_tx,
@@ -189,6 +190,9 @@ impl eframe::App for TwelfApp {
             });
         self.ssh_dialog.open = dialog_open;
         if connect_clicked {
+            config::save(&config::Config {
+                ssh: self.ssh_dialog.to_settings(),
+            });
             let req = ssh::ConnectRequest {
                 host: self.ssh_dialog.host.clone(),
                 port: self.ssh_dialog.port.parse().unwrap_or(22),

@@ -1,3 +1,4 @@
+use crate::config;
 use russh::client::{self, Handler};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 use russh_sftp::client::SftpSession;
@@ -45,14 +46,29 @@ pub struct ConnectDialog {
 }
 
 impl ConnectDialog {
-    pub fn new() -> Self {
+    pub fn from_settings(s: config::SshSettings) -> Self {
+        let port = if s.port.is_empty() {
+            "22".to_string()
+        } else {
+            s.port
+        };
         Self {
             open: false,
-            host: String::new(),
-            port: "22".to_string(),
-            user: String::new(),
-            key_path: String::new(),
-            root: String::new(),
+            host: s.host,
+            port,
+            user: s.user,
+            key_path: s.key_path,
+            root: s.root,
+        }
+    }
+
+    pub fn to_settings(&self) -> config::SshSettings {
+        config::SshSettings {
+            host: self.host.clone(),
+            port: self.port.clone(),
+            user: self.user.clone(),
+            key_path: self.key_path.clone(),
+            root: self.root.clone(),
         }
     }
 }
