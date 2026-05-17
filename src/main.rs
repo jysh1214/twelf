@@ -1,6 +1,7 @@
 mod config;
 mod fonts;
 mod heic;
+mod image_panel;
 mod menu_bar;
 mod nav;
 mod remote;
@@ -134,29 +135,6 @@ impl eframe::App for TwelfApp {
             self.navigate_image(delta);
         }
 
-        let prev_zoom = self.zoom;
-        let prev_displayed = self.last_displayed.clone();
-        let current_displayed = self
-            .selected_remote
-            .clone()
-            .or_else(|| self.selected_image.clone());
-        if current_displayed != self.last_displayed {
-            self.zoom = 1.0;
-            self.last_displayed = current_displayed;
-        }
-        let zoom_scroll = ctx.input(|i| {
-            if i.modifiers.ctrl {
-                i.raw_scroll_delta.y
-            } else {
-                0.0
-            }
-        });
-        if zoom_scroll != 0.0 {
-            self.zoom = (self.zoom * (1.0 + zoom_scroll * 0.01)).clamp(0.1, 10.0);
-        }
-        let recenter_image =
-            (self.zoom - prev_zoom).abs() > f32::EPSILON || self.last_displayed != prev_displayed;
-
         menu_bar::render(self, ctx);
 
         let mut connect_clicked = false;
@@ -264,42 +242,6 @@ impl eframe::App for TwelfApp {
                 }
             }
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let uri = if let Some(path) = &self.selected_remote {
-                Some(format!("sftp://{}", path.display()))
-            } else {
-                self.selected_image
-                    .as_ref()
-                    .map(|path| format!("file://{}", path.display()))
-            };
-            if let Some(uri) = uri {
-                let panel_avail = ui.available_size();
-                let image_size = panel_avail * self.zoom;
-                let content_size = egui::vec2(
-                    image_size.x.max(panel_avail.x),
-                    image_size.y.max(panel_avail.y),
-                );
-                let mut scroll_area = egui::ScrollArea::both();
-                if recenter_image {
-                    scroll_area = scroll_area.scroll_offset(egui::vec2(
-                        (content_size.x - panel_avail.x) * 0.5,
-                        (content_size.y - panel_avail.y) * 0.5,
-                    ));
-                }
-                scroll_area.show(ui, |ui| {
-                    ui.allocate_ui_with_layout(
-                        content_size,
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.add(
-                                egui::Image::new(uri)
-                                    .max_size(image_size)
-                                    .maintain_aspect_ratio(true),
-                            );
-                        },
-                    );
-                });
-            }
-        });
+        image_panel::render(self, ctx);
     }
 }
