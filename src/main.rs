@@ -35,7 +35,7 @@ fn main() -> eframe::Result {
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
-    nav: nav::Navigator,
+    scroll_target: Option<PathBuf>,
     ssh: ssh::SshState,
     ssh_rx: Option<tokio::sync::mpsc::Receiver<ssh::ConnectResult>>,
     ssh_dialog: ssh::ConnectDialog,
@@ -53,7 +53,7 @@ impl TwelfApp {
         Self {
             root_node: None,
             selected_image: None,
-            nav: nav::Navigator::new(),
+            scroll_target: None,
             ssh: ssh::SshState::Disconnected,
             ssh_rx: None,
             ssh_dialog: ssh::ConnectDialog::from_settings(config::load().ssh),
@@ -81,7 +81,8 @@ impl TwelfApp {
             let Some(root) = self.root_node.as_ref() else { return };
             (current, root.collect_images())
         };
-        if let Some(new) = self.nav.navigate(&list, &current, delta) {
+        if let Some(new) = nav::navigate(&list, &current, delta) {
+            self.scroll_target = Some(new.clone());
             if remote_mode {
                 self.selected_remote = Some(new);
             } else {
@@ -106,6 +107,7 @@ impl eframe::App for TwelfApp {
                 Ok((session, info)) => {
                     self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
                     self.selected_remote = None;
+                    self.scroll_target = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     ssh::SshState::Connected { session, info }
                 }
@@ -134,6 +136,7 @@ impl eframe::App for TwelfApp {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.root_node = Some(sidebar::TreeNode::root(path));
                             self.selected_image = None;
+                            self.scroll_target = None;
                             self.remote_root = None;
                             self.selected_remote = None;
                             *self.session_holder.lock().unwrap() = None;
@@ -234,7 +237,6 @@ impl eframe::App for TwelfApp {
                 // Captures the clicked image path — deferred to dodge the borrow
                 // on `&mut self.root_node` taken by `render_tree`.
                 let mut new_selection: Option<PathBuf> = None;
-                let scroll_to_selected = self.nav.take_scroll_flag();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(root_node) = &mut self.root_node {
                         sidebar::render_tree(
@@ -242,7 +244,7 @@ impl eframe::App for TwelfApp {
                             root_node,
                             true,
                             &self.selected_image,
-                            scroll_to_selected,
+                            &mut self.scroll_target,
                             &mut new_selection,
                         );
                     }

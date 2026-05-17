@@ -88,15 +88,16 @@ pub fn render_tree(
     node: &mut TreeNode,
     is_root: bool,
     selected_image: &Option<PathBuf>,
-    scroll_to_selected: bool,
+    scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
 ) {
     match &mut node.kind {
         NodeKind::File => {
             let is_selected = selected_image.as_ref() == Some(&node.path);
             let response = ui.selectable_label(is_selected, &node.name);
-            if is_selected && scroll_to_selected {
+            if scroll_target.as_deref() == Some(node.path.as_path()) {
                 response.scroll_to_me(Some(egui::Align::Center));
+                *scroll_target = None;
             }
             if response.clicked() {
                 *new_selection = Some(node.path.clone());
@@ -104,13 +105,12 @@ pub fn render_tree(
         }
         NodeKind::Dir { children } => {
             let path = node.path.clone();
-            // Force this ancestor folder open this frame so the selected row gets rendered.
-            // egui's `.open(Some(true))` toggles the underlying CollapsingState if needed
+            // Force this ancestor folder open so the selected row gets rendered.
+            // `.open(Some(true))` toggles the underlying CollapsingState if needed
             // and requests a repaint, so the change persists across frames.
-            let force_open = scroll_to_selected
-                && selected_image
-                    .as_ref()
-                    .is_some_and(|sel| sel.starts_with(&node.path));
+            let force_open = scroll_target
+                .as_deref()
+                .is_some_and(|t| t.starts_with(&node.path));
             let mut header = egui::CollapsingHeader::new(&node.name)
                 .id_salt(&node.path)
                 .default_open(is_root);
@@ -118,22 +118,22 @@ pub fn render_tree(
                 header = header.open(Some(true));
             }
             header.show(ui, |ui| {
-                    if children.is_none() {
-                        *children = Some(list_children(&path));
+                if children.is_none() {
+                    *children = Some(list_children(&path));
+                }
+                if let Some(children) = children {
+                    for child in children {
+                        render_tree(
+                            ui,
+                            child,
+                            false,
+                            selected_image,
+                            scroll_target,
+                            new_selection,
+                        );
                     }
-                    if let Some(children) = children {
-                        for child in children {
-                            render_tree(
-                                ui,
-                                child,
-                                false,
-                                selected_image,
-                                scroll_to_selected,
-                                new_selection,
-                            );
-                        }
-                    }
-                });
+                }
+            });
         }
     }
 }
