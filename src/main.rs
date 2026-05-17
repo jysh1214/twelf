@@ -1,6 +1,7 @@
 mod fonts;
 mod heic;
 mod nav;
+mod remote;
 mod sidebar;
 mod ssh;
 
@@ -30,11 +31,16 @@ struct TwelfApp {
     ssh: ssh::SshState,
     ssh_rx: Option<tokio::sync::mpsc::Receiver<ssh::ConnectResult>>,
     ssh_dialog: ssh::ConnectDialog,
+    remote_root: Option<remote::RemoteTreeNode>,
+    selected_remote: Option<PathBuf>,
+    remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
+    remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     runtime: tokio::runtime::Runtime,
 }
 
 impl TwelfApp {
     fn new() -> Self {
+        let (remote_listings_tx, remote_listings_rx) = tokio::sync::mpsc::channel(64);
         Self {
             root_node: None,
             selected_image: None,
@@ -42,6 +48,10 @@ impl TwelfApp {
             ssh: ssh::SshState::Disconnected,
             ssh_rx: None,
             ssh_dialog: ssh::ConnectDialog::new(),
+            remote_root: None,
+            selected_remote: None,
+            remote_listings_tx,
+            remote_listings_rx,
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -60,11 +70,21 @@ impl TwelfApp {
 
 impl eframe::App for TwelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok((path, result)) = self.remote_listings_rx.try_recv() {
+            if let Some(root) = self.remote_root.as_mut() {
+                root.apply_listing(&path, result);
+            }
+        }
+
         if let Some(rx) = self.ssh_rx.as_mut()
             && let Ok(result) = rx.try_recv()
         {
             self.ssh = match result {
-                Ok((session, info)) => ssh::SshState::Connected { session, info },
+                Ok((session, info)) => {
+                    self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
+                    self.selected_remote = None;
+                    ssh::SshState::Connected { session, info }
+                }
                 Err(error) => ssh::SshState::Failed { error },
             };
             self.ssh_rx = None;
@@ -91,6 +111,8 @@ impl eframe::App for TwelfApp {
                             self.root_node = Some(sidebar::TreeNode::root(path));
                             self.selected_image = None;
                             self.nav.invalidate();
+                            self.remote_root = None;
+                            self.selected_remote = None;
                         }
                         ui.close();
                     }
@@ -162,26 +184,45 @@ impl eframe::App for TwelfApp {
                 ctx_clone.request_repaint();
             });
         }
+        let sftp = match &self.ssh {
+            ssh::SshState::Connected { session, .. } => Some(session.clone()),
+            _ => None,
+        };
         egui::SidePanel::left("entries").show(ctx, |ui| {
             ui.set_min_width(ui.available_width());
-            // Captures the clicked image path — deferred to dodge the borrow
-            // on `&mut self.root_node` taken by `render_tree`.
-            let mut new_selection: Option<PathBuf> = None;
-            let scroll_to_selected = self.nav.take_scroll_flag();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(root_node) = &mut self.root_node {
-                    sidebar::render_tree(
+            if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    remote::render_remote_tree(
                         ui,
-                        root_node,
+                        remote_root,
                         true,
-                        &self.selected_image,
-                        scroll_to_selected,
-                        &mut new_selection,
+                        &mut self.selected_remote,
+                        &sftp,
+                        &self.remote_listings_tx,
+                        &self.runtime,
+                        ctx,
                     );
+                });
+            } else {
+                // Captures the clicked image path — deferred to dodge the borrow
+                // on `&mut self.root_node` taken by `render_tree`.
+                let mut new_selection: Option<PathBuf> = None;
+                let scroll_to_selected = self.nav.take_scroll_flag();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(root_node) = &mut self.root_node {
+                        sidebar::render_tree(
+                            ui,
+                            root_node,
+                            true,
+                            &self.selected_image,
+                            scroll_to_selected,
+                            &mut new_selection,
+                        );
+                    }
+                });
+                if let Some(path) = new_selection {
+                    self.selected_image = Some(path);
                 }
-            });
-            if let Some(path) = new_selection {
-                self.selected_image = Some(path);
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {

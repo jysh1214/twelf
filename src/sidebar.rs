@@ -78,7 +78,7 @@ fn collect_images_into(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_image(path: &Path) -> bool {
+pub fn is_image(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
