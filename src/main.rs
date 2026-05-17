@@ -71,7 +71,8 @@ impl TwelfApp {
     fn navigate_image(&mut self, delta: i32) {
         let Some(root) = self.root_node.as_ref() else { return };
         let Some(current) = self.selected_image.clone() else { return };
-        if let Some(new) = self.nav.navigate(root.path(), &current, delta) {
+        let list = root.collect_images();
+        if let Some(new) = self.nav.navigate(&list, &current, delta) {
             self.selected_image = Some(new);
         }
     }
@@ -120,7 +121,6 @@ impl eframe::App for TwelfApp {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.root_node = Some(sidebar::TreeNode::root(path));
                             self.selected_image = None;
-                            self.nav.invalidate();
                             self.remote_root = None;
                             self.selected_remote = None;
                             *self.session_holder.lock().unwrap() = None;

@@ -25,8 +25,24 @@ impl TreeNode {
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Walk the loaded subtree depth-first and collect every image's full path.
+    /// Folders whose children are `None` (not yet expanded) contribute nothing.
+    pub fn collect_images(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.collect_images_into(&mut out);
+        out
+    }
+
+    fn collect_images_into(&self, out: &mut Vec<PathBuf>) {
+        match &self.kind {
+            NodeKind::File => out.push(self.path.clone()),
+            NodeKind::Dir { children: Some(children) } => {
+                for child in children {
+                    child.collect_images_into(out);
+                }
+            }
+            NodeKind::Dir { children: None } => {}
+        }
     }
 
     fn child(path: PathBuf) -> Self {
@@ -55,27 +71,6 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     nodes
-}
-
-pub fn collect_images(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_images_into(root, &mut out);
-    out.sort();
-    out
-}
-
-fn collect_images_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_images_into(&path, out);
-        } else if is_image(&path) {
-            out.push(path);
-        }
-    }
 }
 
 pub fn is_image(path: &Path) -> bool {
