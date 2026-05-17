@@ -2,6 +2,7 @@ mod fonts;
 mod heic;
 mod nav;
 mod sidebar;
+mod ssh;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -26,6 +27,10 @@ struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
     nav: nav::Navigator,
+    ssh: ssh::SshState,
+    ssh_rx: Option<tokio::sync::mpsc::Receiver<ssh::ConnectResult>>,
+    ssh_dialog: ssh::ConnectDialog,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl TwelfApp {
@@ -34,6 +39,13 @@ impl TwelfApp {
             root_node: None,
             selected_image: None,
             nav: nav::Navigator::new(),
+            ssh: ssh::SshState::Disconnected,
+            ssh_rx: None,
+            ssh_dialog: ssh::ConnectDialog::new(),
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime"),
         }
     }
 
@@ -48,6 +60,16 @@ impl TwelfApp {
 
 impl eframe::App for TwelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(rx) = self.ssh_rx.as_mut()
+            && let Ok(result) = rx.try_recv()
+        {
+            self.ssh = match result {
+                Ok((session, info)) => ssh::SshState::Connected { session, info },
+                Err(error) => ssh::SshState::Failed { error },
+            };
+            self.ssh_rx = None;
+        }
+
         let nav_delta = ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
                 Some(-1_i32)
@@ -72,9 +94,74 @@ impl eframe::App for TwelfApp {
                         }
                         ui.close();
                     }
+                    if ui.button("Connect SSH").clicked() {
+                        self.ssh_dialog.open = true;
+                        ui.close();
+                    }
                 });
+                let status = match &self.ssh {
+                    ssh::SshState::Disconnected => String::new(),
+                    ssh::SshState::Connecting => "Connecting…".to_string(),
+                    ssh::SshState::Connected { info, .. } => {
+                        format!("Connected: {}@{}:{}", info.user, info.host, info.port)
+                    }
+                    ssh::SshState::Failed { error } => format!("SSH error: {error}"),
+                };
+                if !status.is_empty() {
+                    ui.label(status);
+                }
             });
         });
+
+        let mut connect_clicked = false;
+        let mut dialog_open = self.ssh_dialog.open;
+        egui::Window::new("Connect SSH")
+            .open(&mut dialog_open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("ssh_dialog_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("HostName:");
+                        ui.text_edit_singleline(&mut self.ssh_dialog.host);
+                        ui.end_row();
+                        ui.label("Port:");
+                        ui.text_edit_singleline(&mut self.ssh_dialog.port);
+                        ui.end_row();
+                        ui.label("User:");
+                        ui.text_edit_singleline(&mut self.ssh_dialog.user);
+                        ui.end_row();
+                        ui.label("SSH Key:");
+                        ui.text_edit_singleline(&mut self.ssh_dialog.key_path);
+                        ui.end_row();
+                        ui.label("Root path:");
+                        ui.text_edit_singleline(&mut self.ssh_dialog.root);
+                        ui.end_row();
+                    });
+                if ui.button("Connect").clicked() {
+                    connect_clicked = true;
+                }
+            });
+        self.ssh_dialog.open = dialog_open;
+        if connect_clicked {
+            let req = ssh::ConnectRequest {
+                host: self.ssh_dialog.host.clone(),
+                port: self.ssh_dialog.port.parse().unwrap_or(22),
+                user: self.ssh_dialog.user.clone(),
+                key_path: self.ssh_dialog.key_path.clone(),
+                root: self.ssh_dialog.root.clone(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.ssh = ssh::SshState::Connecting;
+            self.ssh_rx = Some(rx);
+            self.ssh_dialog.open = false;
+            let ctx_clone = ctx.clone();
+            self.runtime.spawn(async move {
+                let result = ssh::connect(req).await;
+                let _ = tx.send(result).await;
+                ctx_clone.request_repaint();
+            });
+        }
         egui::SidePanel::left("entries").show(ctx, |ui| {
             ui.set_min_width(ui.available_width());
             // Captures the clicked image path — deferred to dodge the borrow
