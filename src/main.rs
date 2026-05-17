@@ -69,11 +69,23 @@ impl TwelfApp {
     }
 
     fn navigate_image(&mut self, delta: i32) {
-        let Some(root) = self.root_node.as_ref() else { return };
-        let Some(current) = self.selected_image.clone() else { return };
-        let list = root.collect_images();
+        let remote_mode = matches!(self.ssh, ssh::SshState::Connected { .. })
+            && self.remote_root.is_some();
+        let (current, list) = if remote_mode {
+            let Some(current) = self.selected_remote.clone() else { return };
+            let Some(root) = self.remote_root.as_ref() else { return };
+            (current, root.collect_images())
+        } else {
+            let Some(current) = self.selected_image.clone() else { return };
+            let Some(root) = self.root_node.as_ref() else { return };
+            (current, root.collect_images())
+        };
         if let Some(new) = self.nav.navigate(&list, &current, delta) {
-            self.selected_image = Some(new);
+            if remote_mode {
+                self.selected_remote = Some(new);
+            } else {
+                self.selected_image = Some(new);
+            }
         }
     }
 }

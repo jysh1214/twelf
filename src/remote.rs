@@ -48,6 +48,28 @@ impl RemoteTreeNode {
         Self { path, name, kind }
     }
 
+    /// Walk the loaded subtree depth-first and collect every image's full path.
+    /// `Unloaded`, `Loading`, or `Error` folders contribute nothing.
+    pub fn collect_images(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.collect_images_into(&mut out);
+        out
+    }
+
+    fn collect_images_into(&self, out: &mut Vec<PathBuf>) {
+        match &self.kind {
+            RemoteNodeKind::File => out.push(self.path.clone()),
+            RemoteNodeKind::Dir {
+                children: RemoteDirChildren::Loaded(children),
+            } => {
+                for child in children {
+                    child.collect_images_into(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn apply_listing(
         &mut self,
         target: &Path,
