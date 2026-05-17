@@ -51,6 +51,7 @@ impl eframe::App for TwelfApp {
             });
         });
         egui::SidePanel::left("entries").show(ctx, |ui| {
+            ui.set_min_width(ui.available_width());
             // Outer = a click happened; inner = the new selection (Some=show, None=clear).
             // Deferred to dodge the borrow on `&mut self.root_node`.
             let mut new_selection: Option<Option<PathBuf>> = None;
