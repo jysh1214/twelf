@@ -9,3 +9,6 @@ egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 libheif-rs = "2.7"
 rfd = "0.17"
+russh = "0.60"
+russh-sftp = "2.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"] }
