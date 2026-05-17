@@ -188,10 +188,22 @@ impl eframe::App for TwelfApp {
             ssh::SshState::Connected { session, .. } => Some(session.clone()),
             _ => None,
         };
-        egui::SidePanel::left("entries").show(ctx, |ui| {
-            ui.set_min_width(ui.available_width());
+        let screen_w = ctx.content_rect().width();
+        egui::SidePanel::left("entries")
+            .min_width(screen_w * 0.10)
+            .max_width(screen_w * 0.50)
+            .show(ctx, |ui| {
+            let panel_w = ui.available_width();
+            ui.set_min_width(panel_w);
+            ui.set_max_width(panel_w);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            let scroll = || {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                scroll().show(ui, |ui| {
                     remote::render_remote_tree(
                         ui,
                         remote_root,
@@ -208,7 +220,7 @@ impl eframe::App for TwelfApp {
                 // Captures the clicked image path — deferred to dodge the borrow
                 // on `&mut self.root_node` taken by `render_tree`.
                 let mut new_selection: Option<PathBuf> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                scroll().show(ui, |ui| {
                     if let Some(root_node) = &mut self.root_node {
                         sidebar::render_tree(
                             ui,
