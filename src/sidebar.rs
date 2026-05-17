@@ -49,7 +49,9 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
     };
     let mut nodes: Vec<TreeNode> = entries
         .filter_map(Result::ok)
-        .map(|e| TreeNode::child(e.path()))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() || is_image(p))
+        .map(TreeNode::child)
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     nodes
@@ -91,14 +93,13 @@ pub fn render_tree(
     node: &mut TreeNode,
     is_root: bool,
     selected_image: &Option<PathBuf>,
-    new_selection: &mut Option<Option<PathBuf>>,
+    new_selection: &mut Option<PathBuf>,
 ) {
     match &mut node.kind {
         NodeKind::File => {
             let is_selected = selected_image.as_ref() == Some(&node.path);
             if ui.selectable_label(is_selected, &node.name).clicked() {
-                let p = node.path.clone();
-                *new_selection = Some(if is_image(&p) { Some(p) } else { None });
+                *new_selection = Some(node.path.clone());
             }
         }
         NodeKind::Dir { children } => {

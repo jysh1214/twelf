@@ -88,9 +88,9 @@ impl eframe::App for TwelfApp {
         });
         egui::SidePanel::left("entries").show(ctx, |ui| {
             ui.set_min_width(ui.available_width());
-            // Outer = a click happened; inner = the new selection (Some=show, None=clear).
-            // Deferred to dodge the borrow on `&mut self.root_node`.
-            let mut new_selection: Option<Option<PathBuf>> = None;
+            // Captures the clicked image path — deferred to dodge the borrow
+            // on `&mut self.root_node` taken by `render_tree`.
+            let mut new_selection: Option<PathBuf> = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(root_node) = &mut self.root_node {
                     sidebar::render_tree(
@@ -102,8 +102,8 @@ impl eframe::App for TwelfApp {
                     );
                 }
             });
-            if let Some(sel) = new_selection {
-                self.selected_image = sel;
+            if let Some(path) = new_selection {
+                self.selected_image = Some(path);
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
