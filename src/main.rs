@@ -1,5 +1,6 @@
 mod fonts;
 mod heic;
+mod nav;
 mod sidebar;
 
 use eframe::egui;
@@ -24,8 +25,7 @@ fn main() -> eframe::Result {
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
-    image_list: Option<Vec<PathBuf>>,
-    scroll_to_selected: bool,
+    nav: nav::Navigator,
 }
 
 impl TwelfApp {
@@ -33,30 +33,16 @@ impl TwelfApp {
         Self {
             root_node: None,
             selected_image: None,
-            image_list: None,
-            scroll_to_selected: false,
+            nav: nav::Navigator::new(),
         }
     }
 
     fn navigate_image(&mut self, delta: i32) {
-        let Some(root_path) = self.root_node.as_ref().map(|n| n.path().to_owned()) else {
-            return;
-        };
+        let Some(root) = self.root_node.as_ref() else { return };
         let Some(current) = self.selected_image.clone() else { return };
-        if self.image_list.is_none() {
-            self.image_list = Some(sidebar::collect_images(&root_path));
+        if let Some(new) = self.nav.navigate(root.path(), &current, delta) {
+            self.selected_image = Some(new);
         }
-        let images = self.image_list.as_ref().unwrap();
-        if images.is_empty() {
-            return;
-        }
-        let Some(idx) = images.iter().position(|p| p == &current) else {
-            return;
-        };
-        let len = images.len() as i32;
-        let new_idx = (idx as i32 + delta).rem_euclid(len) as usize;
-        self.selected_image = Some(images[new_idx].clone());
-        self.scroll_to_selected = true;
     }
 }
 
@@ -82,7 +68,7 @@ impl eframe::App for TwelfApp {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.root_node = Some(sidebar::TreeNode::root(path));
                             self.selected_image = None;
-                            self.image_list = None;
+                            self.nav.invalidate();
                         }
                         ui.close();
                     }
@@ -94,7 +80,7 @@ impl eframe::App for TwelfApp {
             // Captures the clicked image path — deferred to dodge the borrow
             // on `&mut self.root_node` taken by `render_tree`.
             let mut new_selection: Option<PathBuf> = None;
-            let scroll_to_selected = std::mem::replace(&mut self.scroll_to_selected, false);
+            let scroll_to_selected = self.nav.take_scroll_flag();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(root_node) = &mut self.root_node {
                     sidebar::render_tree(
