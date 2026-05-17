@@ -25,6 +25,7 @@ struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
     image_list: Option<Vec<PathBuf>>,
+    scroll_to_selected: bool,
 }
 
 impl TwelfApp {
@@ -33,6 +34,7 @@ impl TwelfApp {
             root_node: None,
             selected_image: None,
             image_list: None,
+            scroll_to_selected: false,
         }
     }
 
@@ -54,6 +56,7 @@ impl TwelfApp {
         let len = images.len() as i32;
         let new_idx = (idx as i32 + delta).rem_euclid(len) as usize;
         self.selected_image = Some(images[new_idx].clone());
+        self.scroll_to_selected = true;
     }
 }
 
@@ -91,6 +94,7 @@ impl eframe::App for TwelfApp {
             // Captures the clicked image path — deferred to dodge the borrow
             // on `&mut self.root_node` taken by `render_tree`.
             let mut new_selection: Option<PathBuf> = None;
+            let scroll_to_selected = std::mem::replace(&mut self.scroll_to_selected, false);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(root_node) = &mut self.root_node {
                     sidebar::render_tree(
@@ -98,6 +102,7 @@ impl eframe::App for TwelfApp {
                         root_node,
                         true,
                         &self.selected_image,
+                        scroll_to_selected,
                         &mut new_selection,
                     );
                 }
