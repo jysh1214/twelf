@@ -72,11 +72,13 @@ impl eframe::App for TwelfApp {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(path) = &self.selected_image {
-                ui.add(
-                    egui::Image::new(format!("file://{}", path.display()))
-                        .max_size(ui.available_size())
-                        .maintain_aspect_ratio(true),
-                );
+                ui.centered_and_justified(|ui| {
+                    ui.add(
+                        egui::Image::new(format!("file://{}", path.display()))
+                            .max_size(ui.available_size())
+                            .maintain_aspect_ratio(true),
+                    );
+                });
             }
         });
     }
