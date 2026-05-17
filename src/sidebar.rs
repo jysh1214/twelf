@@ -25,6 +25,10 @@ impl TreeNode {
         }
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn child(path: PathBuf) -> Self {
         let name = path
             .file_name()
@@ -49,6 +53,27 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     nodes
+}
+
+pub fn collect_images(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_images_into(root, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_images_into(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_images_into(&path, out);
+        } else if is_image(&path) {
+            out.push(path);
+        }
+    }
 }
 
 fn is_image(path: &Path) -> bool {
