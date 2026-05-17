@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dirs = "6"
 eframe = "0.33"
 egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
@@ -11,4 +12,6 @@ libheif-rs = "2.7"
 rfd = "0.17"
 russh = "0.60"
 russh-sftp = "2.1"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"] }
+toml = "1"
