@@ -63,9 +63,9 @@ impl TwelfApp {
 impl eframe::App for TwelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let nav_delta = ctx.input(|i| {
-            if i.key_pressed(egui::Key::ArrowLeft) {
+            if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
                 Some(-1_i32)
-            } else if i.key_pressed(egui::Key::ArrowRight) {
+            } else if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
                 Some(1)
             } else {
                 None
