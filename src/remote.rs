@@ -131,6 +131,7 @@ pub fn render_remote_tree(
     node: &mut RemoteTreeNode,
     is_root: bool,
     selected_remote: &mut Option<PathBuf>,
+    scroll_target: &mut Option<PathBuf>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -139,49 +140,61 @@ pub fn render_remote_tree(
     match &mut node.kind {
         RemoteNodeKind::File => {
             let is_selected = selected_remote.as_deref() == Some(node.path.as_path());
-            if ui.selectable_label(is_selected, &node.name).clicked() {
+            let response = ui.selectable_label(is_selected, &node.name);
+            if scroll_target.as_deref() == Some(node.path.as_path()) {
+                response.scroll_to_me(Some(egui::Align::Center));
+                *scroll_target = None;
+            }
+            if response.clicked() {
                 *selected_remote = Some(node.path.clone());
             }
         }
         RemoteNodeKind::Dir { children } => {
             let path = node.path.clone();
-            egui::CollapsingHeader::new(&node.name)
+            let force_open = scroll_target
+                .as_deref()
+                .is_some_and(|t| t.starts_with(&node.path));
+            let mut header = egui::CollapsingHeader::new(&node.name)
                 .id_salt(&node.path)
-                .default_open(is_root)
-                .show(ui, |ui| match children {
-                    RemoteDirChildren::Unloaded => {
-                        *children = RemoteDirChildren::Loading;
-                        let sftp_clone = sftp.clone();
-                        let tx_clone = tx.clone();
-                        let ctx_clone = ctx.clone();
-                        let path_for_task = path.clone();
-                        runtime.spawn(async move {
-                            let result = list_remote_children(&sftp_clone, &path_for_task).await;
-                            let _ = tx_clone.send((path_for_task, result)).await;
-                            ctx_clone.request_repaint();
-                        });
-                        ui.label(egui::RichText::new("loading…").italics());
+                .default_open(is_root);
+            if force_open {
+                header = header.open(Some(true));
+            }
+            header.show(ui, |ui| match children {
+                RemoteDirChildren::Unloaded => {
+                    *children = RemoteDirChildren::Loading;
+                    let sftp_clone = sftp.clone();
+                    let tx_clone = tx.clone();
+                    let ctx_clone = ctx.clone();
+                    let path_for_task = path.clone();
+                    runtime.spawn(async move {
+                        let result = list_remote_children(&sftp_clone, &path_for_task).await;
+                        let _ = tx_clone.send((path_for_task, result)).await;
+                        ctx_clone.request_repaint();
+                    });
+                    ui.label(egui::RichText::new("loading…").italics());
+                }
+                RemoteDirChildren::Loading => {
+                    ui.label(egui::RichText::new("loading…").italics());
+                }
+                RemoteDirChildren::Loaded(c) => {
+                    for child in c {
+                        render_remote_tree(
+                            ui,
+                            child,
+                            false,
+                            selected_remote,
+                            scroll_target,
+                            sftp,
+                            tx,
+                            runtime,
+                            ctx,
+                        );
                     }
-                    RemoteDirChildren::Loading => {
-                        ui.label(egui::RichText::new("loading…").italics());
-                    }
-                    RemoteDirChildren::Loaded(c) => {
-                        for child in c {
-                            render_remote_tree(
-                                ui,
-                                child,
-                                false,
-                                selected_remote,
-                                sftp,
-                                tx,
-                                runtime,
-                                ctx,
-                            );
-                        }
-                    }
-                    RemoteDirChildren::Error(msg) => {
-                        ui.colored_label(egui::Color32::RED, msg.as_str());
-                    }
+                }
+                RemoteDirChildren::Error(msg) => {
+                    ui.colored_label(egui::Color32::RED, msg.as_str());
+                }
                 });
         }
     }

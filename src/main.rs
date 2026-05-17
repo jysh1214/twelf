@@ -227,6 +227,7 @@ impl eframe::App for TwelfApp {
                         remote_root,
                         true,
                         &mut self.selected_remote,
+                        &mut self.scroll_target,
                         &sftp,
                         &self.remote_listings_tx,
                         &self.runtime,
