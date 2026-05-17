@@ -2,11 +2,13 @@ mod fonts;
 mod heic;
 mod nav;
 mod remote;
+mod sftp_loader;
 mod sidebar;
 mod ssh;
 
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions::default();
@@ -17,9 +19,14 @@ fn main() -> eframe::Result {
             // Must run before any `egui::Image` is rendered.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             cc.egui_ctx
-                .add_image_loader(std::sync::Arc::new(heic::HeicLoader::new()));
+                .add_image_loader(Arc::new(heic::HeicLoader::new()));
             fonts::apply_fonts(&cc.egui_ctx);
-            Ok(Box::new(TwelfApp::new()))
+            let app = TwelfApp::new();
+            cc.egui_ctx.add_bytes_loader(Arc::new(sftp_loader::SftpBytesLoader::new(
+                app.session_holder.clone(),
+                app.runtime.handle().clone(),
+            )));
+            Ok(Box::new(app))
         }),
     )
 }
@@ -35,6 +42,7 @@ struct TwelfApp {
     selected_remote: Option<PathBuf>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
+    session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -52,6 +60,7 @@ impl TwelfApp {
             selected_remote: None,
             remote_listings_tx,
             remote_listings_rx,
+            session_holder: Arc::new(Mutex::new(None)),
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -83,6 +92,7 @@ impl eframe::App for TwelfApp {
                 Ok((session, info)) => {
                     self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
                     self.selected_remote = None;
+                    *self.session_holder.lock().unwrap() = Some(session.clone());
                     ssh::SshState::Connected { session, info }
                 }
                 Err(error) => ssh::SshState::Failed { error },
@@ -113,6 +123,7 @@ impl eframe::App for TwelfApp {
                             self.nav.invalidate();
                             self.remote_root = None;
                             self.selected_remote = None;
+                            *self.session_holder.lock().unwrap() = None;
                         }
                         ui.close();
                     }
@@ -226,10 +237,17 @@ impl eframe::App for TwelfApp {
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(path) = &self.selected_image {
+            let uri = if let Some(path) = &self.selected_remote {
+                Some(format!("sftp://{}", path.display()))
+            } else {
+                self.selected_image
+                    .as_ref()
+                    .map(|path| format!("file://{}", path.display()))
+            };
+            if let Some(uri) = uri {
                 ui.centered_and_justified(|ui| {
                     ui.add(
-                        egui::Image::new(format!("file://{}", path.display()))
+                        egui::Image::new(uri)
                             .max_size(ui.available_size())
                             .maintain_aspect_ratio(true),
                     );
