@@ -10,9 +10,10 @@ egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 libheif-rs = "2.7"
 rfd = "0.17"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 russh = "0.60"
 russh-sftp = "2.1"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"] }
 toml = "1"

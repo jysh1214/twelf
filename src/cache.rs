@@ -1,30 +1,51 @@
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct ImageCache {
-    inner: Option<Inner>,
+    inner: Mutex<Option<Inner>>,
 }
 
 struct Inner {
-    conn: Mutex<Connection>,
+    conn: Connection,
     blobs_dir: PathBuf,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
-        match Self::try_init() {
-            Ok(inner) => Self { inner: Some(inner) },
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    pub fn initialize(&self, ssh_key_path: &Path) {
+        match Self::try_open(ssh_key_path) {
+            Ok(inner) => {
+                if let Ok(mut guard) = self.inner.lock() {
+                    *guard = Some(inner);
+                }
+            }
             Err(e) => {
                 eprintln!("[twelf] image cache disabled: {e}");
-                Self { inner: None }
+                if let Ok(mut guard) = self.inner.lock() {
+                    *guard = None;
+                }
             }
         }
     }
 
-    fn try_init() -> Result<Inner, String> {
+    pub fn is_initialized(&self) -> bool {
+        self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    fn try_open(ssh_key_path: &Path) -> Result<Inner, String> {
+        let key_bytes = fs::read(ssh_key_path)
+            .map_err(|e| format!("failed to read SSH key {}: {e}", ssh_key_path.display()))?;
+        let key_hex = format!("{:x}", Sha256::digest(&key_bytes));
+
         let mut dir = dirs::cache_dir().ok_or_else(|| "no cache dir available".to_string())?;
         dir.push("twelf");
         fs::create_dir_all(&dir)
@@ -33,19 +54,36 @@ impl ImageCache {
         fs::create_dir_all(&blobs_dir)
             .map_err(|e| format!("failed to create {}: {e}", blobs_dir.display()))?;
         let db_path = dir.join("cache.db");
-        let conn = Connection::open(&db_path)
+
+        match Self::open_with_key(&db_path, &key_hex) {
+            Ok(conn) => Ok(Inner { conn, blobs_dir }),
+            Err(_) => {
+                let _ = fs::remove_file(&db_path);
+                if let Ok(iter) = fs::read_dir(&blobs_dir) {
+                    for entry in iter.flatten() {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+                let conn = Self::open_with_key(&db_path, &key_hex)
+                    .map_err(|e| format!("failed to open encrypted cache after wipe: {e}"))?;
+                Ok(Inner { conn, blobs_dir })
+            }
+        }
+    }
+
+    fn open_with_key(db_path: &Path, key_hex: &str) -> Result<Connection, String> {
+        let conn = Connection::open(db_path)
             .map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\""))
+            .map_err(|e| format!("failed to set key: {e}"))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok::<(), rusqlite::Error>(()))
+            .map_err(|e| format!("decryption check failed: {e}"))?;
         let has_legacy_column = conn
             .prepare("SELECT blob_file FROM entries LIMIT 0")
             .is_ok();
         if has_legacy_column {
             conn.execute("DROP TABLE entries", [])
                 .map_err(|e| format!("failed to drop legacy table: {e}"))?;
-            if let Ok(iter) = fs::read_dir(&blobs_dir) {
-                for entry in iter.flatten() {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
         }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS entries (
@@ -56,28 +94,30 @@ impl ImageCache {
             [],
         )
         .map_err(|e| format!("failed to create table: {e}"))?;
-        Ok(Inner {
-            conn: Mutex::new(conn),
-            blobs_dir,
-        })
+        Ok(conn)
     }
 
     pub fn get(&self, uri: &str) -> Option<Vec<u8>> {
-        let inner = self.inner.as_ref()?;
-        let rowid: i64 = {
-            let conn = inner.conn.lock().ok()?;
-            conn.query_row(
-                "SELECT rowid FROM entries WHERE uri = ?1",
-                params![uri],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()?
+        let (rowid, blob_path) = {
+            let guard = self.inner.lock().ok()?;
+            let inner = guard.as_ref()?;
+            let id: i64 = inner
+                .conn
+                .query_row(
+                    "SELECT rowid FROM entries WHERE uri = ?1",
+                    params![uri],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()?;
+            (id, inner.blobs_dir.join(id.to_string()))
         };
-        let bytes = fs::read(inner.blobs_dir.join(rowid.to_string())).ok()?;
-        if let Ok(conn) = inner.conn.lock() {
-            let _ = conn.execute(
+        let bytes = fs::read(&blob_path).ok()?;
+        if let Ok(guard) = self.inner.lock()
+            && let Some(inner) = guard.as_ref()
+        {
+            let _ = inner.conn.execute(
                 "UPDATE entries SET last_accessed = ?1 WHERE rowid = ?2",
                 params![unix_now(), rowid],
             );
@@ -86,22 +126,23 @@ impl ImageCache {
     }
 
     pub fn put(&self, uri: &str, bytes: &[u8]) {
-        let Some(inner) = self.inner.as_ref() else { return };
         let size = bytes.len() as i64;
         let now = unix_now();
 
-        let rowid: i64 = {
-            let Ok(conn) = inner.conn.lock() else { return };
-            let existing = conn
+        let (rowid, blobs_dir) = {
+            let Ok(guard) = self.inner.lock() else { return };
+            let Some(inner) = guard.as_ref() else { return };
+            let existing = inner
+                .conn
                 .query_row(
                     "SELECT rowid FROM entries WHERE uri = ?1",
                     params![uri],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional();
-            match existing {
+            let id = match existing {
                 Ok(Some(id)) => {
-                    if let Err(e) = conn.execute(
+                    if let Err(e) = inner.conn.execute(
                         "UPDATE entries SET byte_size = ?1, last_accessed = ?2 WHERE rowid = ?3",
                         params![size, now, id],
                     ) {
@@ -111,25 +152,26 @@ impl ImageCache {
                     id
                 }
                 Ok(None) => {
-                    if let Err(e) = conn.execute(
+                    if let Err(e) = inner.conn.execute(
                         "INSERT INTO entries (uri, byte_size, last_accessed) VALUES (?1, ?2, ?3)",
                         params![uri, size, now],
                     ) {
                         eprintln!("[twelf] failed to insert cache entry for {uri}: {e}");
                         return;
                     }
-                    conn.last_insert_rowid()
+                    inner.conn.last_insert_rowid()
                 }
                 Err(e) => {
                     eprintln!("[twelf] failed to look up cache entry for {uri}: {e}");
                     return;
                 }
-            }
+            };
+            (id, inner.blobs_dir.clone())
         };
 
         let file_name = rowid.to_string();
-        let final_path = inner.blobs_dir.join(&file_name);
-        let tmp_path = inner.blobs_dir.join(format!("{file_name}.tmp"));
+        let final_path = blobs_dir.join(&file_name);
+        let tmp_path = blobs_dir.join(format!("{file_name}.tmp"));
         if let Err(e) = fs::write(&tmp_path, bytes) {
             eprintln!("[twelf] failed to write {}: {e}", tmp_path.display());
             return;
@@ -141,13 +183,15 @@ impl ImageCache {
     }
 
     pub fn clear(&self) {
-        let Some(inner) = self.inner.as_ref() else { return };
-        if let Ok(conn) = inner.conn.lock()
-            && let Err(e) = conn.execute("DELETE FROM entries", [])
-        {
-            eprintln!("[twelf] failed to clear cache rows: {e}");
-        }
-        if let Ok(iter) = fs::read_dir(&inner.blobs_dir) {
+        let blobs_dir = {
+            let Ok(guard) = self.inner.lock() else { return };
+            let Some(inner) = guard.as_ref() else { return };
+            if let Err(e) = inner.conn.execute("DELETE FROM entries", []) {
+                eprintln!("[twelf] failed to clear cache rows: {e}");
+            }
+            inner.blobs_dir.clone()
+        };
+        if let Ok(iter) = fs::read_dir(&blobs_dir) {
             for entry in iter.flatten() {
                 let _ = fs::remove_file(entry.path());
             }
@@ -155,16 +199,18 @@ impl ImageCache {
     }
 
     pub fn total_size_bytes(&self) -> u64 {
-        let Some(inner) = self.inner.as_ref() else { return 0 };
-        let Ok(conn) = inner.conn.lock() else { return 0 };
-        conn.query_row(
-            "SELECT COALESCE(SUM(byte_size), 0) FROM entries",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .ok()
-        .map(|n| n.max(0) as u64)
-        .unwrap_or(0)
+        let Ok(guard) = self.inner.lock() else { return 0 };
+        let Some(inner) = guard.as_ref() else { return 0 };
+        inner
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(byte_size), 0) FROM entries",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|n| n.max(0) as u64)
+            .unwrap_or(0)
     }
 }
 
