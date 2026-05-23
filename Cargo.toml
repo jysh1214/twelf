@@ -10,6 +10,7 @@ egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 libheif-rs = "2.7"
 rfd = "0.17"
+rusqlite = { version = "0.32", features = ["bundled"] }
 russh = "0.60"
 russh-sftp = "2.1"
 serde = { version = "1", features = ["derive"] }
