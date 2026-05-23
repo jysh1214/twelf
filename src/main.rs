@@ -120,6 +120,7 @@ impl eframe::App for TwelfApp {
                     self.scroll_target = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
+                    ctx.forget_all_images();
                     ssh::SshState::Connected { session, info }
                 }
                 Err(error) => ssh::SshState::Failed { error },

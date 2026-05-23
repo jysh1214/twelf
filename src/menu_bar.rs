@@ -13,6 +13,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;
+                        ctx.forget_all_images();
                     }
                     ui.close();
                 }
