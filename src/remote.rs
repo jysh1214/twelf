@@ -160,7 +160,7 @@ pub fn render_remote_tree(
             if force_open {
                 header = header.open(Some(true));
             }
-            header.show(ui, |ui| match children {
+            let collapsing = header.show(ui, |ui| match children {
                 RemoteDirChildren::Unloaded => {
                     *children = RemoteDirChildren::Loading;
                     let sftp_clone = sftp.clone();
@@ -196,6 +196,22 @@ pub fn render_remote_tree(
                     ui.colored_label(egui::Color32::RED, msg.as_str());
                 }
                 });
+            let children_ref: &RemoteDirChildren = &*children;
+            collapsing.header_response.context_menu(|ui| {
+                if ui.button("Load").clicked() {
+                    if let RemoteDirChildren::Loaded(c) = children_ref {
+                        let mut paths = Vec::new();
+                        for child in c {
+                            child.collect_images_into(&mut paths);
+                        }
+                        for path in paths {
+                            let uri = format!("sftp://{}", path.display());
+                            let _ = ctx.try_load_bytes(&uri);
+                        }
+                    }
+                    ui.close();
+                }
+            });
         }
     }
 }
