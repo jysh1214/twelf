@@ -1,3 +1,4 @@
+use crate::cache::ImageCache;
 use eframe::egui;
 use egui::Context;
 use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
@@ -14,12 +15,14 @@ pub struct SftpBytesLoader {
     session: Arc<Mutex<Option<Arc<SftpSession>>>>,
     handle: tokio::runtime::Handle,
     state: Arc<Mutex<LoaderState>>,
+    disk: Arc<ImageCache>,
 }
 
 impl SftpBytesLoader {
     pub fn new(
         session: Arc<Mutex<Option<Arc<SftpSession>>>>,
         handle: tokio::runtime::Handle,
+        disk: Arc<ImageCache>,
     ) -> Self {
         Self {
             session,
@@ -28,6 +31,7 @@ impl SftpBytesLoader {
                 cache: HashMap::new(),
                 pending: HashSet::new(),
             })),
+            disk,
         }
     }
 }
@@ -54,6 +58,19 @@ impl BytesLoader for SftpBytesLoader {
                 return Ok(BytesPoll::Pending { size: None });
             }
         }
+        if let Some(vec) = self.disk.get(uri) {
+            let bytes: Bytes = vec.into();
+            self.state
+                .lock()
+                .unwrap()
+                .cache
+                .insert(uri.to_string(), bytes.clone());
+            return Ok(BytesPoll::Ready {
+                size: None,
+                bytes,
+                mime: None,
+            });
+        }
         let session_opt = self.session.lock().unwrap().clone();
         let Some(session) = session_opt else {
             return Err(LoadError::Loading("not connected".to_string()));
@@ -61,6 +78,7 @@ impl BytesLoader for SftpBytesLoader {
         let path = path.to_string();
         self.state.lock().unwrap().pending.insert(uri.to_string());
         let state_clone = self.state.clone();
+        let disk_clone = self.disk.clone();
         let uri_owned = uri.to_string();
         let ctx_clone = ctx.clone();
         self.handle.spawn(async move {
@@ -68,6 +86,7 @@ impl BytesLoader for SftpBytesLoader {
             let mut state = state_clone.lock().unwrap();
             state.pending.remove(&uri_owned);
             if let Ok(vec) = result {
+                disk_clone.put(&uri_owned, &vec);
                 state.cache.insert(uri_owned, vec.into());
             }
             drop(state);

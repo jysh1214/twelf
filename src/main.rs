@@ -29,6 +29,7 @@ fn main() -> eframe::Result {
             cc.egui_ctx.add_bytes_loader(Arc::new(sftp_loader::SftpBytesLoader::new(
                 app.session_holder.clone(),
                 app.runtime.handle().clone(),
+                app.cache.clone(),
             )));
             Ok(Box::new(app))
         }),
@@ -50,6 +51,7 @@ struct TwelfApp {
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
     runtime: tokio::runtime::Runtime,
+    cache: Arc<cache::ImageCache>,
 }
 
 impl TwelfApp {
@@ -73,6 +75,7 @@ impl TwelfApp {
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime"),
+            cache: Arc::new(cache::ImageCache::new()),
         }
     }
 
