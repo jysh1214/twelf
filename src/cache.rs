@@ -114,14 +114,25 @@ impl ImageCache {
             (id, inner.blobs_dir.join(id.to_string()))
         };
         let bytes = fs::read(&blob_path).ok()?;
-        if let Ok(guard) = self.inner.lock()
-            && let Some(inner) = guard.as_ref()
-        {
-            let _ = inner.conn.execute(
-                "UPDATE entries SET last_accessed = ?1 WHERE rowid = ?2",
-                params![unix_now(), rowid],
-            );
+        let guard = self.inner.lock().ok()?;
+        let inner = guard.as_ref()?;
+        let current: Option<i64> = inner
+            .conn
+            .query_row(
+                "SELECT rowid FROM entries WHERE uri = ?1",
+                params![uri],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if current != Some(rowid) {
+            return None;
         }
+        let _ = inner.conn.execute(
+            "UPDATE entries SET last_accessed = ?1 WHERE rowid = ?2",
+            params![unix_now(), rowid],
+        );
         Some(bytes)
     }
 
