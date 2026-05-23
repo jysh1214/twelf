@@ -21,6 +21,15 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     ui.close();
                 }
             });
+            ui.menu_button("Cache", |ui| {
+                ui.label(format!("Size: {}", format_bytes(app.cache.total_size_bytes())));
+                ui.separator();
+                if ui.button("Clear Cache").clicked() {
+                    app.cache.clear();
+                    ctx.forget_all_images();
+                    ui.close();
+                }
+            });
             let status = match &app.ssh {
                 ssh::SshState::Disconnected => String::new(),
                 ssh::SshState::Connecting => "Connecting…".to_string(),
@@ -34,4 +43,19 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
             }
         });
     });
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
