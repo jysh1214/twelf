@@ -22,12 +22,16 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                 }
             });
             ui.menu_button("Cache", |ui| {
-                ui.label(format!("Size: {}", format_bytes(app.cache.total_size_bytes())));
-                ui.separator();
-                if ui.button("Clear Cache").clicked() {
-                    app.cache.clear();
-                    ctx.forget_all_images();
-                    ui.close();
+                if app.cache.is_initialized() {
+                    ui.label(format!("Size: {}", format_bytes(app.cache.total_size_bytes())));
+                    ui.separator();
+                    if ui.button("Clear Cache").clicked() {
+                        app.cache.clear();
+                        ctx.forget_all_images();
+                        ui.close();
+                    }
+                } else {
+                    ui.label("Not initialized");
                 }
             });
             let status = match &app.ssh {
