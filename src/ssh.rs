@@ -24,6 +24,7 @@ pub struct ConnInfo {
     pub user: String,
     #[allow(dead_code)]
     pub root: String,
+    pub key_path: String,
 }
 
 pub struct ConnectRequest {
@@ -120,11 +121,12 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
             port: req.port,
             user: req.user,
             root: req.root,
+            key_path: req.key_path,
         },
     ))
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
     {
