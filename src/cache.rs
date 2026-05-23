@@ -140,7 +140,7 @@ impl ImageCache {
         let size = bytes.len() as i64;
         let now = unix_now();
 
-        let (rowid, blobs_dir) = {
+        let (rowid, is_new, blobs_dir) = {
             let Ok(guard) = self.inner.lock() else { return };
             let Some(inner) = guard.as_ref() else { return };
             let existing = inner
@@ -151,45 +151,57 @@ impl ImageCache {
                     |row| row.get::<_, i64>(0),
                 )
                 .optional();
-            let id = match existing {
-                Ok(Some(id)) => {
-                    if let Err(e) = inner.conn.execute(
-                        "UPDATE entries SET byte_size = ?1, last_accessed = ?2 WHERE rowid = ?3",
-                        params![size, now, id],
-                    ) {
-                        eprintln!("[twelf] failed to update cache entry for {uri}: {e}");
-                        return;
-                    }
-                    id
-                }
+            let (id, is_new) = match existing {
+                Ok(Some(id)) => (id, false),
                 Ok(None) => {
                     if let Err(e) = inner.conn.execute(
-                        "INSERT INTO entries (uri, byte_size, last_accessed) VALUES (?1, ?2, ?3)",
-                        params![uri, size, now],
+                        "INSERT INTO entries (uri, byte_size, last_accessed) VALUES (?1, 0, ?2)",
+                        params![uri, now],
                     ) {
-                        eprintln!("[twelf] failed to insert cache entry for {uri}: {e}");
+                        eprintln!("[twelf] failed to insert placeholder for {uri}: {e}");
                         return;
                     }
-                    inner.conn.last_insert_rowid()
+                    (inner.conn.last_insert_rowid(), true)
                 }
                 Err(e) => {
                     eprintln!("[twelf] failed to look up cache entry for {uri}: {e}");
                     return;
                 }
             };
-            (id, inner.blobs_dir.clone())
+            (id, is_new, inner.blobs_dir.clone())
         };
 
         let file_name = rowid.to_string();
         let final_path = blobs_dir.join(&file_name);
         let tmp_path = blobs_dir.join(format!("{file_name}.tmp"));
-        if let Err(e) = fs::write(&tmp_path, bytes) {
-            eprintln!("[twelf] failed to write {}: {e}", tmp_path.display());
-            return;
-        }
-        if let Err(e) = fs::rename(&tmp_path, &final_path) {
-            eprintln!("[twelf] failed to finalize {}: {e}", final_path.display());
-            let _ = fs::remove_file(&tmp_path);
+        let blob_ok = match fs::write(&tmp_path, bytes) {
+            Ok(()) => match fs::rename(&tmp_path, &final_path) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[twelf] failed to finalize {}: {e}", final_path.display());
+                    let _ = fs::remove_file(&tmp_path);
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("[twelf] failed to write {}: {e}", tmp_path.display());
+                false
+            }
+        };
+
+        if let Ok(guard) = self.inner.lock()
+            && let Some(inner) = guard.as_ref()
+        {
+            if blob_ok {
+                let _ = inner.conn.execute(
+                    "UPDATE entries SET byte_size = ?1, last_accessed = ?2 WHERE rowid = ?3",
+                    params![size, now, rowid],
+                );
+            } else if is_new {
+                let _ = inner
+                    .conn
+                    .execute("DELETE FROM entries WHERE rowid = ?1", params![rowid]);
+            }
         }
     }
 
