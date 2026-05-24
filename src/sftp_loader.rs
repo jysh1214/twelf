@@ -143,3 +143,61 @@ impl BytesLoader for SftpBytesLoader {
         !self.state.lock().unwrap().pending.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui;
+
+    fn make_loader() -> (SftpBytesLoader, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let loader = SftpBytesLoader::new(
+            Arc::new(Mutex::new(None)),
+            rt.handle().clone(),
+            Arc::new(ImageCache::new()),
+        );
+        (loader, rt)
+    }
+
+    #[test]
+    fn backed_off_uri_errors_without_spawning() {
+        let (loader, _rt) = make_loader();
+        let uri = "sftp://host/a.jpg";
+        loader
+            .state
+            .lock()
+            .unwrap()
+            .failed
+            .insert(uri.to_string(), Instant::now());
+        let ctx = egui::Context::default();
+        assert!(loader.load(&ctx, uri).is_err());
+        assert!(loader.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn forget_clears_failed_entry() {
+        let (loader, _rt) = make_loader();
+        let uri = "sftp://host/a.jpg";
+        loader
+            .state
+            .lock()
+            .unwrap()
+            .failed
+            .insert(uri.to_string(), Instant::now());
+        loader.forget(uri);
+        assert!(!loader.state.lock().unwrap().failed.contains_key(uri));
+    }
+
+    #[test]
+    fn forget_all_clears_failed() {
+        let (loader, _rt) = make_loader();
+        loader
+            .state
+            .lock()
+            .unwrap()
+            .failed
+            .insert("sftp://host/a.jpg".to_string(), Instant::now());
+        loader.forget_all();
+        assert!(loader.state.lock().unwrap().failed.is_empty());
+    }
+}
