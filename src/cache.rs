@@ -78,17 +78,17 @@ impl ImageCache {
             .map_err(|e| format!("failed to set key: {e}"))?;
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok::<(), rusqlite::Error>(()))
             .map_err(|e| format!("decryption check failed: {e}"))?;
-        let has_legacy_column = conn
-            .prepare("SELECT blob_file FROM entries LIMIT 0")
-            .is_ok();
-        if has_legacy_column {
+        let entries_exists = conn.prepare("SELECT 1 FROM entries LIMIT 0").is_ok();
+        let has_fingerprint = conn.prepare("SELECT mtime FROM entries LIMIT 0").is_ok();
+        if entries_exists && !has_fingerprint {
             conn.execute("DROP TABLE entries", [])
-                .map_err(|e| format!("failed to drop legacy table: {e}"))?;
+                .map_err(|e| format!("failed to drop outdated table: {e}"))?;
         }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS entries (
                 uri TEXT PRIMARY KEY,
                 byte_size INTEGER NOT NULL,
+                mtime INTEGER,
                 last_accessed INTEGER NOT NULL
             )",
             [],
@@ -136,7 +136,7 @@ impl ImageCache {
         Some(bytes)
     }
 
-    pub fn put(&self, uri: &str, bytes: &[u8]) {
+    pub fn put(&self, uri: &str, bytes: &[u8], mtime: Option<i64>) {
         let size = bytes.len() as i64;
         let now = unix_now();
 
@@ -194,8 +194,8 @@ impl ImageCache {
         {
             if blob_ok {
                 let _ = inner.conn.execute(
-                    "UPDATE entries SET byte_size = ?1, last_accessed = ?2 WHERE rowid = ?3",
-                    params![size, now, rowid],
+                    "UPDATE entries SET byte_size = ?1, mtime = ?2, last_accessed = ?3 WHERE rowid = ?4",
+                    params![size, mtime, now, rowid],
                 );
             } else if is_new {
                 let _ = inner

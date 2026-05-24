@@ -86,7 +86,7 @@ impl BytesLoader for SftpBytesLoader {
             let mut state = state_clone.lock().unwrap();
             state.pending.remove(&uri_owned);
             if let Ok(vec) = result {
-                disk_clone.put(&uri_owned, &vec);
+                disk_clone.put(&uri_owned, &vec, None);
                 state.cache.insert(uri_owned, vec.into());
             }
             drop(state);
