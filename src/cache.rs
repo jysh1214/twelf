@@ -267,3 +267,50 @@ fn unix_now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn fresh_cache() -> (ImageCache, tempfile::TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let cache = ImageCache::new();
+        cache.initialize_at(dir.path(), b"test-key");
+        (cache, dir)
+    }
+
+    #[test]
+    fn matching_fingerprint_returns_bytes() {
+        let (cache, _dir) = fresh_cache();
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        assert_eq!(
+            cache.get("sftp://host/a.jpg", Some(100), Some(5)),
+            Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn changed_mtime_is_a_miss() {
+        let (cache, _dir) = fresh_cache();
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        assert_eq!(cache.get("sftp://host/a.jpg", Some(200), Some(5)), None);
+    }
+
+    #[test]
+    fn changed_size_is_a_miss() {
+        let (cache, _dir) = fresh_cache();
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        assert_eq!(cache.get("sftp://host/a.jpg", Some(100), Some(4)), None);
+    }
+
+    #[test]
+    fn absent_mtime_falls_back_to_size_match() {
+        let (cache, _dir) = fresh_cache();
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        assert_eq!(
+            cache.get("sftp://host/a.jpg", None, Some(5)),
+            Some(b"hello".to_vec())
+        );
+    }
+}

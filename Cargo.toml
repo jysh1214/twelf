@@ -17,3 +17,6 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"] }
 toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
