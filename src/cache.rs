@@ -130,8 +130,8 @@ impl ImageCache {
             if size.is_some_and(|s| s != stored_size) {
                 return None;
             }
-            if let (Some(m), Some(sm)) = (mtime, stored_mtime)
-                && m != sm
+            if let Some(m) = mtime
+                && stored_mtime != Some(m)
             {
                 return None;
             }
