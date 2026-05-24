@@ -27,7 +27,11 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
 
     egui::CentralPanel::default().show(ctx, |ui| {
         let uri = if let Some(path) = &app.selected_remote {
-            Some(format!("sftp://{}", path.display()))
+            let host = match &app.ssh {
+                crate::ssh::SshState::Connected { info, .. } => info.host.as_str(),
+                _ => "",
+            };
+            Some(format!("sftp://{host}{}", path.display()))
         } else {
             app.selected_image
                 .as_ref()

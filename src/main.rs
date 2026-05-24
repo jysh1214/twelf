@@ -199,6 +199,10 @@ impl eframe::App for TwelfApp {
             ssh::SshState::Connected { session, .. } => Some(session.clone()),
             _ => None,
         };
+        let remote_host = match &self.ssh {
+            ssh::SshState::Connected { info, .. } => info.host.clone(),
+            _ => String::new(),
+        };
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -219,6 +223,7 @@ impl eframe::App for TwelfApp {
                         ui,
                         remote_root,
                         true,
+                        &remote_host,
                         &mut self.selected_remote,
                         &mut self.scroll_target,
                         &sftp,

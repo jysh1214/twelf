@@ -42,9 +42,14 @@ impl BytesLoader for SftpBytesLoader {
     }
 
     fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult {
-        let Some(path) = uri.strip_prefix("sftp://") else {
+        let Some(rest) = uri.strip_prefix("sftp://") else {
             return Err(LoadError::NotSupported);
         };
+        // URIs are `sftp://{host}{absolute_path}`; recover the path after the host.
+        let Some(slash) = rest.find('/') else {
+            return Err(LoadError::NotSupported);
+        };
+        let path = &rest[slash..];
         {
             let state = self.state.lock().unwrap();
             if let Some(bytes) = state.cache.get(uri).cloned() {

@@ -130,6 +130,7 @@ pub fn render_remote_tree(
     ui: &mut egui::Ui,
     node: &mut RemoteTreeNode,
     is_root: bool,
+    host: &str,
     selected_remote: &mut Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     sftp: &Arc<SftpSession>,
@@ -183,6 +184,7 @@ pub fn render_remote_tree(
                             ui,
                             child,
                             false,
+                            host,
                             selected_remote,
                             scroll_target,
                             sftp,
@@ -205,7 +207,7 @@ pub fn render_remote_tree(
                             child.collect_images_into(&mut paths);
                         }
                         for path in paths {
-                            let uri = format!("sftp://{}", path.display());
+                            let uri = format!("sftp://{host}{}", path.display());
                             let _ = ctx.try_load_bytes(&uri);
                         }
                     }
