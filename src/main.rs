@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod decoded;
 mod fonts;
 mod heic;
 mod image_panel;
@@ -11,6 +12,7 @@ mod sidebar;
 mod ssh;
 
 use eframe::egui;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +32,11 @@ fn main() -> eframe::Result {
                 app.session_holder.clone(),
                 app.runtime.handle().clone(),
                 app.cache.clone(),
+            )));
+            // Registered after the others so egui's reverse-order lookup tries it
+            // first for sftp:// images (decoded off-thread); it defers everything else.
+            cc.egui_ctx.add_image_loader(Arc::new(decoded::DecodedImageLoader::new(
+                app.runtime.handle().clone(),
             )));
             Ok(Box::new(app))
         }),
@@ -52,6 +59,7 @@ struct TwelfApp {
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
     runtime: tokio::runtime::Runtime,
     cache: Arc<cache::ImageCache>,
+    image_prefetch: VecDeque<String>,
 }
 
 impl TwelfApp {
@@ -76,6 +84,27 @@ impl TwelfApp {
                 .build()
                 .expect("failed to build tokio runtime"),
             cache: Arc::new(cache::ImageCache::new()),
+            image_prefetch: VecDeque::new(),
+        }
+    }
+
+    /// Re-poll queued prefetch URIs each frame, driving the bytes→decode
+    /// pipeline to completion for off-screen images. A one-shot poll wouldn't
+    /// work: the byte fetch is still in flight on the first call.
+    fn drain_image_prefetch(&mut self, ctx: &egui::Context) {
+        if self.image_prefetch.is_empty() {
+            return;
+        }
+        let mut remaining = VecDeque::with_capacity(self.image_prefetch.len());
+        while let Some(uri) = self.image_prefetch.pop_front() {
+            match ctx.try_load_image(&uri, egui::load::SizeHint::default()) {
+                Ok(egui::load::ImagePoll::Pending { .. }) => remaining.push_back(uri),
+                _ => {} // Ready (decoded + cached) or Err (give up) — drop it
+            }
+        }
+        self.image_prefetch = remaining;
+        if !self.image_prefetch.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -127,6 +156,8 @@ impl eframe::App for TwelfApp {
             };
             self.ssh_rx = None;
         }
+
+        self.drain_image_prefetch(ctx);
 
         let nav_delta = ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
@@ -226,6 +257,7 @@ impl eframe::App for TwelfApp {
                         &remote_host,
                         &mut self.selected_remote,
                         &mut self.scroll_target,
+                        &mut self.image_prefetch,
                         &sftp,
                         &self.remote_listings_tx,
                         &self.runtime,

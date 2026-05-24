@@ -1,6 +1,7 @@
 use crate::sidebar;
 use eframe::egui;
 use russh_sftp::client::SftpSession;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -133,6 +134,7 @@ pub fn render_remote_tree(
     host: &str,
     selected_remote: &mut Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
+    prefetch: &mut VecDeque<String>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -187,6 +189,7 @@ pub fn render_remote_tree(
                             host,
                             selected_remote,
                             scroll_target,
+                            prefetch,
                             sftp,
                             tx,
                             runtime,
@@ -207,8 +210,7 @@ pub fn render_remote_tree(
                             child.collect_images_into(&mut paths);
                         }
                         for path in paths {
-                            let uri = format!("sftp://{host}{}", path.display());
-                            let _ = ctx.try_load_bytes(&uri);
+                            prefetch.push_back(format!("sftp://{host}{}", path.display()));
                         }
                     }
                     ui.close();
