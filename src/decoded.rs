@@ -1,7 +1,6 @@
 use eframe::egui;
 use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::{ColorImage, Context};
-use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -192,9 +191,8 @@ impl ImageLoader for DecodedImageLoader {
 }
 
 fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
-    let lower = uri.to_ascii_lowercase();
-    if lower.ends_with(".heic") || lower.ends_with(".heif") {
-        decode_heic_bytes(bytes).map_err(|e| e.to_string())
+    if crate::heic::is_heic(uri) {
+        crate::heic::decode_bytes(bytes).map_err(|e| e.to_string())
     } else {
         let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
         let rgba = img.to_rgba8();
@@ -204,27 +202,6 @@ fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
             rgba.as_raw(),
         ))
     }
-}
-
-fn decode_heic_bytes(bytes: &[u8]) -> Result<ColorImage, libheif_rs::HeifError> {
-    let lib = LibHeif::new();
-    let ctx = HeifContext::read_from_bytes(bytes)?;
-    let handle = ctx.primary_image_handle()?;
-    let image = lib.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)?;
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let planes = image.planes();
-    let plane = planes
-        .interleaved
-        .expect("RGBA decode should produce an interleaved plane");
-    let stride = plane.stride;
-    let row_bytes = width * 4;
-    let mut pixels = Vec::with_capacity(width * height * 4);
-    for y in 0..height {
-        let start = y * stride;
-        pixels.extend_from_slice(&plane.data[start..start + row_bytes]);
-    }
-    Ok(ColorImage::from_rgba_unmultiplied([width, height], &pixels))
 }
 
 #[cfg(test)]

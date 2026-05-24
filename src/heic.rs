@@ -23,8 +23,7 @@ impl ImageLoader for HeicLoader {
     }
 
     fn load(&self, _ctx: &Context, uri: &str, _size_hint: SizeHint) -> ImageLoadResult {
-        let lower = uri.to_ascii_lowercase();
-        if !(lower.ends_with(".heic") || lower.ends_with(".heif")) {
+        if !is_heic(uri) {
             return Err(LoadError::NotSupported);
         }
         if let Some(cached) = self.cache.lock().unwrap().get(uri).cloned() {
@@ -55,9 +54,23 @@ impl ImageLoader for HeicLoader {
     }
 }
 
+pub fn is_heic(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    lower.ends_with(".heic") || lower.ends_with(".heif")
+}
+
 fn decode_heic(path: &str) -> Result<ColorImage, libheif_rs::HeifError> {
-    let lib = LibHeif::new();
     let ctx = HeifContext::read_from_file(path)?;
+    heif_to_image(&ctx)
+}
+
+pub fn decode_bytes(bytes: &[u8]) -> Result<ColorImage, libheif_rs::HeifError> {
+    let ctx = HeifContext::read_from_bytes(bytes)?;
+    heif_to_image(&ctx)
+}
+
+fn heif_to_image(ctx: &HeifContext) -> Result<ColorImage, libheif_rs::HeifError> {
+    let lib = LibHeif::new();
     let handle = ctx.primary_image_handle()?;
     let image = lib.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)?;
     let width = image.width() as usize;
