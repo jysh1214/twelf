@@ -5,10 +5,14 @@ use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
 use russh_sftp::client::SftpSession;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 struct LoaderState {
     cache: HashMap<String, Bytes>,
     pending: HashSet<String>,
+    failed: HashMap<String, Instant>,
 }
 
 pub struct SftpBytesLoader {
@@ -30,6 +34,7 @@ impl SftpBytesLoader {
             state: Arc::new(Mutex::new(LoaderState {
                 cache: HashMap::new(),
                 pending: HashSet::new(),
+                failed: HashMap::new(),
             })),
             disk,
         }
@@ -62,6 +67,11 @@ impl BytesLoader for SftpBytesLoader {
             if state.pending.contains(uri) {
                 return Ok(BytesPoll::Pending { size: None });
             }
+            if let Some(failed_at) = state.failed.get(uri)
+                && failed_at.elapsed() < RETRY_BACKOFF
+            {
+                return Err(LoadError::Loading("previous load failed".to_string()));
+            }
         }
         let session_opt = self.session.lock().unwrap().clone();
         let Some(session) = session_opt else {
@@ -92,8 +102,14 @@ impl BytesLoader for SftpBytesLoader {
             };
             let mut state = state_clone.lock().unwrap();
             state.pending.remove(&uri_owned);
-            if let Some(vec) = bytes {
-                state.cache.insert(uri_owned, vec.into());
+            match bytes {
+                Some(vec) => {
+                    state.failed.remove(&uri_owned);
+                    state.cache.insert(uri_owned, vec.into());
+                }
+                None => {
+                    state.failed.insert(uri_owned, Instant::now());
+                }
             }
             drop(state);
             ctx_clone.request_repaint();
@@ -102,11 +118,15 @@ impl BytesLoader for SftpBytesLoader {
     }
 
     fn forget(&self, uri: &str) {
-        self.state.lock().unwrap().cache.remove(uri);
+        let mut state = self.state.lock().unwrap();
+        state.cache.remove(uri);
+        state.failed.remove(uri);
     }
 
     fn forget_all(&self) {
-        self.state.lock().unwrap().cache.clear();
+        let mut state = self.state.lock().unwrap();
+        state.cache.clear();
+        state.failed.clear();
     }
 
     fn byte_size(&self) -> usize {
