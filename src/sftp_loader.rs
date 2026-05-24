@@ -63,19 +63,6 @@ impl BytesLoader for SftpBytesLoader {
                 return Ok(BytesPoll::Pending { size: None });
             }
         }
-        if let Some(vec) = self.disk.get(uri, None, None) {
-            let bytes: Bytes = vec.into();
-            self.state
-                .lock()
-                .unwrap()
-                .cache
-                .insert(uri.to_string(), bytes.clone());
-            return Ok(BytesPoll::Ready {
-                size: None,
-                bytes,
-                mime: None,
-            });
-        }
         let session_opt = self.session.lock().unwrap().clone();
         let Some(session) = session_opt else {
             return Err(LoadError::Loading("not connected".to_string()));
@@ -87,11 +74,25 @@ impl BytesLoader for SftpBytesLoader {
         let uri_owned = uri.to_string();
         let ctx_clone = ctx.clone();
         self.handle.spawn(async move {
-            let result = session.read(path).await;
+            // Fingerprint the remote file so a cached blob is reused only when its
+            // size+mtime still match. A failed stat yields None/None, which degrades
+            // to serving the cached blob (if any) and otherwise reading fresh.
+            let meta = session.metadata(path.clone()).await.ok();
+            let mtime = meta.as_ref().and_then(|m| m.mtime).map(|t| t as i64);
+            let size = meta.as_ref().and_then(|m| m.size).map(|s| s as i64);
+            let bytes = match disk_clone.get(&uri_owned, mtime, size) {
+                Some(vec) => Some(vec),
+                None => match session.read(path).await {
+                    Ok(vec) => {
+                        disk_clone.put(&uri_owned, &vec, mtime);
+                        Some(vec)
+                    }
+                    Err(_) => None,
+                },
+            };
             let mut state = state_clone.lock().unwrap();
             state.pending.remove(&uri_owned);
-            if let Ok(vec) = result {
-                disk_clone.put(&uri_owned, &vec, None);
+            if let Some(vec) = bytes {
                 state.cache.insert(uri_owned, vec.into());
             }
             drop(state);
