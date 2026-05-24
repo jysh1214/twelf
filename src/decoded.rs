@@ -1,9 +1,10 @@
 use eframe::egui;
 use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
+use crate::backoff::BackOff;
 use egui::{ColorImage, Context};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DECODED_CACHE_CAP: usize = 512 * 1024 * 1024;
 const DECODE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -94,7 +95,7 @@ impl DecodedCache {
 struct LoaderState {
     cache: DecodedCache,
     pending: HashSet<String>,
-    failed: HashMap<String, Instant>,
+    failed: BackOff,
 }
 
 /// Decodes remote (`sftp://`) images off the UI thread into a bounded cache.
@@ -112,7 +113,7 @@ impl DecodedImageLoader {
             state: Arc::new(Mutex::new(LoaderState {
                 cache: DecodedCache::new(),
                 pending: HashSet::new(),
-                failed: HashMap::new(),
+                failed: BackOff::new(DECODE_RETRY_BACKOFF),
             })),
         }
     }
@@ -135,9 +136,7 @@ impl ImageLoader for DecodedImageLoader {
             if state.pending.contains(uri) {
                 return Ok(ImagePoll::Pending { size: None });
             }
-            if let Some(failed_at) = state.failed.get(uri)
-                && failed_at.elapsed() < DECODE_RETRY_BACKOFF
-            {
+            if state.failed.is_backed_off(uri) {
                 return Err(LoadError::Loading("previous decode failed".to_string()));
             }
         }
@@ -157,12 +156,12 @@ impl ImageLoader for DecodedImageLoader {
             state.pending.remove(&uri_owned);
             match decoded {
                 Ok(image) => {
-                    state.failed.remove(&uri_owned);
+                    state.failed.clear(&uri_owned);
                     state.cache.put(uri_owned, Arc::new(image));
                 }
                 Err(e) => {
                     eprintln!("[twelf] decode failed for {uri_owned}: {e}");
-                    state.failed.insert(uri_owned, Instant::now());
+                    state.failed.record(uri_owned);
                 }
             }
             drop(state);
@@ -175,14 +174,14 @@ impl ImageLoader for DecodedImageLoader {
         let mut state = self.state.lock().unwrap();
         state.cache.forget(uri);
         state.pending.remove(uri);
-        state.failed.remove(uri);
+        state.failed.clear(uri);
     }
 
     fn forget_all(&self) {
         let mut state = self.state.lock().unwrap();
         state.cache.forget_all();
         state.pending.clear();
-        state.failed.clear();
+        state.failed.clear_all();
     }
 
     fn byte_size(&self) -> usize {

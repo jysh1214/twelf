@@ -1,3 +1,4 @@
+use crate::backoff::BackOff;
 use crate::cache::ImageCache;
 use eframe::egui;
 use egui::Context;
@@ -5,14 +6,14 @@ use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
 use russh_sftp::client::SftpSession;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 struct LoaderState {
     cache: HashMap<String, Bytes>,
     pending: HashSet<String>,
-    failed: HashMap<String, Instant>,
+    failed: BackOff,
 }
 
 pub struct SftpBytesLoader {
@@ -34,7 +35,7 @@ impl SftpBytesLoader {
             state: Arc::new(Mutex::new(LoaderState {
                 cache: HashMap::new(),
                 pending: HashSet::new(),
-                failed: HashMap::new(),
+                failed: BackOff::new(RETRY_BACKOFF),
             })),
             disk,
         }
@@ -67,9 +68,7 @@ impl BytesLoader for SftpBytesLoader {
             if state.pending.contains(uri) {
                 return Ok(BytesPoll::Pending { size: None });
             }
-            if let Some(failed_at) = state.failed.get(uri)
-                && failed_at.elapsed() < RETRY_BACKOFF
-            {
+            if state.failed.is_backed_off(uri) {
                 return Err(LoadError::Loading("previous load failed".to_string()));
             }
         }
@@ -104,11 +103,11 @@ impl BytesLoader for SftpBytesLoader {
             state.pending.remove(&uri_owned);
             match bytes {
                 Some(vec) => {
-                    state.failed.remove(&uri_owned);
+                    state.failed.clear(&uri_owned);
                     state.cache.insert(uri_owned, vec.into());
                 }
                 None => {
-                    state.failed.insert(uri_owned, Instant::now());
+                    state.failed.record(uri_owned);
                 }
             }
             drop(state);
@@ -120,13 +119,13 @@ impl BytesLoader for SftpBytesLoader {
     fn forget(&self, uri: &str) {
         let mut state = self.state.lock().unwrap();
         state.cache.remove(uri);
-        state.failed.remove(uri);
+        state.failed.clear(uri);
     }
 
     fn forget_all(&self) {
         let mut state = self.state.lock().unwrap();
         state.cache.clear();
-        state.failed.clear();
+        state.failed.clear_all();
     }
 
     fn byte_size(&self) -> usize {
@@ -163,12 +162,7 @@ mod tests {
     fn backed_off_uri_errors_without_spawning() {
         let (loader, _rt) = make_loader();
         let uri = "sftp://host/a.jpg";
-        loader
-            .state
-            .lock()
-            .unwrap()
-            .failed
-            .insert(uri.to_string(), Instant::now());
+        loader.state.lock().unwrap().failed.record(uri.to_string());
         let ctx = egui::Context::default();
         assert!(matches!(
             loader.load(&ctx, uri),
@@ -181,26 +175,17 @@ mod tests {
     fn forget_clears_failed_entry() {
         let (loader, _rt) = make_loader();
         let uri = "sftp://host/a.jpg";
-        loader
-            .state
-            .lock()
-            .unwrap()
-            .failed
-            .insert(uri.to_string(), Instant::now());
+        loader.state.lock().unwrap().failed.record(uri.to_string());
         loader.forget(uri);
-        assert!(!loader.state.lock().unwrap().failed.contains_key(uri));
+        assert!(!loader.state.lock().unwrap().failed.is_backed_off(uri));
     }
 
     #[test]
     fn forget_all_clears_failed() {
         let (loader, _rt) = make_loader();
-        loader
-            .state
-            .lock()
-            .unwrap()
-            .failed
-            .insert("sftp://host/a.jpg".to_string(), Instant::now());
+        let uri = "sftp://host/a.jpg";
+        loader.state.lock().unwrap().failed.record(uri.to_string());
         loader.forget_all();
-        assert!(loader.state.lock().unwrap().failed.is_empty());
+        assert!(!loader.state.lock().unwrap().failed.is_backed_off(uri));
     }
 }
