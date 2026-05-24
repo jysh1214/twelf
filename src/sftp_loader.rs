@@ -170,7 +170,10 @@ mod tests {
             .failed
             .insert(uri.to_string(), Instant::now());
         let ctx = egui::Context::default();
-        assert!(loader.load(&ctx, uri).is_err());
+        assert!(matches!(
+            loader.load(&ctx, uri),
+            Err(LoadError::Loading(m)) if m == "previous load failed"
+        ));
         assert!(loader.state.lock().unwrap().pending.is_empty());
     }
 
