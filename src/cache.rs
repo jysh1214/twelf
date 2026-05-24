@@ -41,21 +41,31 @@ impl ImageCache {
         self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
+    #[cfg(test)]
+    fn initialize_at(&self, dir: &Path, key: &[u8]) {
+        let key_hex = format!("{:x}", Sha256::digest(key));
+        let inner = Self::open_at(dir, &key_hex).expect("open test cache");
+        *self.inner.lock().unwrap() = Some(inner);
+    }
+
     fn try_open(ssh_key_path: &Path) -> Result<Inner, String> {
         let key_bytes = fs::read(ssh_key_path)
             .map_err(|e| format!("failed to read SSH key {}: {e}", ssh_key_path.display()))?;
         let key_hex = format!("{:x}", Sha256::digest(&key_bytes));
-
         let mut dir = dirs::cache_dir().ok_or_else(|| "no cache dir available".to_string())?;
         dir.push("twelf");
-        fs::create_dir_all(&dir)
+        Self::open_at(&dir, &key_hex)
+    }
+
+    fn open_at(dir: &Path, key_hex: &str) -> Result<Inner, String> {
+        fs::create_dir_all(dir)
             .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
         let blobs_dir = dir.join("blobs");
         fs::create_dir_all(&blobs_dir)
             .map_err(|e| format!("failed to create {}: {e}", blobs_dir.display()))?;
         let db_path = dir.join("cache.db");
 
-        match Self::open_with_key(&db_path, &key_hex) {
+        match Self::open_with_key(&db_path, key_hex) {
             Ok(conn) => Ok(Inner { conn, blobs_dir }),
             Err(_) => {
                 let _ = fs::remove_file(&db_path);
@@ -64,7 +74,7 @@ impl ImageCache {
                         let _ = fs::remove_file(entry.path());
                     }
                 }
-                let conn = Self::open_with_key(&db_path, &key_hex)
+                let conn = Self::open_with_key(&db_path, key_hex)
                     .map_err(|e| format!("failed to open encrypted cache after wipe: {e}"))?;
                 Ok(Inner { conn, blobs_dir })
             }
