@@ -313,4 +313,19 @@ mod tests {
             Some(b"hello".to_vec())
         );
     }
+
+    #[test]
+    fn null_mtime_entry_is_revalidated() {
+        let (cache, _dir) = fresh_cache();
+        // Stored during a stat outage: no mtime recorded.
+        cache.put("sftp://host/a.jpg", b"hello", None);
+        // Once a real mtime is known, the unconfirmable entry must miss.
+        assert_eq!(cache.get("sftp://host/a.jpg", Some(100), Some(5)), None);
+        // A repair put with the real mtime restores the hit.
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        assert_eq!(
+            cache.get("sftp://host/a.jpg", Some(100), Some(5)),
+            Some(b"hello".to_vec())
+        );
+    }
 }
