@@ -97,20 +97,34 @@ impl ImageCache {
         Ok(conn)
     }
 
-    pub fn get(&self, uri: &str) -> Option<Vec<u8>> {
+    pub fn get(&self, uri: &str, mtime: Option<i64>, size: Option<i64>) -> Option<Vec<u8>> {
         let (rowid, blob_path) = {
             let guard = self.inner.lock().ok()?;
             let inner = guard.as_ref()?;
-            let id: i64 = inner
+            let (id, stored_size, stored_mtime) = inner
                 .conn
                 .query_row(
-                    "SELECT rowid FROM entries WHERE uri = ?1",
+                    "SELECT rowid, byte_size, mtime FROM entries WHERE uri = ?1",
                     params![uri],
-                    |row| row.get::<_, i64>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .ok()
                 .flatten()?;
+            if size.is_some_and(|s| s != stored_size) {
+                return None;
+            }
+            if let (Some(m), Some(sm)) = (mtime, stored_mtime)
+                && m != sm
+            {
+                return None;
+            }
             (id, inner.blobs_dir.join(id.to_string()))
         };
         let bytes = fs::read(&blob_path).ok()?;

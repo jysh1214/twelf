@@ -58,7 +58,7 @@ impl BytesLoader for SftpBytesLoader {
                 return Ok(BytesPoll::Pending { size: None });
             }
         }
-        if let Some(vec) = self.disk.get(uri) {
+        if let Some(vec) = self.disk.get(uri, None, None) {
             let bytes: Bytes = vec.into();
             self.state
                 .lock()
