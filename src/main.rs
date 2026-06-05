@@ -11,6 +11,7 @@ mod remote;
 mod sftp_loader;
 mod sidebar;
 mod ssh;
+mod webp;
 
 use eframe::egui;
 use std::collections::VecDeque;
