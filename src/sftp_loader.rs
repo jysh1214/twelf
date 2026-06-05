@@ -193,4 +193,11 @@ mod tests {
         loader.forget_all();
         assert!(!loader.state.lock().unwrap().failed.is_backed_off(uri));
     }
+
+    #[test]
+    fn remote_path_strips_frame_fragment() {
+        assert_eq!(remote_path("sftp://host/dir/a.webp#0"), Some("/dir/a.webp"));
+        assert_eq!(remote_path("sftp://host/dir/a.jpg"), Some("/dir/a.jpg"));
+        assert_eq!(remote_path("file:///dir/a.webp"), None);
+    }
 }
