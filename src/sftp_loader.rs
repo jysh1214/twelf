@@ -91,7 +91,10 @@ impl BytesLoader for SftpBytesLoader {
                         disk_clone.put(&uri_owned, &vec, mtime);
                         Some(vec)
                     }
-                    Err(_) => None,
+                    Err(e) => {
+                        crate::log!("failed to read {uri_owned}: {e}");
+                        None
+                    }
                 },
             };
             let mut state = state_clone.lock().unwrap();
