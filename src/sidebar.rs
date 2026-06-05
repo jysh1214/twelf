@@ -66,7 +66,7 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
     let mut nodes: Vec<TreeNode> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir() || is_image(p))
+        .filter(|p| p.is_dir() || is_image(p) || crate::video::is_video(&p.to_string_lossy()))
         .map(TreeNode::child)
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
