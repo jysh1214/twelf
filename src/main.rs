@@ -63,6 +63,7 @@ struct TwelfApp {
     cache: Arc<cache::ImageCache>,
     image_prefetch: VecDeque<String>,
     animation: Option<webp::Animation>,
+    anim_pending: Option<String>,
 }
 
 impl TwelfApp {
@@ -89,6 +90,7 @@ impl TwelfApp {
             cache: Arc::new(cache::ImageCache::new()),
             image_prefetch: VecDeque::new(),
             animation: None,
+            anim_pending: None,
         }
     }
 

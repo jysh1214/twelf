@@ -8,10 +8,24 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         .selected_remote
         .clone()
         .or_else(|| app.selected_image.clone());
+    let uri = selected_uri(app);
     if current_displayed != app.last_displayed {
         app.zoom = 1.0;
         app.last_displayed = current_displayed;
-        app.animation = load_animation(app);
+        app.animation = None;
+        app.anim_pending = uri.clone();
+    }
+    // Build the animation once its bytes are available. Remote bytes arrive
+    // asynchronously, so keep retrying each frame until the decode resolves to
+    // an animation or a still image.
+    if let Some(pending) = app.anim_pending.clone() {
+        match build_animation(ctx, &pending) {
+            AnimBuild::Pending => {}
+            AnimBuild::Resolved(anim) => {
+                app.animation = anim;
+                app.anim_pending = None;
+            }
+        }
     }
     let zoom_scroll = ctx.input(|i| {
         if i.modifiers.ctrl {
@@ -27,17 +41,6 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         (app.zoom - prev_zoom).abs() > f32::EPSILON || app.last_displayed != prev_displayed;
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        let uri = if let Some(path) = &app.selected_remote {
-            let host = match &app.ssh {
-                crate::ssh::SshState::Connected { info, .. } => info.host.as_str(),
-                _ => "",
-            };
-            Some(format!("sftp://{host}{}", path.display()))
-        } else {
-            app.selected_image
-                .as_ref()
-                .map(|path| format!("file://{}", path.display()))
-        };
         if let Some(uri) = uri {
             let panel_avail = ui.available_size();
             let image_size = panel_avail * app.zoom;
@@ -73,23 +76,55 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     });
 }
 
-/// Build an animation player for the current selection when it is a local,
-/// multi-frame WebP; otherwise `None` so the still-image path is used.
-fn load_animation(app: &TwelfApp) -> Option<crate::webp::Animation> {
-    if app.selected_remote.is_some() {
-        return None;
+fn selected_uri(app: &TwelfApp) -> Option<String> {
+    if let Some(path) = &app.selected_remote {
+        let host = match &app.ssh {
+            crate::ssh::SshState::Connected { info, .. } => info.host.as_str(),
+            _ => "",
+        };
+        Some(format!("sftp://{host}{}", path.display()))
+    } else {
+        app.selected_image
+            .as_ref()
+            .map(|path| format!("file://{}", path.display()))
     }
-    let path = app.selected_image.as_ref()?;
-    if !crate::webp::is_webp(&path.to_string_lossy()) {
-        return None;
+}
+
+enum AnimBuild {
+    /// Bytes are not available yet; retry on a later frame.
+    Pending,
+    /// Decided: `Some` plays as an animation, `None` falls back to the still path.
+    Resolved(Option<crate::webp::Animation>),
+}
+
+/// Try to build a multi-frame WebP player for `uri`. Local files read
+/// synchronously; remote files draw bytes from the async SFTP loader cache.
+fn build_animation(ctx: &egui::Context, uri: &str) -> AnimBuild {
+    if !crate::webp::is_webp(uri) {
+        return AnimBuild::Resolved(None);
     }
-    let bytes = std::fs::read(path).ok()?;
-    let frames = crate::webp::decode_frames(&bytes).ok()?;
+    if let Some(path) = uri.strip_prefix("file://") {
+        match std::fs::read(path) {
+            Ok(bytes) => AnimBuild::Resolved(animation_from_bytes(uri, &bytes)),
+            Err(_) => AnimBuild::Resolved(None),
+        }
+    } else if uri.starts_with("sftp://") {
+        match ctx.try_load_bytes(uri) {
+            Ok(egui::load::BytesPoll::Ready { bytes, .. }) => {
+                AnimBuild::Resolved(animation_from_bytes(uri, bytes.as_ref()))
+            }
+            Ok(egui::load::BytesPoll::Pending { .. }) => AnimBuild::Pending,
+            Err(_) => AnimBuild::Resolved(None),
+        }
+    } else {
+        AnimBuild::Resolved(None)
+    }
+}
+
+fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animation> {
+    let frames = crate::webp::decode_frames(bytes).ok()?;
     if frames.len() <= 1 {
         return None;
     }
-    Some(crate::webp::Animation::new(
-        format!("file://{}", path.display()),
-        frames,
-    ))
+    Some(crate::webp::Animation::new(uri.to_string(), frames))
 }
