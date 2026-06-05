@@ -146,10 +146,23 @@ fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animatio
     Some(crate::webp::Animation::new(uri.to_string(), frames))
 }
 
-/// Start a player for the current selection when it is a local video file.
+/// Start a player for the current selection when it is a video file, local or
+/// remote (the remote case downloads over SFTP before decoding).
 fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
-    if app.selected_remote.is_some() {
-        return None;
+    if let Some(path) = &app.selected_remote {
+        let crate::ssh::SshState::Connected { session, info } = &app.ssh else {
+            return None;
+        };
+        let uri = format!("sftp://{}{}", info.host, path.display());
+        if !crate::video::is_video(&uri) {
+            return None;
+        }
+        return Some(crate::video::VideoPlayer::open_remote(
+            uri,
+            session.clone(),
+            app.runtime.handle().clone(),
+            path.to_string_lossy().into_owned(),
+        ));
     }
     let path = app.selected_image.as_ref()?;
     let uri = format!("file://{}", path.display());
