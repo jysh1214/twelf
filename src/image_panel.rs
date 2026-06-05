@@ -11,6 +11,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     if current_displayed != app.last_displayed {
         app.zoom = 1.0;
         app.last_displayed = current_displayed;
+        app.animation = load_animation(app);
     }
     let zoom_scroll = ctx.input(|i| {
         if i.modifiers.ctrl {
@@ -56,14 +57,39 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     content_size,
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     |ui| {
-                        ui.add(
-                            egui::Image::new(uri)
-                                .max_size(image_size)
-                                .maintain_aspect_ratio(true),
-                        );
+                        let image = match app.animation.as_mut().filter(|a| a.uri == uri) {
+                            Some(anim) => {
+                                let (texture, remaining) = anim.frame(ui.ctx());
+                                ui.ctx().request_repaint_after(remaining);
+                                egui::Image::new(texture)
+                            }
+                            None => egui::Image::new(uri),
+                        };
+                        ui.add(image.max_size(image_size).maintain_aspect_ratio(true));
                     },
                 );
             });
         }
     });
+}
+
+/// Build an animation player for the current selection when it is a local,
+/// multi-frame WebP; otherwise `None` so the still-image path is used.
+fn load_animation(app: &TwelfApp) -> Option<crate::webp::Animation> {
+    if app.selected_remote.is_some() {
+        return None;
+    }
+    let path = app.selected_image.as_ref()?;
+    if !crate::webp::is_webp(&path.to_string_lossy()) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let frames = crate::webp::decode_frames(&bytes).ok()?;
+    if frames.len() <= 1 {
+        return None;
+    }
+    Some(crate::webp::Animation::new(
+        format!("file://{}", path.display()),
+        frames,
+    ))
 }

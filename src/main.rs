@@ -62,6 +62,7 @@ struct TwelfApp {
     runtime: tokio::runtime::Runtime,
     cache: Arc<cache::ImageCache>,
     image_prefetch: VecDeque<String>,
+    animation: Option<webp::Animation>,
 }
 
 impl TwelfApp {
@@ -87,6 +88,7 @@ impl TwelfApp {
                 .expect("failed to build tokio runtime"),
             cache: Arc::new(cache::ImageCache::new()),
             image_prefetch: VecDeque::new(),
+            animation: None,
         }
     }
 
