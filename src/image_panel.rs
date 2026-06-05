@@ -43,12 +43,14 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
 
     egui::CentralPanel::default().show(ctx, |ui| {
         if let Some(uri) = uri {
+            let panel_rect = ui.max_rect();
             let panel_avail = ui.available_size();
             let image_size = panel_avail * app.zoom;
             let content_size = egui::vec2(
                 image_size.x.max(panel_avail.x),
                 image_size.y.max(panel_avail.y),
             );
+            let video_active = app.video.as_ref().is_some_and(|p| p.uri == uri);
             let mut scroll_area = egui::ScrollArea::both();
             if recenter_image {
                 scroll_area = scroll_area.scroll_offset(egui::vec2(
@@ -89,6 +91,23 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     },
                 );
             });
+            if video_active && let Some(player) = app.video.as_mut() {
+                let label = if player.is_paused() { "▶" } else { "⏸" };
+                // Anchor to the central panel's bottom-center, not the whole window
+                // (the side panel would otherwise pull it off-center).
+                let screen = ui.ctx().content_rect();
+                let offset = egui::vec2(
+                    panel_rect.center().x - screen.center().x,
+                    panel_rect.bottom() - screen.bottom() - 16.0,
+                );
+                egui::Area::new(egui::Id::new("video_controls"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, offset)
+                    .show(ui.ctx(), |ui| {
+                        if ui.button(label).clicked() {
+                            player.toggle_pause();
+                        }
+                    });
+            }
         }
     });
 }
