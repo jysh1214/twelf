@@ -12,6 +12,7 @@ mod remote;
 mod sftp_loader;
 mod sidebar;
 mod ssh;
+mod video;
 mod webp;
 
 use eframe::egui;
@@ -65,6 +66,7 @@ struct TwelfApp {
     image_prefetch: VecDeque<String>,
     animation: Option<webp::Animation>,
     anim_pending: Option<String>,
+    video: Option<video::VideoPlayer>,
 }
 
 impl TwelfApp {
@@ -92,6 +94,7 @@ impl TwelfApp {
             image_prefetch: VecDeque::new(),
             animation: None,
             anim_pending: None,
+            video: None,
         }
     }
 
