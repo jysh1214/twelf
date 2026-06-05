@@ -160,7 +160,7 @@ impl ImageLoader for DecodedImageLoader {
                     state.cache.put(uri_owned, Arc::new(image));
                 }
                 Err(e) => {
-                    eprintln!("[twelf] decode failed for {uri_owned}: {e}");
+                    crate::log!("decode failed for {uri_owned}: {e}");
                     state.failed.record(uri_owned);
                 }
             }

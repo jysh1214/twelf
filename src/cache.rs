@@ -29,7 +29,7 @@ impl ImageCache {
                 }
             }
             Err(e) => {
-                eprintln!("[twelf] image cache disabled: {e}");
+                crate::log!("image cache disabled: {e}");
                 if let Ok(mut guard) = self.inner.lock() {
                     *guard = None;
                 }
@@ -182,13 +182,13 @@ impl ImageCache {
                         "INSERT INTO entries (uri, byte_size, last_accessed) VALUES (?1, 0, ?2)",
                         params![uri, now],
                     ) {
-                        eprintln!("[twelf] failed to insert placeholder for {uri}: {e}");
+                        crate::log!("failed to insert placeholder for {uri}: {e}");
                         return;
                     }
                     (inner.conn.last_insert_rowid(), true)
                 }
                 Err(e) => {
-                    eprintln!("[twelf] failed to look up cache entry for {uri}: {e}");
+                    crate::log!("failed to look up cache entry for {uri}: {e}");
                     return;
                 }
             };
@@ -202,13 +202,13 @@ impl ImageCache {
             Ok(()) => match fs::rename(&tmp_path, &final_path) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("[twelf] failed to finalize {}: {e}", final_path.display());
+                    crate::log!("failed to finalize {}: {e}", final_path.display());
                     let _ = fs::remove_file(&tmp_path);
                     false
                 }
             },
             Err(e) => {
-                eprintln!("[twelf] failed to write {}: {e}", tmp_path.display());
+                crate::log!("failed to write {}: {e}", tmp_path.display());
                 false
             }
         };
@@ -234,7 +234,7 @@ impl ImageCache {
             let Ok(guard) = self.inner.lock() else { return };
             let Some(inner) = guard.as_ref() else { return };
             if let Err(e) = inner.conn.execute("DELETE FROM entries", []) {
-                eprintln!("[twelf] failed to clear cache rows: {e}");
+                crate::log!("failed to clear cache rows: {e}");
             }
             inner.blobs_dir.clone()
         };
