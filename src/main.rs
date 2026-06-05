@@ -182,6 +182,15 @@ impl eframe::App for TwelfApp {
             self.navigate_image(delta);
         }
 
+        // Space toggles play/pause for the active video. Consume it only when no
+        // text field wants keyboard input, so it still types in the SSH dialog
+        // and a focused on-screen button does not also toggle.
+        let toggle_video = !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        if toggle_video && let Some(player) = self.video.as_mut() {
+            player.toggle_pause();
+        }
+
         menu_bar::render(self, ctx);
 
         let mut connect_clicked = false;
