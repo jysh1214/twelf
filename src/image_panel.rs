@@ -92,7 +92,6 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                 );
             });
             if video_active && let Some(player) = app.video.as_mut() {
-                let label = if player.is_paused() { "▶" } else { "⏸" };
                 // Anchor to the central panel's bottom-center, not the whole window
                 // (the side panel would otherwise pull it off-center).
                 let screen = ui.ctx().content_rect();
@@ -100,16 +99,51 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     panel_rect.center().x - screen.center().x,
                     panel_rect.bottom() - screen.bottom() - 16.0,
                 );
+                let bar_width = (panel_rect.width() * 0.6).clamp(120.0, 640.0);
                 egui::Area::new(egui::Id::new("video_controls"))
                     .anchor(egui::Align2::CENTER_BOTTOM, offset)
                     .show(ui.ctx(), |ui| {
-                        if ui.button(label).clicked() {
-                            player.toggle_pause();
-                        }
+                        ui.horizontal(|ui| {
+                            let label = if player.is_paused() { "▶" } else { "⏸" };
+                            if ui.button(label).clicked() {
+                                player.toggle_pause();
+                            }
+                            let duration = player.duration();
+                            if duration > 0.0 {
+                                draw_seek_bar(ui, player, duration, bar_width);
+                            }
+                        });
                     });
             }
         }
     });
+}
+
+/// Draw a draggable progress bar filled to the player's position; seek on release.
+fn draw_seek_bar(ui: &mut egui::Ui, player: &mut crate::video::VideoPlayer, duration: f64, width: f32) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::click_and_drag());
+    let played = (player.position() / duration).clamp(0.0, 1.0) as f32;
+    let pointer_frac = response
+        .interact_pointer_pos()
+        .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
+    // While dragging, preview the dragged position; otherwise show playback.
+    let shown = if response.dragged() {
+        pointer_frac.unwrap_or(played)
+    } else {
+        played
+    };
+    let bg = ui.visuals().extreme_bg_color;
+    let fg = ui.visuals().selection.bg_fill;
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0_f32, bg);
+    let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * shown, rect.height()));
+    painter.rect_filled(fill, 4.0_f32, fg);
+    if (response.drag_stopped() || response.clicked())
+        && let Some(frac) = pointer_frac
+    {
+        player.seek(frac as f64 * duration);
+    }
 }
 
 fn selected_uri(app: &TwelfApp) -> Option<String> {
