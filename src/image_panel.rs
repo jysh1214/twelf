@@ -14,6 +14,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         app.last_displayed = current_displayed;
         app.animation = None;
         app.anim_pending = uri.clone();
+        app.video = open_video(app);
     }
     // Build the animation once its bytes are available. Remote bytes arrive
     // asynchronously, so keep retrying each frame until the decode resolves to
@@ -60,15 +61,31 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     content_size,
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                     |ui| {
-                        let image = match app.animation.as_mut().filter(|a| a.uri == uri) {
-                            Some(anim) => {
-                                let (texture, remaining) = anim.frame(ui.ctx());
-                                ui.ctx().request_repaint_after(remaining);
-                                egui::Image::new(texture)
+                        let image = if let Some(player) =
+                            app.video.as_mut().filter(|p| p.uri == uri)
+                        {
+                            match player.frame(ui.ctx()) {
+                                Some((texture, delay)) => {
+                                    ui.ctx().request_repaint_after(delay);
+                                    Some(egui::Image::new(texture))
+                                }
+                                None => {
+                                    ui.ctx().request_repaint(); // decoding; nothing yet
+                                    None
+                                }
                             }
-                            None => egui::Image::new(uri),
+                        } else if let Some(anim) =
+                            app.animation.as_mut().filter(|a| a.uri == uri)
+                        {
+                            let (texture, remaining) = anim.frame(ui.ctx());
+                            ui.ctx().request_repaint_after(remaining);
+                            Some(egui::Image::new(texture))
+                        } else {
+                            Some(egui::Image::new(uri))
                         };
-                        ui.add(image.max_size(image_size).maintain_aspect_ratio(true));
+                        if let Some(image) = image {
+                            ui.add(image.max_size(image_size).maintain_aspect_ratio(true));
+                        }
                     },
                 );
             });
@@ -127,4 +144,17 @@ fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animatio
         return None;
     }
     Some(crate::webp::Animation::new(uri.to_string(), frames))
+}
+
+/// Start a player for the current selection when it is a local video file.
+fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
+    if app.selected_remote.is_some() {
+        return None;
+    }
+    let path = app.selected_image.as_ref()?;
+    let uri = format!("file://{}", path.display());
+    if !crate::video::is_video(&uri) {
+        return None;
+    }
+    Some(crate::video::VideoPlayer::open(uri, path.clone()))
 }
