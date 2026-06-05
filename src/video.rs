@@ -151,6 +151,8 @@ pub struct VideoPlayer {
     pub uri: String,
     rx: Receiver<TimedFrame>,
     start: Option<Instant>,
+    /// Playback seconds captured when paused; `None` while playing.
+    paused_at: Option<f64>,
     next: Option<TimedFrame>,
     texture: Option<egui::TextureHandle>,
 }
@@ -168,6 +170,7 @@ impl VideoPlayer {
             uri,
             rx,
             start: None,
+            paused_at: None,
             next: None,
             texture: None,
         }
@@ -217,14 +220,35 @@ impl VideoPlayer {
             uri,
             rx,
             start: None,
+            paused_at: None,
             next: None,
             texture: None,
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Toggle play/pause. Pausing captures the playback position; resuming rebases
+    /// the clock so frames continue from there instead of jumping ahead.
+    pub fn toggle_pause(&mut self) {
+        match self.paused_at.take() {
+            Some(elapsed) => self.start = Some(Instant::now() - Duration::from_secs_f64(elapsed)),
+            None => {
+                self.paused_at = Some(self.start.map_or(0.0, |s| s.elapsed().as_secs_f64()));
+            }
         }
     }
 
     /// Upload and return the frame due now plus when to repaint, or `None` until
     /// the first frame has been decoded.
     pub fn frame(&mut self, ctx: &egui::Context) -> Option<(egui::load::SizedTexture, Duration)> {
+        if self.paused_at.is_some() {
+            // Hold the current frame; no repaint until the user resumes.
+            let handle = self.texture.as_ref()?;
+            return Some((egui::load::SizedTexture::from_handle(handle), Duration::from_secs(3600)));
+        }
         let options = egui::TextureOptions::LINEAR;
         loop {
             if self.next.is_none() {
