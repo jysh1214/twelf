@@ -5,6 +5,7 @@ mod decoded;
 mod fonts;
 mod heic;
 mod image_panel;
+mod logging;
 mod menu_bar;
 mod nav;
 mod remote;
