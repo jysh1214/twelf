@@ -48,14 +48,9 @@ impl BytesLoader for SftpBytesLoader {
     }
 
     fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult {
-        let Some(rest) = uri.strip_prefix("sftp://") else {
+        let Some(path) = remote_path(uri) else {
             return Err(LoadError::NotSupported);
         };
-        // URIs are `sftp://{host}{absolute_path}`; recover the path after the host.
-        let Some(slash) = rest.find('/') else {
-            return Err(LoadError::NotSupported);
-        };
-        let path = &rest[slash..];
         {
             let state = self.state.lock().unwrap();
             if let Some(bytes) = state.cache.get(uri).cloned() {
@@ -141,6 +136,16 @@ impl BytesLoader for SftpBytesLoader {
     fn has_pending(&self) -> bool {
         !self.state.lock().unwrap().pending.is_empty()
     }
+}
+
+/// Recover the remote path from an `sftp://{host}{absolute_path}` URI, dropping
+/// the `#frame` fragment egui appends to webp/gif URIs (which is never part of
+/// the filesystem path). Returns `None` for non-sftp URIs.
+fn remote_path(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("sftp://")?;
+    let slash = rest.find('/')?;
+    let path = &rest[slash..];
+    Some(egui::decode_animated_image_uri(path).map_or(path, |(p, _)| p))
 }
 
 #[cfg(test)]
