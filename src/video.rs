@@ -8,9 +8,8 @@ use russh_sftp::client::SftpSession;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Once;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -121,9 +120,17 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Seek back to the start and flush decoder state so playback can loop.
-    fn seek_to_start(&mut self) -> Result<(), ffmpeg::Error> {
-        self.input.seek(0, ..)?;
+    /// Video duration in seconds, or `0.0` if unknown.
+    fn duration(&self) -> f64 {
+        let d = self.input.duration();
+        if d > 0 { d as f64 / AV_TIME_BASE } else { 0.0 }
+    }
+
+    /// Seek to `secs` (snapping to the keyframe at or before it) and flush decoder
+    /// state so decoding resumes from there.
+    fn seek_to(&mut self, secs: f64) -> Result<(), ffmpeg::Error> {
+        let ts = (secs.max(0.0) * AV_TIME_BASE) as i64;
+        self.input.seek(ts, ..ts)?;
         self.decoder.flush();
         self.pending.clear();
         self.drained = false;
@@ -131,49 +138,54 @@ impl VideoDecoder {
     }
 }
 
+/// ffmpeg's `AV_TIME_BASE`: durations and seek timestamps are in microseconds.
+const AV_TIME_BASE: f64 = 1_000_000.0;
+
 /// How many decoded frames to buffer ahead; bounds the decoder's lead and the
 /// memory it holds for a looping (otherwise unbounded) stream.
 const FRAME_BUFFER: usize = 6;
-/// Seam spacing used to continue the timeline across a loop when the per-frame
-/// gap is unknown.
-const FALLBACK_GAP: f64 = 1.0 / 30.0;
 
 struct TimedFrame {
     image: ColorImage,
-    /// Monotonically increasing presentation time (seconds) across loops.
-    timeline: f64,
+    /// In-file presentation time in seconds.
+    position: f64,
+    /// Seek generation; frames decoded before a seek carry an older value.
+    generation: u64,
 }
 
-/// Plays a local video: a worker thread decodes (and loops) into a bounded
-/// channel, and `frame` hands the UI the frame due at the current wall-clock
-/// time, uploaded as a texture.
+/// State shared with the worker: pending seek requests, the current seek
+/// generation, and the duration the worker fills in once the file is open.
+#[derive(Default)]
+struct Shared {
+    seek_request: Option<f64>,
+    generation: u64,
+    duration: f64,
+}
+
+/// Plays a video: a worker thread decodes (looping, and honoring seeks) into a
+/// bounded channel, and `frame` hands the UI the frame due now, uploaded as a
+/// texture. Playback is paced by anchoring a wall-clock to a frame position and
+/// re-anchoring on any position discontinuity (loop or seek).
 pub struct VideoPlayer {
     pub uri: String,
     rx: Receiver<TimedFrame>,
-    start: Option<Instant>,
-    /// Playback seconds captured when paused; `None` while playing.
-    paused_at: Option<f64>,
+    shared: Arc<Mutex<Shared>>,
+    /// The seek generation the UI expects; frames with an older value are dropped.
+    generation: u64,
+    /// (wall instant, playback position then); `None` until (re)anchored.
+    anchor: Option<(Instant, f64)>,
+    paused: bool,
+    position: f64,
     next: Option<TimedFrame>,
     texture: Option<egui::TextureHandle>,
 }
 
 impl VideoPlayer {
     pub fn open(uri: String, path: PathBuf) -> Self {
-        let (tx, rx) = sync_channel(FRAME_BUFFER);
-        // The decoder (and its non-Send scaler) is built and used entirely on
-        // the worker thread; only the path crosses in and frames cross out.
-        thread::spawn(move || match VideoDecoder::open(&path) {
-            Ok(mut decoder) => decode_loop(&mut decoder, &tx),
+        Self::spawn(uri, move |tx, shared| match VideoDecoder::open(&path) {
+            Ok(decoder) => decode_loop(decoder, &tx, &shared),
             Err(e) => crate::log!("video open failed for {}: {e}", path.display()),
-        });
-        Self {
-            uri,
-            rx,
-            start: None,
-            paused_at: None,
-            next: None,
-            texture: None,
-        }
+        })
     }
 
     /// Like `open`, but for a remote (SFTP) video: the worker thread downloads
@@ -185,13 +197,12 @@ impl VideoPlayer {
         handle: tokio::runtime::Handle,
         remote_path: String,
     ) -> Self {
-        let (tx, rx) = sync_channel(FRAME_BUFFER);
         let suffix = Path::new(&uri)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| format!(".{e}"))
             .unwrap_or_default();
-        thread::spawn(move || {
+        Self::spawn(uri, move |tx, shared| {
             let bytes = match handle.block_on(session.read(remote_path.clone())) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -212,53 +223,92 @@ impl VideoPlayer {
             }
             // `temp` stays alive (and on disk) until this thread returns.
             match VideoDecoder::open(temp.path()) {
-                Ok(mut decoder) => decode_loop(&mut decoder, &tx),
+                Ok(decoder) => decode_loop(decoder, &tx, &shared),
                 Err(e) => crate::log!("remote video decode failed for {remote_path}: {e}"),
             }
-        });
+        })
+    }
+
+    /// Spawn the worker (whose body produces frames into `tx`) and build the player.
+    /// The decoder and its non-Send scaler live entirely on the worker thread.
+    fn spawn(
+        uri: String,
+        body: impl FnOnce(SyncSender<TimedFrame>, Arc<Mutex<Shared>>) + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = sync_channel(FRAME_BUFFER);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let worker_shared = shared.clone();
+        thread::spawn(move || body(tx, worker_shared));
         Self {
             uri,
             rx,
-            start: None,
-            paused_at: None,
+            shared,
+            generation: 0,
+            anchor: None,
+            paused: false,
+            position: 0.0,
             next: None,
             texture: None,
         }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused_at.is_some()
+        self.paused
     }
 
-    /// Toggle play/pause. Pausing captures the playback position; resuming rebases
-    /// the clock so frames continue from there instead of jumping ahead.
+    /// Toggle play/pause. Resuming re-anchors the clock to the current position so
+    /// playback continues from there instead of jumping ahead.
     pub fn toggle_pause(&mut self) {
-        match self.paused_at.take() {
-            Some(elapsed) => self.start = Some(Instant::now() - Duration::from_secs_f64(elapsed)),
-            None => {
-                self.paused_at = Some(self.start.map_or(0.0, |s| s.elapsed().as_secs_f64()));
-            }
+        self.paused = !self.paused;
+        if !self.paused {
+            self.anchor = Some((Instant::now(), self.position));
         }
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.shared.lock().unwrap().duration
+    }
+
+    pub fn position(&self) -> f64 {
+        self.position
+    }
+
+    /// Request a seek to `secs`. The worker performs it; stale frames are dropped
+    /// and pacing re-anchors when the seeked frame arrives.
+    pub fn seek(&mut self, secs: f64) {
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.generation += 1;
+            shared.seek_request = Some(secs);
+            self.generation = shared.generation;
+        }
+        self.next = None;
+        self.anchor = None;
+        self.position = secs;
     }
 
     /// Upload and return the frame due now plus when to repaint, or `None` until
     /// the first frame has been decoded.
     pub fn frame(&mut self, ctx: &egui::Context) -> Option<(egui::load::SizedTexture, Duration)> {
-        if self.paused_at.is_some() {
-            // Hold the current frame; no repaint until the user resumes.
-            let handle = self.texture.as_ref()?;
-            return Some((egui::load::SizedTexture::from_handle(handle), Duration::from_secs(3600)));
-        }
         let options = egui::TextureOptions::LINEAR;
         loop {
             if self.next.is_none() {
                 self.next = self.rx.try_recv().ok();
             }
-            let due = match (self.start, self.next.as_ref()) {
-                (_, None) => break,
-                (None, Some(_)) => true, // first frame: show it and start the clock
-                (Some(start), Some(frame)) => frame.timeline <= start.elapsed().as_secs_f64(),
+            let Some(frame) = self.next.as_ref() else { break };
+            if frame.generation != self.generation {
+                self.next = None; // stale pre-seek frame
+                continue;
+            }
+            // Re-anchor on the first frame, a seek, or a loop-back to an earlier position.
+            let reanchor = match self.anchor {
+                None => true,
+                Some((_, p0)) => frame.position + 1e-3 < p0,
             };
+            // While paused, only land a re-anchoring frame (first/seek/loop), then hold.
+            let due = reanchor
+                || (!self.paused
+                    && matches!(self.anchor, Some((t0, p0)) if frame.position - p0 <= t0.elapsed().as_secs_f64()));
             if !due {
                 break;
             }
@@ -267,51 +317,74 @@ impl VideoPlayer {
                 Some(handle) => handle.set(frame.image, options),
                 None => self.texture = Some(ctx.load_texture(&self.uri, frame.image, options)),
             }
-            self.start.get_or_insert_with(Instant::now);
+            self.position = frame.position;
+            if reanchor {
+                self.anchor = Some((Instant::now(), frame.position));
+            }
         }
         let handle = self.texture.as_ref()?;
-        let delay = match (self.start, self.next.as_ref()) {
-            (Some(start), Some(frame)) => {
-                Duration::from_secs_f64((frame.timeline - start.elapsed().as_secs_f64()).max(0.0))
+        let texture = egui::load::SizedTexture::from_handle(handle);
+        if self.paused {
+            // Poll while still awaiting a seeked frame; otherwise hold without repainting.
+            let delay = if self.anchor.is_none() {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_secs(3600)
+            };
+            return Some((texture, delay));
+        }
+        let delay = match (self.anchor, self.next.as_ref()) {
+            (Some((t0, p0)), Some(frame)) if frame.generation == self.generation => {
+                Duration::from_secs_f64(((frame.position - p0) - t0.elapsed().as_secs_f64()).max(0.0))
             }
             _ => Duration::from_millis(5), // waiting on the decoder; poll again soon
         };
-        Some((egui::load::SizedTexture::from_handle(handle), delay))
+        Some((texture, delay))
     }
 }
 
-/// Decode frames forever, looping at EOF, pushing each onto a monotonic
-/// timeline. Returns when the player is dropped (send fails) or decoding errors.
-fn decode_loop(decoder: &mut VideoDecoder, tx: &SyncSender<TimedFrame>) {
-    let mut offset = 0.0;
-    let mut last_timeline = 0.0;
-    let mut prev_pts = 0.0;
-    let mut gap = FALLBACK_GAP;
+/// Decode frames forever — looping at EOF and honoring seek requests — pushing
+/// each onto the channel with its position and seek generation. Returns when the
+/// player is dropped (send fails) or decoding errors.
+fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &Arc<Mutex<Shared>>) {
+    shared.lock().unwrap().duration = decoder.duration();
+    let mut generation = 0;
     loop {
+        // Apply a pending seek before producing the next frame.
+        let target = {
+            let mut s = shared.lock().unwrap();
+            s.seek_request.take().inspect(|_| generation = s.generation)
+        };
+        if let Some(target) = target
+            && decoder.seek_to(target).is_err()
+        {
+            return;
+        }
         match decoder.next_frame() {
             Ok(Some(frame)) => {
-                let delta = frame.pts - prev_pts;
-                if delta > 0.0 {
-                    gap = delta;
-                }
-                prev_pts = frame.pts;
-                let timeline = offset + frame.pts;
-                last_timeline = timeline;
-                if tx
-                    .send(TimedFrame {
-                        image: frame.image,
-                        timeline,
-                    })
-                    .is_err()
-                {
-                    return; // player dropped
+                let mut item = TimedFrame {
+                    image: frame.image,
+                    position: frame.pts,
+                    generation,
+                };
+                loop {
+                    match tx.try_send(item) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(returned)) => {
+                            // Stay responsive to seeks while the channel is full (paused).
+                            if shared.lock().unwrap().seek_request.is_some() {
+                                break; // drop this now-stale frame; the seek runs next
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                            item = returned;
+                        }
+                        Err(TrySendError::Disconnected(_)) => return, // player dropped
+                    }
                 }
             }
             Ok(None) => {
-                offset = last_timeline + gap;
-                prev_pts = 0.0;
-                if decoder.seek_to_start().is_err() {
-                    return;
+                if decoder.seek_to(0.0).is_err() {
+                    return; // loop back to the start
                 }
             }
             Err(_) => return,
