@@ -4,8 +4,11 @@ use ffmpeg::format::Pixel;
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
 use ffmpeg::frame::Video;
+use russh_sftp::client::SftpSession;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Once;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
@@ -160,6 +163,55 @@ impl VideoPlayer {
         thread::spawn(move || match VideoDecoder::open(&path) {
             Ok(mut decoder) => decode_loop(&mut decoder, &tx),
             Err(e) => crate::log!("video open failed for {}: {e}", path.display()),
+        });
+        Self {
+            uri,
+            rx,
+            start: None,
+            next: None,
+            texture: None,
+        }
+    }
+
+    /// Like `open`, but for a remote (SFTP) video: the worker thread downloads
+    /// the file to a temp path, then decodes it. The temp file is held on the
+    /// thread for the player's lifetime and removed when the player is dropped.
+    pub fn open_remote(
+        uri: String,
+        session: Arc<SftpSession>,
+        handle: tokio::runtime::Handle,
+        remote_path: String,
+    ) -> Self {
+        let (tx, rx) = sync_channel(FRAME_BUFFER);
+        let suffix = Path::new(&uri)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        thread::spawn(move || {
+            let bytes = match handle.block_on(session.read(remote_path.clone())) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    crate::log!("remote video fetch failed for {remote_path}: {e}");
+                    return;
+                }
+            };
+            let mut temp = match tempfile::Builder::new().suffix(&suffix).tempfile() {
+                Ok(temp) => temp,
+                Err(e) => {
+                    crate::log!("temp file for {remote_path} failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = temp.write_all(&bytes) {
+                crate::log!("temp write for {remote_path} failed: {e}");
+                return;
+            }
+            // `temp` stays alive (and on disk) until this thread returns.
+            match VideoDecoder::open(temp.path()) {
+                Ok(mut decoder) => decode_loop(&mut decoder, &tx),
+                Err(e) => crate::log!("remote video decode failed for {remote_path}: {e}"),
+            }
         });
         Self {
             uri,
