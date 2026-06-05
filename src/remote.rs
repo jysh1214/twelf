@@ -116,7 +116,10 @@ async fn list_remote_children(
             let is_dir = entry.metadata().is_dir();
             let mut child_path = path.to_path_buf();
             child_path.push(&name);
-            if is_dir || sidebar::is_image(&child_path) {
+            if is_dir
+                || sidebar::is_image(&child_path)
+                || crate::video::is_video(&child_path.to_string_lossy())
+            {
                 Some(RemoteTreeNode::child(child_path, name, is_dir))
             } else {
                 None
