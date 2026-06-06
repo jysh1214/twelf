@@ -8,7 +8,6 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::File;
 use std::collections::VecDeque;
 use std::io::SeekFrom;
-use std::io::Write;
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -353,41 +352,30 @@ impl VideoPlayer {
         })
     }
 
-    /// Like `open`, but for a remote (SFTP) video: the worker thread downloads
-    /// the file to a temp path, then decodes it. The temp file is held on the
-    /// thread for the player's lifetime and removed when the player is dropped.
+    /// Like `open`, but for a remote (SFTP) video: the worker thread opens the
+    /// remote file and decodes straight from it through a custom AVIO doing
+    /// on-demand range reads, so playback starts after only the header and index
+    /// are read rather than after a whole-file download.
     pub fn open_remote(
         uri: String,
         session: Arc<SftpSession>,
         handle: tokio::runtime::Handle,
         remote_path: String,
     ) -> Self {
-        let suffix = Path::new(&uri)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
         Self::spawn(uri, move |tx, shared| {
-            let bytes = match handle.block_on(session.read(remote_path.clone())) {
-                Ok(bytes) => bytes,
+            let size = handle
+                .block_on(session.metadata(remote_path.clone()))
+                .ok()
+                .and_then(|meta| meta.size)
+                .unwrap_or(0);
+            let file = match handle.block_on(session.open(remote_path.clone())) {
+                Ok(file) => file,
                 Err(e) => {
-                    crate::log!("remote video fetch failed for {remote_path}: {e}");
+                    crate::log!("remote video open failed for {remote_path}: {e}");
                     return;
                 }
             };
-            let mut temp = match tempfile::Builder::new().suffix(&suffix).tempfile() {
-                Ok(temp) => temp,
-                Err(e) => {
-                    crate::log!("temp file for {remote_path} failed: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = temp.write_all(&bytes) {
-                crate::log!("temp write for {remote_path} failed: {e}");
-                return;
-            }
-            // `temp` stays alive (and on disk) until this thread returns.
-            match VideoDecoder::open(temp.path()) {
+            match VideoDecoder::open_sftp(handle, file, size) {
                 Ok(decoder) => decode_loop(decoder, &tx, &shared),
                 Err(e) => crate::log!("remote video decode failed for {remote_path}: {e}"),
             }
