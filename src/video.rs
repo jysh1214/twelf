@@ -5,13 +5,18 @@ use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
 use ffmpeg::frame::Video;
 use russh_sftp::client::SftpSession;
+use russh_sftp::client::fs::File;
 use std::collections::VecDeque;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 static FFMPEG_INIT: Once = Once::new();
 
@@ -41,6 +46,9 @@ pub struct VideoDecoder {
     time_base: f64,
     pending: VecDeque<Frame>,
     drained: bool,
+    /// Backing for a custom-AVIO (remote) input; `None` for a path-based one.
+    /// Declared last so it is freed only after `input` has been closed.
+    _avio: Option<AvioGuard>,
 }
 
 impl VideoDecoder {
@@ -49,6 +57,75 @@ impl VideoDecoder {
             let _ = ffmpeg::init();
         });
         let input = ffmpeg::format::input(&path)?;
+        Self::from_input(input, None)
+    }
+
+    /// Open a decoder that reads `file` (an SFTP file of `size` bytes) through a
+    /// custom AVIO doing on-demand range reads, so the demuxer can read any
+    /// offset — including a trailing MP4 index — without a whole-file download.
+    fn open_sftp(
+        handle: tokio::runtime::Handle,
+        file: File,
+        size: u64,
+    ) -> Result<Self, ffmpeg::Error> {
+        FFMPEG_INIT.call_once(|| {
+            let _ = ffmpeg::init();
+        });
+        unsafe {
+            let reader = Box::into_raw(Box::new(SftpReader {
+                handle,
+                file,
+                pos: 0,
+                size,
+            }));
+            let buffer_size: c_int = 1 << 16;
+            let buffer = ffmpeg::ffi::av_malloc(buffer_size as usize) as *mut u8;
+            if buffer.is_null() {
+                drop(Box::from_raw(reader));
+                return Err(ffmpeg::Error::Unknown);
+            }
+            let avio = ffmpeg::ffi::avio_alloc_context(
+                buffer,
+                buffer_size,
+                0,
+                reader as *mut c_void,
+                Some(avio_read),
+                None,
+                Some(avio_seek),
+            );
+            if avio.is_null() {
+                ffmpeg::ffi::av_free(buffer as *mut c_void);
+                drop(Box::from_raw(reader));
+                return Err(ffmpeg::Error::Unknown);
+            }
+            let mut ctx = ffmpeg::ffi::avformat_alloc_context();
+            if ctx.is_null() {
+                free_avio(avio, reader);
+                return Err(ffmpeg::Error::Unknown);
+            }
+            (*ctx).pb = avio;
+            (*ctx).flags |= ffmpeg::ffi::AVFMT_FLAG_CUSTOM_IO as c_int;
+            let ret =
+                ffmpeg::ffi::avformat_open_input(&mut ctx, ptr::null(), ptr::null(), ptr::null_mut());
+            if ret < 0 {
+                // open_input frees `ctx` on failure but leaves our custom pb.
+                free_avio(avio, reader);
+                return Err(ffmpeg::Error::from(ret));
+            }
+            if ffmpeg::ffi::avformat_find_stream_info(ctx, ptr::null_mut()) < 0 {
+                ffmpeg::ffi::avformat_close_input(&mut ctx);
+                free_avio(avio, reader);
+                return Err(ffmpeg::Error::Unknown);
+            }
+            let input = ffmpeg::format::context::Input::wrap(ctx);
+            Self::from_input(input, Some(AvioGuard { avio, opaque: reader }))
+        }
+    }
+
+    fn from_input(
+        input: ffmpeg::format::context::Input,
+        avio: Option<AvioGuard>,
+    ) -> Result<Self, ffmpeg::Error> {
         let stream = input
             .streams()
             .best(Type::Video)
@@ -76,6 +153,7 @@ impl VideoDecoder {
             time_base,
             pending: VecDeque::new(),
             drained: false,
+            _avio: avio,
         })
     }
 
@@ -136,6 +214,93 @@ impl VideoDecoder {
         self.drained = false;
         Ok(())
     }
+}
+
+/// Opaque behind a remote input's custom AVIO: the runtime handle used to drive
+/// blocking SFTP reads, the open remote file, the current read position, and the
+/// total size (for `AVSEEK_SIZE`/`SEEK_END`).
+struct SftpReader {
+    handle: tokio::runtime::Handle,
+    file: File,
+    pos: u64,
+    size: u64,
+}
+
+/// Owns a remote input's `AVIOContext` and its `SftpReader`, freeing both when
+/// the decoder is dropped — after its `Input` has closed the format context.
+struct AvioGuard {
+    avio: *mut ffmpeg::ffi::AVIOContext,
+    opaque: *mut SftpReader,
+}
+
+impl Drop for AvioGuard {
+    fn drop(&mut self) {
+        unsafe { free_avio(self.avio, self.opaque) }
+    }
+}
+
+unsafe fn free_avio(avio: *mut ffmpeg::ffi::AVIOContext, reader: *mut SftpReader) {
+    unsafe {
+        if !avio.is_null() {
+            ffmpeg::ffi::av_freep(&mut (*avio).buffer as *mut _ as *mut c_void);
+            let mut avio = avio;
+            ffmpeg::ffi::avio_context_free(&mut avio);
+        }
+        drop(Box::from_raw(reader));
+    }
+}
+
+/// Custom AVIO read: range-read `buf_size` bytes at the current position straight
+/// from the remote file. Reports an error (not EOF) on an SFTP failure so the
+/// demuxer stops instead of looping.
+unsafe extern "C" fn avio_read(opaque: *mut c_void, buf: *mut u8, buf_size: c_int) -> c_int {
+    let reader = unsafe { &mut *(opaque as *mut SftpReader) };
+    let want = buf_size.max(0) as usize;
+    if want == 0 {
+        return 0;
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, want) };
+    let pos = reader.pos;
+    let handle = reader.handle.clone();
+    let file = &mut reader.file;
+    let result = handle.block_on(async move {
+        file.seek(SeekFrom::Start(pos)).await?;
+        file.read(slice).await
+    });
+    match result {
+        Ok(0) => ffmpeg::ffi::AVERROR_EOF,
+        Ok(n) => {
+            reader.pos += n as u64;
+            n as c_int
+        }
+        Err(_) => ffmpeg::ffi::AVERROR_EXTERNAL,
+    }
+}
+
+/// Custom AVIO seek. `AVSEEK_SIZE` and `SEEK_END` need the total size and fail if
+/// it is unknown; otherwise the position is just recorded for the next read.
+unsafe extern "C" fn avio_seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+    const SEEK_SET: c_int = 0;
+    const SEEK_CUR: c_int = 1;
+    const SEEK_END: c_int = 2;
+    const AVSEEK_SIZE: c_int = 0x10000;
+    const AVSEEK_FORCE: c_int = 0x20000;
+    let reader = unsafe { &mut *(opaque as *mut SftpReader) };
+    let whence = whence & !AVSEEK_FORCE;
+    if whence & AVSEEK_SIZE != 0 {
+        return if reader.size > 0 { reader.size as i64 } else { -1 };
+    }
+    let new = match whence {
+        SEEK_SET => offset,
+        SEEK_CUR => reader.pos as i64 + offset,
+        SEEK_END if reader.size > 0 => reader.size as i64 + offset,
+        _ => return -1,
+    };
+    if new < 0 {
+        return -1;
+    }
+    reader.pos = new as u64;
+    new
 }
 
 /// ffmpeg's `AV_TIME_BASE`: durations and seek timestamps are in microseconds.
