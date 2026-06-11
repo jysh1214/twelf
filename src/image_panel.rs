@@ -91,8 +91,12 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                             let (texture, remaining) = anim.frame(ui.ctx());
                             ui.ctx().request_repaint_after(remaining);
                             Some(egui::Image::new(texture))
-                        } else {
+                        } else if !crate::video::is_video(&uri) {
                             Some(egui::Image::new(uri))
+                        } else {
+                            // A video with no live player (e.g. disconnected): the
+                            // image loaders must not fetch it whole.
+                            None
                         };
                         if let Some(image) = image {
                             ui.add(image.max_size(image_size).maintain_aspect_ratio(true));
