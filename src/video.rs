@@ -11,6 +11,7 @@ use std::io::SeekFrom;
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
@@ -73,6 +74,7 @@ impl VideoDecoder {
         handle: tokio::runtime::Handle,
         file: File,
         size: u64,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Self, ffmpeg::Error> {
         FFMPEG_INIT.call_once(|| {
             let _ = ffmpeg::init();
@@ -83,6 +85,7 @@ impl VideoDecoder {
                 file,
                 pos: 0,
                 size,
+                cancel,
             }));
             let buffer_size: c_int = 1 << 16;
             let buffer = ffmpeg::ffi::av_malloc(buffer_size as usize) as *mut u8;
@@ -248,6 +251,8 @@ struct SftpReader {
     file: File,
     pos: u64,
     size: u64,
+    /// Set when the player is dropped; the next read aborts the decode.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Owns a remote input's `AVIOContext` and its `SftpReader`, freeing both when
@@ -288,6 +293,10 @@ unsafe extern "C" fn avio_read(opaque: *mut c_void, buf: *mut u8, buf_size: c_in
     // not unwind across the C boundary — that aborts the process.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let reader = unsafe { &mut *(opaque as *mut SftpReader) };
+        // A dropped player aborts the decode here, mid-probe included.
+        if reader.cancel.load(Ordering::Relaxed) {
+            return ffmpeg::ffi::AVERROR_EXIT;
+        }
         let want = buf_size.max(0) as usize;
         if want == 0 {
             return 0;
@@ -397,18 +406,29 @@ pub struct VideoPlayer {
     texture: Option<egui::TextureHandle>,
     /// Set once the worker is gone: the failure to show instead of the video.
     error: Option<String>,
+    /// Tells the worker to stop; set when the player drops.
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for VideoPlayer {
+    /// Abandoned workers must stop promptly: this interrupts the next AVIO read
+    /// (mid-probe included) and the decode loop's next iteration — the send-side
+    /// `Disconnected` alone is never seen during the open-phase probe.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl VideoPlayer {
     pub fn open(uri: String, path: PathBuf) -> Self {
-        Self::spawn(uri, move |tx, shared| {
+        Self::spawn(uri, move |tx, shared, cancel| {
             // ffmpeg-next unwraps to_str(), so a non-UTF-8 path would panic the worker.
             if path.to_str().is_none() {
                 report_error(&shared, format!("video path is not UTF-8: {}", path.display()));
                 return;
             }
             match VideoDecoder::open(&path) {
-                Ok(decoder) => decode_loop(decoder, &tx, &shared),
+                Ok(decoder) => decode_loop(decoder, &tx, &shared, &cancel),
                 Err(e) => {
                     report_error(&shared, format!("video open failed for {}: {e}", path.display()))
                 }
@@ -426,7 +446,7 @@ impl VideoPlayer {
         handle: tokio::runtime::Handle,
         remote_path: String,
     ) -> Self {
-        Self::spawn(uri, move |tx, shared| {
+        Self::spawn(uri, move |tx, shared, cancel| {
             let size = handle
                 .block_on(session.metadata(remote_path.clone()))
                 .ok()
@@ -439,11 +459,13 @@ impl VideoPlayer {
                     return;
                 }
             };
-            match VideoDecoder::open_sftp(handle, file, size) {
-                Ok(decoder) => decode_loop(decoder, &tx, &shared),
-                Err(e) => {
+            match VideoDecoder::open_sftp(handle, file, size, cancel.clone()) {
+                Ok(decoder) => decode_loop(decoder, &tx, &shared, &cancel),
+                // A cancelled probe is not a failure worth surfacing.
+                Err(e) if !cancel.load(Ordering::Relaxed) => {
                     report_error(&shared, format!("remote video decode failed for {remote_path}: {e}"))
                 }
+                Err(_) => {}
             }
         })
     }
@@ -452,12 +474,14 @@ impl VideoPlayer {
     /// The decoder and its non-Send scaler live entirely on the worker thread.
     fn spawn(
         uri: String,
-        body: impl FnOnce(SyncSender<TimedFrame>, Arc<Mutex<Shared>>) + Send + 'static,
+        body: impl FnOnce(SyncSender<TimedFrame>, Arc<Mutex<Shared>>, Arc<AtomicBool>) + Send + 'static,
     ) -> Self {
         let (tx, rx) = sync_channel(FRAME_BUFFER);
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
         let worker_shared = shared.clone();
-        thread::spawn(move || body(tx, worker_shared));
+        let worker_cancel = cancel.clone();
+        thread::spawn(move || body(tx, worker_shared, worker_cancel));
         Self {
             uri,
             rx,
@@ -469,6 +493,7 @@ impl VideoPlayer {
             next: None,
             texture: None,
             error: None,
+            cancel,
         }
     }
 
@@ -586,10 +611,18 @@ impl VideoPlayer {
 /// Decode frames forever — looping at EOF and honoring seek requests — pushing
 /// each onto the channel with its position and seek generation. Returns when the
 /// player is dropped (send fails) or decoding errors.
-fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &Arc<Mutex<Shared>>) {
+fn decode_loop(
+    mut decoder: VideoDecoder,
+    tx: &SyncSender<TimedFrame>,
+    shared: &Arc<Mutex<Shared>>,
+    cancel: &AtomicBool,
+) {
     shared.lock().unwrap().duration = decoder.duration();
     let mut generation = 0;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return; // player dropped
+        }
         // Apply a pending seek before producing the next frame.
         let target = {
             let mut s = shared.lock().unwrap();
@@ -598,7 +631,9 @@ fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &
         if let Some(target) = target
             && let Err(e) = decoder.seek_to(target)
         {
-            report_error(shared, format!("video seek failed: {e}"));
+            if !cancel.load(Ordering::Relaxed) {
+                report_error(shared, format!("video seek failed: {e}"));
+            }
             return;
         }
         match decoder.next_frame() {
@@ -626,12 +661,16 @@ fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &
             Ok(None) => {
                 // Loop back to the start.
                 if let Err(e) = decoder.seek_to(0.0) {
-                    report_error(shared, format!("video restart failed: {e}"));
+                    if !cancel.load(Ordering::Relaxed) {
+                        report_error(shared, format!("video restart failed: {e}"));
+                    }
                     return;
                 }
             }
             Err(e) => {
-                report_error(shared, format!("video decode failed: {e}"));
+                if !cancel.load(Ordering::Relaxed) {
+                    report_error(shared, format!("video decode failed: {e}"));
+                }
                 return;
             }
         }
@@ -661,7 +700,7 @@ mod tests {
     /// Player whose worker sends one frame per position, then exits.
     fn player_with(positions: &[f64]) -> VideoPlayer {
         let positions = positions.to_vec();
-        VideoPlayer::spawn("test://video".to_string(), move |tx, _shared| {
+        VideoPlayer::spawn("test://video".to_string(), move |tx, _shared, _cancel| {
             for position in positions {
                 let frame = TimedFrame {
                     image: ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]),
@@ -764,7 +803,7 @@ mod tests {
     #[test]
     fn reported_worker_failure_surfaces() {
         let ctx = egui::Context::default();
-        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, shared| {
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, shared, _cancel| {
             report_error(&shared, "boom".to_string());
         });
         assert_eq!(wait_for_error(&mut player, &ctx), "boom");
@@ -773,14 +812,15 @@ mod tests {
     #[test]
     fn silent_worker_death_gets_fallback_message() {
         let ctx = egui::Context::default();
-        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, _shared| {});
+        let mut player =
+            VideoPlayer::spawn("test://video".to_string(), |_tx, _shared, _cancel| {});
         assert_eq!(wait_for_error(&mut player, &ctx), "playback stopped unexpectedly");
     }
 
     #[test]
     fn buffered_frame_lands_before_the_error() {
         let ctx = egui::Context::default();
-        let mut player = VideoPlayer::spawn("test://video".to_string(), |tx, shared| {
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |tx, shared, _cancel| {
             let frame = TimedFrame {
                 image: ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]),
                 position: 1.5,
