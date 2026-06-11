@@ -309,6 +309,11 @@ const AV_TIME_BASE: f64 = 1_000_000.0;
 /// memory it holds for a looping (otherwise unbounded) stream.
 const FRAME_BUFFER: usize = 6;
 
+/// Forward position jump (seconds) treated as a stream discontinuity rather than a
+/// wait until its wall-clock time: ffplay's no-sync threshold. Below it, playback
+/// waits the gap out in real time, which keeps low-fps content paced.
+const NOSYNC_THRESHOLD: f64 = 10.0;
+
 struct TimedFrame {
     image: ColorImage,
     /// In-file presentation time in seconds.
@@ -453,12 +458,16 @@ impl VideoPlayer {
                 self.next = None; // stale pre-seek frame
                 continue;
             }
-            // Re-anchor on the first frame, a seek, or a loop-back to an earlier position.
+            // Re-anchor on the first frame, a seek, or a discontinuity against the
+            // playing position: a jump back (loop) or past the no-sync threshold.
             let reanchor = match self.anchor {
                 None => true,
-                Some((_, p0)) => frame.position + 1e-3 < p0,
+                Some(_) => {
+                    let delta = frame.position - self.position;
+                    delta < -1e-3 || delta > NOSYNC_THRESHOLD
+                }
             };
-            // While paused, only land a re-anchoring frame (first/seek/loop), then hold.
+            // While paused, only land a re-anchoring frame (first/seek/jump), then hold.
             let due = reanchor
                 || (!self.paused
                     && matches!(self.anchor, Some((t0, p0)) if frame.position - p0 <= t0.elapsed().as_secs_f64()));
