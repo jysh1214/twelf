@@ -232,3 +232,19 @@ pub fn render_remote_tree(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_prefetch_skips_videos() {
+        let children = vec![
+            RemoteTreeNode::child(PathBuf::from("/photos/a.jpg"), "a.jpg".to_string(), false),
+            RemoteTreeNode::child(PathBuf::from("/photos/b.mkv"), "b.mkv".to_string(), false),
+            RemoteTreeNode::child(PathBuf::from("/photos/sub"), "sub".to_string(), true),
+        ];
+        let uris = image_prefetch_uris(&children, "nas");
+        assert_eq!(uris, vec!["sftp://nas/photos/a.jpg".to_string()]);
+    }
+}
