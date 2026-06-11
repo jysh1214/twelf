@@ -284,53 +284,62 @@ unsafe fn free_avio(avio: *mut ffmpeg::ffi::AVIOContext, reader: *mut SftpReader
 /// from the remote file. Reports an error (not EOF) on an SFTP failure so the
 /// demuxer stops instead of looping.
 unsafe extern "C" fn avio_read(opaque: *mut c_void, buf: *mut u8, buf_size: c_int) -> c_int {
-    let reader = unsafe { &mut *(opaque as *mut SftpReader) };
-    let want = buf_size.max(0) as usize;
-    if want == 0 {
-        return 0;
-    }
-    let slice = unsafe { std::slice::from_raw_parts_mut(buf, want) };
-    let pos = reader.pos;
-    let handle = reader.handle.clone();
-    let file = &mut reader.file;
-    let result = handle.block_on(async move {
-        file.seek(SeekFrom::Start(pos)).await?;
-        file.read(slice).await
-    });
-    match result {
-        Ok(0) => ffmpeg::ffi::AVERROR_EOF,
-        Ok(n) => {
-            reader.pos += n as u64;
-            n as c_int
+    // A panic here (e.g. block_on while the runtime shuts down at app exit) must
+    // not unwind across the C boundary — that aborts the process.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let reader = unsafe { &mut *(opaque as *mut SftpReader) };
+        let want = buf_size.max(0) as usize;
+        if want == 0 {
+            return 0;
         }
-        Err(_) => ffmpeg::ffi::AVERROR_EXTERNAL,
-    }
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, want) };
+        let pos = reader.pos;
+        let handle = reader.handle.clone();
+        let file = &mut reader.file;
+        let result = handle.block_on(async move {
+            file.seek(SeekFrom::Start(pos)).await?;
+            file.read(slice).await
+        });
+        match result {
+            Ok(0) => ffmpeg::ffi::AVERROR_EOF,
+            Ok(n) => {
+                reader.pos += n as u64;
+                n as c_int
+            }
+            Err(_) => ffmpeg::ffi::AVERROR_EXTERNAL,
+        }
+    }))
+    .unwrap_or(ffmpeg::ffi::AVERROR_EXTERNAL)
 }
 
 /// Custom AVIO seek. `AVSEEK_SIZE` and `SEEK_END` need the total size and fail if
 /// it is unknown; otherwise the position is just recorded for the next read.
 unsafe extern "C" fn avio_seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
-    const SEEK_SET: c_int = 0;
-    const SEEK_CUR: c_int = 1;
-    const SEEK_END: c_int = 2;
-    const AVSEEK_SIZE: c_int = 0x10000;
-    const AVSEEK_FORCE: c_int = 0x20000;
-    let reader = unsafe { &mut *(opaque as *mut SftpReader) };
-    let whence = whence & !AVSEEK_FORCE;
-    if whence & AVSEEK_SIZE != 0 {
-        return if reader.size > 0 { reader.size as i64 } else { -1 };
-    }
-    let new = match whence {
-        SEEK_SET => offset,
-        SEEK_CUR => reader.pos as i64 + offset,
-        SEEK_END if reader.size > 0 => reader.size as i64 + offset,
-        _ => return -1,
-    };
-    if new < 0 {
-        return -1;
-    }
-    reader.pos = new as u64;
-    new
+    // Same unwind shield as `avio_read`: never panic across the C boundary.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const SEEK_SET: c_int = 0;
+        const SEEK_CUR: c_int = 1;
+        const SEEK_END: c_int = 2;
+        const AVSEEK_SIZE: c_int = 0x10000;
+        const AVSEEK_FORCE: c_int = 0x20000;
+        let reader = unsafe { &mut *(opaque as *mut SftpReader) };
+        let whence = whence & !AVSEEK_FORCE;
+        if whence & AVSEEK_SIZE != 0 {
+            return if reader.size > 0 { reader.size as i64 } else { -1 };
+        }
+        let new = match whence {
+            SEEK_SET => offset,
+            SEEK_CUR => reader.pos as i64 + offset,
+            SEEK_END if reader.size > 0 => reader.size as i64 + offset,
+            _ => return -1,
+        };
+        if new < 0 {
+            return -1;
+        }
+        reader.pos = new as u64;
+        new
+    }))
+    .unwrap_or(-1)
 }
 
 /// ffmpeg's `AV_TIME_BASE`: durations and seek timestamps are in microseconds.
