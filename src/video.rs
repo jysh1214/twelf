@@ -270,7 +270,13 @@ unsafe fn free_avio(avio: *mut ffmpeg::ffi::AVIOContext, reader: *mut SftpReader
             let mut avio = avio;
             ffmpeg::ffi::avio_context_free(&mut avio);
         }
-        drop(Box::from_raw(reader));
+        let reader = Box::from_raw(reader);
+        // russh-sftp's File sends its close request from Drop only when a tokio
+        // runtime context exists; the worker is a plain thread, so enter the
+        // stored handle or the server-side handle leaks for the session.
+        let handle = reader.handle.clone();
+        let _guard = handle.enter();
+        drop(reader);
     }
 }
 
