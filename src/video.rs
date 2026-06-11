@@ -569,3 +569,98 @@ fn to_color_image(frame: &Video) -> ColorImage {
     }
     ColorImage::from_rgba_unmultiplied([width, height], &pixels)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Player whose worker sends one frame per position, then exits.
+    fn player_with(positions: &[f64]) -> VideoPlayer {
+        let positions = positions.to_vec();
+        VideoPlayer::spawn("test://video".to_string(), move |tx, _shared| {
+            for position in positions {
+                let frame = TimedFrame {
+                    image: ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]),
+                    position,
+                    generation: 0,
+                };
+                if tx.send(frame).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Poll until the first frame has landed (`frame` yields a texture).
+    fn wait_for_first_frame(player: &mut VideoPlayer, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while player.frame(ctx).is_none() {
+            assert!(Instant::now() < deadline, "no frame landed within 2s");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Poll until a frame at `expected` lands. Discontinuous frames must land far
+    /// inside the deadline; a frame paced that far ahead would miss it.
+    fn wait_for_position(player: &mut VideoPlayer, ctx: &egui::Context, expected: f64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (player.position() - expected).abs() > 1e-9 {
+            assert!(
+                Instant::now() < deadline,
+                "frame at {expected} not landed within 2s (position {})",
+                player.position()
+            );
+            player.frame(ctx);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Poll for `hold`, asserting the position stays at `expected` throughout.
+    fn assert_position_holds(player: &mut VideoPlayer, ctx: &egui::Context, expected: f64, hold: Duration) {
+        let until = Instant::now() + hold;
+        while Instant::now() < until {
+            player.frame(ctx);
+            assert!(
+                (player.position() - expected).abs() < 1e-9,
+                "position moved to {} before its time",
+                player.position()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn loop_restart_reanchors_instead_of_fast_forwarding() {
+        let ctx = egui::Context::default();
+        // The bug shape: the loop restarts at the same pts the clock was anchored
+        // to, which the old anchor-relative test could never classify as a jump.
+        let mut player = player_with(&[10.0, 10.4, 10.8, 10.0, 10.4, 10.8]);
+        wait_for_first_frame(&mut player, &ctx);
+        wait_for_position(&mut player, &ctx, 10.4);
+        // The loop-back frame re-anchors and lands (10.8 cascades into it, so
+        // 10.0 is the next stable position)...
+        wait_for_position(&mut player, &ctx, 10.0);
+        // ...and the frames behind it are paced from the new anchor instead of
+        // being instantly due against the stale one (the fast-forward bug).
+        assert_position_holds(&mut player, &ctx, 10.0, Duration::from_millis(200));
+        wait_for_position(&mut player, &ctx, 10.4);
+    }
+
+    #[test]
+    fn forward_gap_reanchors_immediately() {
+        let ctx = egui::Context::default();
+        let mut player = player_with(&[0.0, 60.0]);
+        wait_for_first_frame(&mut player, &ctx);
+        // 60s exceeds the no-sync threshold: landing must not wait for the gap.
+        wait_for_position(&mut player, &ctx, 60.0);
+    }
+
+    #[test]
+    fn continuous_frame_waits_for_presentation_time() {
+        let ctx = egui::Context::default();
+        let mut player = player_with(&[0.0, 2.0]);
+        wait_for_first_frame(&mut player, &ctx);
+        // 2s ahead is below the threshold: still paced, not landed early.
+        assert_position_holds(&mut player, &ctx, 0.0, Duration::from_millis(300));
+    }
+}
