@@ -188,7 +188,7 @@ impl VideoDecoder {
         while self.decoder.receive_frame(&mut decoded).is_ok() {
             let mut rgba = Video::empty();
             self.scaler.run(&decoded, &mut rgba)?;
-            let pts = decoded.pts().unwrap_or(0) as f64 * self.time_base;
+            let pts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0) as f64 * self.time_base;
             self.pending.push_back(Frame {
                 image: to_color_image(&rgba),
                 pts,
