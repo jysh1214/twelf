@@ -11,7 +11,7 @@ use std::io::SeekFrom;
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -323,12 +323,20 @@ struct TimedFrame {
 }
 
 /// State shared with the worker: pending seek requests, the current seek
-/// generation, and the duration the worker fills in once the file is open.
+/// generation, the duration the worker fills in once the file is open, and the
+/// failure a dying worker reports.
 #[derive(Default)]
 struct Shared {
     seek_request: Option<f64>,
     generation: u64,
     duration: f64,
+    error: Option<String>,
+}
+
+/// Record a worker failure for the player to surface; also logged for debugging.
+fn report_error(shared: &Mutex<Shared>, msg: String) {
+    crate::log!("{msg}");
+    shared.lock().unwrap().error = Some(msg);
 }
 
 /// Plays a video: a worker thread decodes (looping, and honoring seeks) into a
@@ -347,13 +355,15 @@ pub struct VideoPlayer {
     position: f64,
     next: Option<TimedFrame>,
     texture: Option<egui::TextureHandle>,
+    /// Set once the worker is gone: the failure to show instead of the video.
+    error: Option<String>,
 }
 
 impl VideoPlayer {
     pub fn open(uri: String, path: PathBuf) -> Self {
         Self::spawn(uri, move |tx, shared| match VideoDecoder::open(&path) {
             Ok(decoder) => decode_loop(decoder, &tx, &shared),
-            Err(e) => crate::log!("video open failed for {}: {e}", path.display()),
+            Err(e) => report_error(&shared, format!("video open failed for {}: {e}", path.display())),
         })
     }
 
@@ -376,13 +386,15 @@ impl VideoPlayer {
             let file = match handle.block_on(session.open(remote_path.clone())) {
                 Ok(file) => file,
                 Err(e) => {
-                    crate::log!("remote video open failed for {remote_path}: {e}");
+                    report_error(&shared, format!("remote video open failed for {remote_path}: {e}"));
                     return;
                 }
             };
             match VideoDecoder::open_sftp(handle, file, size) {
                 Ok(decoder) => decode_loop(decoder, &tx, &shared),
-                Err(e) => crate::log!("remote video decode failed for {remote_path}: {e}"),
+                Err(e) => {
+                    report_error(&shared, format!("remote video decode failed for {remote_path}: {e}"))
+                }
             }
         })
     }
@@ -407,7 +419,13 @@ impl VideoPlayer {
             position: 0.0,
             next: None,
             texture: None,
+            error: None,
         }
+    }
+
+    /// The failure that ended playback, if the worker has died.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -451,7 +469,18 @@ impl VideoPlayer {
         let options = egui::TextureOptions::LINEAR;
         loop {
             if self.next.is_none() {
-                self.next = self.rx.try_recv().ok();
+                match self.rx.try_recv() {
+                    Ok(frame) => self.next = Some(frame),
+                    Err(TryRecvError::Empty) => {}
+                    // Buffered frames drain first, so this is the worker's true end.
+                    Err(TryRecvError::Disconnected) => {
+                        if self.error.is_none() {
+                            self.error = Some(self.shared.lock().unwrap().error.clone().unwrap_or_else(
+                                || "playback stopped unexpectedly".to_string(),
+                            ));
+                        }
+                    }
+                }
             }
             let Some(frame) = self.next.as_ref() else { break };
             if frame.generation != self.generation {
@@ -518,8 +547,9 @@ fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &
             s.seek_request.take().inspect(|_| generation = s.generation)
         };
         if let Some(target) = target
-            && decoder.seek_to(target).is_err()
+            && let Err(e) = decoder.seek_to(target)
         {
+            report_error(shared, format!("video seek failed: {e}"));
             return;
         }
         match decoder.next_frame() {
@@ -545,11 +575,16 @@ fn decode_loop(mut decoder: VideoDecoder, tx: &SyncSender<TimedFrame>, shared: &
                 }
             }
             Ok(None) => {
-                if decoder.seek_to(0.0).is_err() {
-                    return; // loop back to the start
+                // Loop back to the start.
+                if let Err(e) = decoder.seek_to(0.0) {
+                    report_error(shared, format!("video restart failed: {e}"));
+                    return;
                 }
             }
-            Err(_) => return,
+            Err(e) => {
+                report_error(shared, format!("video decode failed: {e}"));
+                return;
+            }
         }
     }
 }
