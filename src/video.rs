@@ -382,9 +382,18 @@ pub struct VideoPlayer {
 
 impl VideoPlayer {
     pub fn open(uri: String, path: PathBuf) -> Self {
-        Self::spawn(uri, move |tx, shared| match VideoDecoder::open(&path) {
-            Ok(decoder) => decode_loop(decoder, &tx, &shared),
-            Err(e) => report_error(&shared, format!("video open failed for {}: {e}", path.display())),
+        Self::spawn(uri, move |tx, shared| {
+            // ffmpeg-next unwraps to_str(), so a non-UTF-8 path would panic the worker.
+            if path.to_str().is_none() {
+                report_error(&shared, format!("video path is not UTF-8: {}", path.display()));
+                return;
+            }
+            match VideoDecoder::open(&path) {
+                Ok(decoder) => decode_loop(decoder, &tx, &shared),
+                Err(e) => {
+                    report_error(&shared, format!("video open failed for {}: {e}", path.display()))
+                }
+            }
         })
     }
 
