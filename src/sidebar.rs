@@ -25,8 +25,9 @@ impl TreeNode {
         }
     }
 
-    /// Walk the loaded subtree depth-first and collect every image's full path.
-    /// Folders whose children are `None` (not yet expanded) contribute nothing.
+    /// Walk the loaded subtree depth-first and collect every media file's full
+    /// path (image or video). Folders whose children are `None` (not yet
+    /// expanded) contribute nothing.
     pub fn collect_images(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
         self.collect_images_into(&mut out);

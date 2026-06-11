@@ -49,8 +49,9 @@ impl RemoteTreeNode {
         Self { path, name, kind }
     }
 
-    /// Walk the loaded subtree depth-first and collect every image's full path.
-    /// `Unloaded`, `Loading`, or `Error` folders contribute nothing.
+    /// Walk the loaded subtree depth-first and collect every media file's full
+    /// path (image or video). `Unloaded`, `Loading`, or `Error` folders
+    /// contribute nothing.
     pub fn collect_images(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
         self.collect_images_into(&mut out);
