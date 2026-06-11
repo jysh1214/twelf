@@ -130,6 +130,21 @@ async fn list_remote_children(
     Ok(nodes)
 }
 
+/// URIs the Load action prefetches: every image under the loaded children, as
+/// `sftp://{host}{path}`. Videos (and anything else non-image) are skipped —
+/// the image pipeline would download them whole only to fail decoding.
+fn image_prefetch_uris(children: &[RemoteTreeNode], host: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for child in children {
+        child.collect_images_into(&mut paths);
+    }
+    paths
+        .into_iter()
+        .filter(|path| sidebar::is_image(path))
+        .map(|path| format!("sftp://{host}{}", path.display()))
+        .collect()
+}
+
 pub fn render_remote_tree(
     ui: &mut egui::Ui,
     node: &mut RemoteTreeNode,
@@ -208,13 +223,7 @@ pub fn render_remote_tree(
             collapsing.header_response.context_menu(|ui| {
                 if ui.button("Load").clicked() {
                     if let RemoteDirChildren::Loaded(c) = children_ref {
-                        let mut paths = Vec::new();
-                        for child in c {
-                            child.collect_images_into(&mut paths);
-                        }
-                        for path in paths {
-                            prefetch.push_back(format!("sftp://{host}{}", path.display()));
-                        }
+                        prefetch.extend(image_prefetch_uris(c, host));
                     }
                     ui.close();
                 }
