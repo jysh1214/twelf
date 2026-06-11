@@ -34,6 +34,11 @@ pub struct Frame {
     pub pts: f64,
 }
 
+/// Consecutive `send_packet` rejections tolerated before decoding is declared
+/// dead: isolated corruption is skipped, a stream that no longer decodes ends
+/// (reported) instead of looping silently.
+const MAX_DECODE_ERRORS: u32 = 100;
+
 /// Pull-based decoder for a single video file: reads packets, decodes the video
 /// stream, and scales each frame to RGBA. Frames come out in decode order with a
 /// presentation timestamp the player uses to pace playback.
@@ -45,6 +50,8 @@ pub struct VideoDecoder {
     time_base: f64,
     pending: VecDeque<Frame>,
     drained: bool,
+    /// Consecutive rejected packets; decoding is declared dead past the cap.
+    decode_errors: u32,
     /// Backing for a custom-AVIO (remote) input; `None` for a path-based one.
     /// Declared last so it is freed only after `input` has been closed.
     _avio: Option<AvioGuard>,
@@ -152,6 +159,7 @@ impl VideoDecoder {
             time_base,
             pending: VecDeque::new(),
             drained: false,
+            decode_errors: 0,
             _avio: avio,
         })
     }
@@ -169,8 +177,20 @@ impl VideoDecoder {
             match packet.read(&mut self.input) {
                 Ok(()) => {
                     if packet.stream() == self.stream_index {
-                        self.decoder.send_packet(&packet)?;
-                        self.receive_frames()?;
+                        match self.decoder.send_packet(&packet) {
+                            Ok(()) => {
+                                self.decode_errors = 0;
+                                self.receive_frames()?;
+                            }
+                            // Skip packets the decoder rejects (isolated corruption)
+                            // until nothing decodes anymore.
+                            Err(e) => {
+                                self.decode_errors += 1;
+                                if self.decode_errors > MAX_DECODE_ERRORS {
+                                    return Err(e);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
@@ -211,6 +231,7 @@ impl VideoDecoder {
         self.decoder.flush();
         self.pending.clear();
         self.drained = false;
+        self.decode_errors = 0;
         Ok(())
     }
 }
