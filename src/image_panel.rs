@@ -1,5 +1,6 @@
 use crate::TwelfApp;
 use eframe::egui;
+use std::time::Duration;
 
 pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     let prev_zoom = app.zoom;
@@ -66,14 +67,22 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         let image = if let Some(player) =
                             app.video.as_mut().filter(|p| p.uri == uri)
                         {
-                            match player.frame(ui.ctx()) {
-                                Some((texture, delay)) => {
-                                    ui.ctx().request_repaint_after(delay);
-                                    Some(egui::Image::new(texture))
-                                }
-                                None => {
-                                    ui.ctx().request_repaint(); // decoding; nothing yet
-                                    None
+                            let frame = player.frame(ui.ctx());
+                            if let Some(error) = player.error() {
+                                // Worker died: show why; repaint only on input.
+                                ui.colored_label(egui::Color32::RED, error);
+                                None
+                            } else {
+                                match frame {
+                                    Some((texture, delay)) => {
+                                        ui.ctx().request_repaint_after(delay);
+                                        Some(egui::Image::new(texture))
+                                    }
+                                    None => {
+                                        // Decoding; nothing to show yet.
+                                        ui.ctx().request_repaint_after(Duration::from_millis(50));
+                                        None
+                                    }
                                 }
                             }
                         } else if let Some(anim) =
@@ -91,7 +100,10 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     },
                 );
             });
-            if video_active && let Some(player) = app.video.as_mut() {
+            if video_active
+                && let Some(player) = app.video.as_mut()
+                && player.error().is_none()
+            {
                 // Anchor to the central panel's bottom-center, not the whole window
                 // (the side panel would otherwise pull it off-center).
                 let screen = ui.ctx().content_rect();
