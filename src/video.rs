@@ -835,6 +835,24 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_player_cancels_the_worker() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_in_worker = stopped.clone();
+        let player = VideoPlayer::spawn("test://video".to_string(), move |_tx, _shared, cancel| {
+            while !cancel.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            stopped_in_worker.store(true, Ordering::Relaxed);
+        });
+        drop(player);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stopped.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "worker not cancelled within 2s");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn non_utf8_path_fails_without_panicking() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
