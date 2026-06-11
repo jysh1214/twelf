@@ -728,4 +728,61 @@ mod tests {
         // 2s ahead is below the threshold: still paced, not landed early.
         assert_position_holds(&mut player, &ctx, 0.0, Duration::from_millis(300));
     }
+
+    /// Poll until the player surfaces an error, or panic after a timeout.
+    fn wait_for_error(player: &mut VideoPlayer, ctx: &egui::Context) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            player.frame(ctx);
+            if let Some(error) = player.error() {
+                return error.to_string();
+            }
+            assert!(Instant::now() < deadline, "no error surfaced within 2s");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn reported_worker_failure_surfaces() {
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, shared| {
+            report_error(&shared, "boom".to_string());
+        });
+        assert_eq!(wait_for_error(&mut player, &ctx), "boom");
+    }
+
+    #[test]
+    fn silent_worker_death_gets_fallback_message() {
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, _shared| {});
+        assert_eq!(wait_for_error(&mut player, &ctx), "playback stopped unexpectedly");
+    }
+
+    #[test]
+    fn buffered_frame_lands_before_the_error() {
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |tx, shared| {
+            let frame = TimedFrame {
+                image: ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]),
+                position: 1.5,
+                generation: 0,
+            };
+            let _ = tx.send(frame);
+            report_error(&shared, "died after one frame".to_string());
+        });
+        wait_for_first_frame(&mut player, &ctx);
+        assert_eq!(player.position(), 1.5);
+        assert_eq!(wait_for_error(&mut player, &ctx), "died after one frame");
+    }
+
+    #[test]
+    fn non_utf8_path_fails_without_panicking() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(OsStr::from_bytes(b"/tmp/f\xFFlm.mp4"));
+        let mut player = VideoPlayer::open("file:///tmp/film.mp4".to_string(), path);
+        let error = wait_for_error(&mut player, &ctx);
+        assert!(error.contains("not UTF-8"), "unexpected error: {error}");
+    }
 }
