@@ -63,7 +63,7 @@ impl VideoDecoder {
             let _ = ffmpeg::init();
         });
         let input = ffmpeg::format::input(&path)?;
-        Self::from_input(input, None)
+        Self::from_input(None, input)
     }
 
     /// Open a decoder that reads `file` (an SFTP file of `size` bytes) through a
@@ -124,13 +124,17 @@ impl VideoDecoder {
                 return Err(ffmpeg::Error::Unknown);
             }
             let input = ffmpeg::format::context::Input::wrap(ctx);
-            Self::from_input(input, Some(AvioGuard { avio, opaque: reader }))
+            Self::from_input(Some(AvioGuard { avio, opaque: reader }), input)
         }
     }
 
+    /// `avio` is declared before `input` on purpose: parameters drop in reverse
+    /// declaration order, so the early `?` returns below close the format context
+    /// (whose `pb` points into the AVIO) before the guard frees it — the same
+    /// invariant the struct's field order keeps on the success path.
     fn from_input(
-        input: ffmpeg::format::context::Input,
         avio: Option<AvioGuard>,
+        input: ffmpeg::format::context::Input,
     ) -> Result<Self, ffmpeg::Error> {
         let stream = input
             .streams()
