@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 dirs = "6"
 eframe = "0.33"
-ffmpeg-next = "8"
+ffmpeg-next = { version = "8", default-features = false, features = ["format", "software-scaling"] }
 egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 libheif-rs = "2.7"
