@@ -51,6 +51,9 @@ struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
     scroll_target: Option<PathBuf>,
+    search_active: bool,
+    search_query: String,
+    search_cache: Option<(String, Vec<sidebar::SearchHit>)>,
     zoom: f32,
     last_displayed: Option<PathBuf>,
     ssh: ssh::SshState,
@@ -76,6 +79,9 @@ impl TwelfApp {
             root_node: None,
             selected_image: None,
             scroll_target: None,
+            search_active: false,
+            search_query: String::new(),
+            search_cache: None,
             zoom: 1.0,
             last_displayed: None,
             ssh: ssh::SshState::Disconnected,
@@ -157,6 +163,9 @@ impl eframe::App for TwelfApp {
                     self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
                     self.selected_remote = None;
                     self.scroll_target = None;
+                    self.search_active = false;
+                    self.search_query.clear();
+                    self.search_cache = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -202,6 +211,22 @@ impl eframe::App for TwelfApp {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         if reset_scroll {
             self.scroll_target = None;
+        }
+
+        // Ctrl+F opens the sidebar search and focuses its field. Ungated: the Ctrl
+        // modifier can't be confused with typing, and gating would make it dead while
+        // the search bar or SSH dialog is focused. Esc (only while searching, so it
+        // doesn't swallow other Escapes) closes the bar and clears the query.
+        let open_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F));
+        if open_search {
+            self.search_active = true;
+        }
+        if self.search_active
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.search_active = false;
+            self.search_query.clear();
+            self.search_cache = None;
         }
 
         menu_bar::render(self, ctx);
@@ -303,10 +328,44 @@ impl eframe::App for TwelfApp {
                 });
             } else {
                 // Captures the clicked image path — deferred to dodge the borrow
-                // on `&mut self.root_node` taken by `render_tree`.
+                // on `&mut self.root_node` taken by the renderers.
                 let mut new_selection: Option<PathBuf> = None;
+                if self.search_active {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    // Focus only on the frame Ctrl+F fired; focusing every frame would
+                    // trap the caret and stop clicks from landing on results.
+                    if open_search {
+                        response.request_focus();
+                    }
+                    ui.separator();
+                }
+                // Refresh the cached walk outside the scroll closure (it needs the root
+                // path and query). Re-walk only when the trimmed query changes — egui
+                // repaints ~60x/s, so an ungated walk would hit the disk every frame.
+                let searching = self.search_active && !self.search_query.trim().is_empty();
+                if searching && let Some(root) = self.root_node.as_ref() {
+                    let query = self.search_query.trim();
+                    if self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query) {
+                        let hits = sidebar::search_tree(root.path(), query);
+                        self.search_cache = Some((query.to_string(), hits));
+                    }
+                }
                 scroll().show(ui, |ui| {
-                    if let Some(root_node) = &mut self.root_node {
+                    if searching {
+                        if let Some((_, hits)) = &self.search_cache {
+                            sidebar::render_search_results(
+                                ui,
+                                hits,
+                                &self.selected_image,
+                                &mut self.scroll_target,
+                                &mut new_selection,
+                            );
+                        }
+                    } else if let Some(root_node) = &mut self.root_node {
                         sidebar::render_tree(
                             ui,
                             root_node,
