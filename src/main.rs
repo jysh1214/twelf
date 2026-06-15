@@ -51,6 +51,7 @@ struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
     scroll_target: Option<PathBuf>,
+    scroll_to_top: bool,
     zoom: f32,
     last_displayed: Option<PathBuf>,
     ssh: ssh::SshState,
@@ -76,6 +77,7 @@ impl TwelfApp {
             root_node: None,
             selected_image: None,
             scroll_target: None,
+            scroll_to_top: false,
             zoom: 1.0,
             last_displayed: None,
             ssh: ssh::SshState::Disconnected,
@@ -191,6 +193,16 @@ impl eframe::App for TwelfApp {
             player.toggle_pause();
         }
 
+        // Home snaps the side panel back to the root folder. Gated like Space so it
+        // still moves the caret in the SSH dialog; clearing the arrow-nav scroll
+        // target stops a pending row-scroll from fighting the reset this frame.
+        if !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home))
+        {
+            self.scroll_to_top = true;
+            self.scroll_target = None;
+        }
+
         menu_bar::render(self, ctx);
 
         let mut connect_clicked = false;
@@ -253,6 +265,7 @@ impl eframe::App for TwelfApp {
             ssh::SshState::Connected { info, .. } => info.host.clone(),
             _ => String::new(),
         };
+        let reset_scroll = std::mem::take(&mut self.scroll_to_top);
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -263,9 +276,14 @@ impl eframe::App for TwelfApp {
             ui.set_max_width(panel_w);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             let scroll = || {
-                egui::ScrollArea::both()
+                let area = egui::ScrollArea::both()
                     .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                if reset_scroll {
+                    area.scroll_offset(egui::Vec2::ZERO)
+                } else {
+                    area
+                }
             };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
                 scroll().show(ui, |ui| {
