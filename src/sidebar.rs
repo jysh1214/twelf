@@ -160,15 +160,14 @@ pub fn render_tree(
 ) {
     match &mut node.kind {
         NodeKind::File => {
-            let is_selected = selected_image.as_ref() == Some(&node.path);
-            let response = ui.selectable_label(is_selected, &node.name);
-            if scroll_target.as_deref() == Some(node.path.as_path()) {
-                response.scroll_to_me(Some(egui::Align::Center));
-                *scroll_target = None;
-            }
-            if response.clicked() {
-                *new_selection = Some(node.path.clone());
-            }
+            render_file_row(
+                ui,
+                &node.path,
+                &node.name,
+                selected_image,
+                scroll_target,
+                new_selection,
+            );
         }
         NodeKind::Dir { children } => {
             let path = node.path.clone();
@@ -201,6 +200,65 @@ pub fn render_tree(
                     }
                 }
             });
+        }
+    }
+}
+
+fn render_file_row(
+    ui: &mut egui::Ui,
+    path: &Path,
+    name: &str,
+    selected_image: &Option<PathBuf>,
+    scroll_target: &mut Option<PathBuf>,
+    new_selection: &mut Option<PathBuf>,
+) {
+    let is_selected = selected_image.as_deref() == Some(path);
+    let response = ui.selectable_label(is_selected, name);
+    if scroll_target.as_deref() == Some(path) {
+        response.scroll_to_me(Some(egui::Align::Center));
+        *scroll_target = None;
+    }
+    if response.clicked() {
+        *new_selection = Some(path.to_path_buf());
+    }
+}
+
+/// Render pruned search results. Every folder is forced open (it only appears
+/// because it or a descendant matched) under a `search:`-prefixed id, so this
+/// transient expansion never touches the live tree's persisted state.
+pub fn render_search_results(
+    ui: &mut egui::Ui,
+    hits: &[SearchHit],
+    selected_image: &Option<PathBuf>,
+    scroll_target: &mut Option<PathBuf>,
+    new_selection: &mut Option<PathBuf>,
+) {
+    for hit in hits {
+        match &hit.kind {
+            SearchKind::File => {
+                render_file_row(
+                    ui,
+                    &hit.path,
+                    &hit.name,
+                    selected_image,
+                    scroll_target,
+                    new_selection,
+                );
+            }
+            SearchKind::Dir { children } => {
+                egui::CollapsingHeader::new(&hit.name)
+                    .id_salt(format!("search:{}", hit.path.display()))
+                    .open(Some(true))
+                    .show(ui, |ui| {
+                        render_search_results(
+                            ui,
+                            children,
+                            selected_image,
+                            scroll_target,
+                            new_selection,
+                        );
+                    });
+            }
         }
     }
 }
