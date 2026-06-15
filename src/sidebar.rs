@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,17 @@ enum NodeKind {
     },
 }
 
+pub struct SearchHit {
+    path: PathBuf,
+    name: String,
+    kind: SearchKind,
+}
+
+enum SearchKind {
+    File,
+    Dir { children: Vec<SearchHit> },
+}
+
 impl TreeNode {
     pub fn root(path: PathBuf) -> Self {
         let name = path.display().to_string();
@@ -23,6 +35,10 @@ impl TreeNode {
             name,
             kind: NodeKind::Dir { children: None },
         }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Walk the loaded subtree depth-first and collect every media file's full
@@ -60,6 +76,10 @@ impl TreeNode {
     }
 }
 
+fn is_visible(path: &Path) -> bool {
+    path.is_dir() || is_image(path) || crate::video::is_video(&path.to_string_lossy())
+}
+
 fn list_children(root: &Path) -> Vec<TreeNode> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -67,11 +87,57 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
     let mut nodes: Vec<TreeNode> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_dir() || is_image(p) || crate::video::is_video(&p.to_string_lossy()))
+        .filter(|p| is_visible(p))
         .map(TreeNode::child)
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
     nodes
+}
+
+/// Recursively walk the filesystem under `root`, keeping only entries whose name
+/// contains `query` (case-insensitive) plus the ancestor folders that lead to a
+/// match. Unlike the live `TreeNode`, the result is fully materialized, so it can
+/// never lazy-load an unfiltered directory when rendered.
+pub fn search_tree(root: &Path, query: &str) -> Vec<SearchHit> {
+    let query_lc = query.to_lowercase();
+    let mut visited = HashSet::new();
+    search_dir(root, &query_lc, &mut visited)
+}
+
+fn search_dir(dir: &Path, query_lc: &str, visited: &mut HashSet<PathBuf>) -> Vec<SearchHit> {
+    // Skip a directory already entered, so a symlink pointing back at an ancestor
+    // can't make the walk loop forever (`is_dir()` follows symlinks).
+    if let Ok(canonical) = dir.canonicalize() {
+        if !visited.insert(canonical) {
+            return Vec::new();
+        }
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| is_visible(p))
+        .collect();
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let mut hits = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let matches = name.to_lowercase().contains(query_lc);
+        if path.is_dir() {
+            let children = search_dir(&path, query_lc, visited);
+            if matches || !children.is_empty() {
+                hits.push(SearchHit { path, name, kind: SearchKind::Dir { children } });
+            }
+        } else if matches {
+            hits.push(SearchHit { path, name, kind: SearchKind::File });
+        }
+    }
+    hits
 }
 
 pub fn is_image(path: &Path) -> bool {
