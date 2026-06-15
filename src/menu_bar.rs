@@ -10,6 +10,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.root_node = Some(sidebar::TreeNode::root(path));
                         app.selected_image = None;
                         app.scroll_target = None;
+                        app.search_active = false;
+                        app.search_query.clear();
+                        app.search_cache = None;
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;
