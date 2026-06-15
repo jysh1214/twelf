@@ -262,3 +262,149 @@ pub fn render_search_results(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn touch(path: &Path) {
+        fs::write(path, b"x").unwrap();
+    }
+
+    /// Pre-order (dir before its children) flatten to `(name, is_dir)` for asserts.
+    fn flatten(hits: &[SearchHit]) -> Vec<(String, bool)> {
+        fn go(hit: &SearchHit, out: &mut Vec<(String, bool)>) {
+            match &hit.kind {
+                SearchKind::File => out.push((hit.name.clone(), false)),
+                SearchKind::Dir { children } => {
+                    out.push((hit.name.clone(), true));
+                    for child in children {
+                        go(child, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for hit in hits {
+            go(hit, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn deep_file_match_keeps_only_its_chain() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        touch(&root.join("a/b/target.jpg"));
+        touch(&root.join("a/b/other.jpg"));
+        touch(&root.join("c/nope.jpg"));
+        assert_eq!(
+            flatten(&search_tree(root, "target")),
+            vec![
+                ("a".to_string(), true),
+                ("b".to_string(), true),
+                ("target.jpg".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_folder_kept_with_empty_children() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("holiday")).unwrap();
+        touch(&root.join("holiday/a.jpg"));
+        touch(&root.join("holiday/b.jpg"));
+        // The folder name matches; its children don't, so it is kept with no children.
+        assert_eq!(
+            flatten(&search_tree(root, "holiday")),
+            vec![("holiday".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn matching_folder_keeps_only_matching_child() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("trip")).unwrap();
+        touch(&root.join("trip/trip-photo.jpg"));
+        touch(&root.join("trip/random.jpg"));
+        assert_eq!(
+            flatten(&search_tree(root, "trip")),
+            vec![
+                ("trip".to_string(), true),
+                ("trip-photo.jpg".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_insensitive_including_non_ascii() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("FOO.jpg"));
+        touch(&root.join("Ärger.png"));
+        assert_eq!(
+            flatten(&search_tree(root, "foo")),
+            vec![("FOO.jpg".to_string(), false)]
+        );
+        assert_eq!(
+            flatten(&search_tree(root, "ärger")),
+            vec![("Ärger.png".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn matches_file_name_not_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("vacation")).unwrap();
+        touch(&root.join("vacation/sunset.jpg"));
+        // Query equals the ancestor folder name; the folder matches, but its
+        // non-matching child is not pulled in via the path.
+        assert_eq!(
+            flatten(&search_tree(root, "vacation")),
+            vec![("vacation".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn no_match_returns_empty() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("a.jpg"));
+        assert!(search_tree(root, "zzz").is_empty());
+    }
+
+    #[test]
+    fn includes_videos_excludes_non_media() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("clip.mkv"));
+        touch(&root.join("clip.txt"));
+        assert_eq!(
+            flatten(&search_tree(root, "clip")),
+            vec![("clip.mkv".to_string(), false)]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        touch(&root.join("sub/match-me.jpg"));
+        // A symlink back to the root would loop forever without the visited guard.
+        symlink(root, root.join("sub/loop")).unwrap();
+        let names: Vec<String> = flatten(&search_tree(root, "match-me"))
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.contains(&"match-me.jpg".to_string()));
+    }
+}
