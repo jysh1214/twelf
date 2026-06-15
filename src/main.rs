@@ -171,15 +171,19 @@ impl eframe::App for TwelfApp {
 
         self.drain_image_prefetch(ctx);
 
-        let nav_delta = ctx.input(|i| {
-            if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
-                Some(-1_i32)
-            } else if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
-                Some(1)
-            } else {
-                None
-            }
-        });
+        let nav_delta = if ctx.wants_keyboard_input() {
+            None
+        } else {
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
+                    Some(-1_i32)
+                } else if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+        };
         if let Some(delta) = nav_delta {
             self.navigate_image(delta);
         }
