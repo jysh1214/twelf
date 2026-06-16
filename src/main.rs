@@ -47,6 +47,10 @@ fn main() -> eframe::Result {
     )
 }
 
+/// How long the remote search query must be stable before launching a walk —
+/// each remote read_dir is a network round-trip, so we don't walk per keystroke.
+const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
@@ -54,6 +58,8 @@ struct TwelfApp {
     search_active: bool,
     search_query: String,
     search_cache: Option<(String, Vec<sidebar::SearchHit>)>,
+    remote_search: Option<remote::RemoteSearchWalk>,
+    remote_search_changed: Option<(String, std::time::Instant)>,
     zoom: f32,
     last_displayed: Option<PathBuf>,
     ssh: ssh::SshState,
@@ -82,6 +88,8 @@ impl TwelfApp {
             search_active: false,
             search_query: String::new(),
             search_cache: None,
+            remote_search: None,
+            remote_search_changed: None,
             zoom: 1.0,
             last_displayed: None,
             ssh: ssh::SshState::Disconnected,
@@ -311,21 +319,88 @@ impl eframe::App for TwelfApp {
                 }
             };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
+                let mut new_remote_selection: Option<PathBuf> = None;
+                if self.search_active {
+                    sidebar::search_bar(ui, &mut self.search_query, open_search);
+                }
+                let searching = self.search_active && !self.search_query.trim().is_empty();
+                if searching {
+                    // Debounce: relaunch the recursive walk only once the query has been
+                    // stable for REMOTE_SEARCH_DEBOUNCE. Replacing self.remote_search drops
+                    // (and so cancels) any superseded walk.
+                    let query = self.search_query.trim().to_string();
+                    let same = matches!(&self.remote_search_changed, Some((q, _)) if *q == query);
+                    if !same {
+                        self.remote_search_changed =
+                            Some((query.clone(), std::time::Instant::now()));
+                    }
+                    let stable = self
+                        .remote_search_changed
+                        .as_ref()
+                        .map(|(_, since)| since.elapsed())
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let needs_new =
+                        self.remote_search.as_ref().map(|w| w.query()) != Some(query.as_str());
+                    if needs_new {
+                        if stable >= REMOTE_SEARCH_DEBOUNCE {
+                            self.remote_search = Some(remote::spawn_remote_search(
+                                sftp.clone(),
+                                &self.runtime,
+                                remote_root.path().to_path_buf(),
+                                query,
+                                ctx,
+                            ));
+                        } else {
+                            ctx.request_repaint_after(REMOTE_SEARCH_DEBOUNCE - stable);
+                        }
+                    }
+                } else {
+                    self.remote_search = None;
+                    self.remote_search_changed = None;
+                }
                 scroll().show(ui, |ui| {
-                    remote::render_remote_tree(
-                        ui,
-                        remote_root,
-                        true,
-                        &remote_host,
-                        &mut self.selected_remote,
-                        &mut self.scroll_target,
-                        &mut self.image_prefetch,
-                        &sftp,
-                        &self.remote_listings_tx,
-                        &self.runtime,
-                        ctx,
-                    );
+                    if !searching {
+                        remote::render_remote_tree(
+                            ui,
+                            remote_root,
+                            true,
+                            &remote_host,
+                            &mut self.selected_remote,
+                            &mut self.scroll_target,
+                            &mut self.image_prefetch,
+                            &sftp,
+                            &self.remote_listings_tx,
+                            &self.runtime,
+                            ctx,
+                        );
+                        return;
+                    }
+                    let ready = self
+                        .remote_search
+                        .as_mut()
+                        .map(|w| {
+                            w.poll();
+                            w.hits().is_some()
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        if let Some(hits) = self.remote_search.as_ref().and_then(|w| w.hits()) {
+                            sidebar::render_search_results(
+                                ui,
+                                hits,
+                                &self.selected_remote,
+                                &mut self.scroll_target,
+                                &mut new_remote_selection,
+                            );
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("searching…").italics());
+                        ctx.request_repaint();
+                    }
                 });
+                if let Some(path) = new_remote_selection {
+                    self.selected_remote = Some(path);
+                }
             } else {
                 // Captures the clicked image path — deferred to dodge the borrow
                 // on `&mut self.root_node` taken by the renderers.
