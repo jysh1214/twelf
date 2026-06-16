@@ -27,6 +27,29 @@ enum SearchKind {
     Dir { children: Vec<SearchHit> },
 }
 
+impl SearchHit {
+    pub(crate) fn file(path: PathBuf, name: String) -> Self {
+        SearchHit { path, name, kind: SearchKind::File }
+    }
+
+    /// Build a directory hit, applying the prune rule: a folder is kept only if
+    /// its own name matched or it has at least one kept descendant. Returns
+    /// `None` when it should be dropped. Single-sources the keep/drop rule for
+    /// both the local (`search_dir`) and remote walks.
+    pub(crate) fn dir(
+        path: PathBuf,
+        name: String,
+        matches: bool,
+        children: Vec<SearchHit>,
+    ) -> Option<Self> {
+        if matches || !children.is_empty() {
+            Some(SearchHit { path, name, kind: SearchKind::Dir { children } })
+        } else {
+            None
+        }
+    }
+}
+
 impl TreeNode {
     pub fn root(path: PathBuf) -> Self {
         let name = path.display().to_string();
@@ -130,11 +153,11 @@ fn search_dir(dir: &Path, query_lc: &str, visited: &mut HashSet<PathBuf>) -> Vec
         let matches = name.to_lowercase().contains(query_lc);
         if path.is_dir() {
             let children = search_dir(&path, query_lc, visited);
-            if matches || !children.is_empty() {
-                hits.push(SearchHit { path, name, kind: SearchKind::Dir { children } });
+            if let Some(hit) = SearchHit::dir(path, name, matches, children) {
+                hits.push(hit);
             }
         } else if matches {
-            hits.push(SearchHit { path, name, kind: SearchKind::File });
+            hits.push(SearchHit::file(path, name));
         }
     }
     hits
