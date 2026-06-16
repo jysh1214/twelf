@@ -13,6 +13,8 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.search_active = false;
                         app.search_query.clear();
                         app.search_cache = None;
+                        app.remote_search = None;
+                        app.remote_search_changed = None;
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;

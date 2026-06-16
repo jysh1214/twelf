@@ -174,12 +174,23 @@ impl eframe::App for TwelfApp {
                     self.search_active = false;
                     self.search_query.clear();
                     self.search_cache = None;
+                    self.remote_search = None;
+                    self.remote_search_changed = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
                     ssh::SshState::Connected { session, info }
                 }
-                Err(error) => ssh::SshState::Failed { error },
+                Err(error) => {
+                    // A failed reconnect with the search bar open would otherwise
+                    // strand a walk/results against the old host.
+                    self.search_active = false;
+                    self.search_query.clear();
+                    self.search_cache = None;
+                    self.remote_search = None;
+                    self.remote_search_changed = None;
+                    ssh::SshState::Failed { error }
+                }
             };
             self.ssh_rx = None;
         }
@@ -235,6 +246,8 @@ impl eframe::App for TwelfApp {
             self.search_active = false;
             self.search_query.clear();
             self.search_cache = None;
+            self.remote_search = None;
+            self.remote_search_changed = None;
         }
 
         menu_bar::render(self, ctx);
