@@ -286,6 +286,21 @@ pub fn render_search_results(
     }
 }
 
+/// The sidebar search field: a full-width single-line `TextEdit` followed by a
+/// separator. `focus` requests keyboard focus this frame — pass `true` only on
+/// the frame search opened, or the caret gets trapped and clicks can't land.
+pub fn search_bar(ui: &mut egui::Ui, query: &mut String, focus: bool) {
+    let response = ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Search…")
+            .desired_width(f32::INFINITY),
+    );
+    if focus {
+        response.request_focus();
+    }
+    ui.separator();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

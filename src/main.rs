@@ -331,17 +331,7 @@ impl eframe::App for TwelfApp {
                 // on `&mut self.root_node` taken by the renderers.
                 let mut new_selection: Option<PathBuf> = None;
                 if self.search_active {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("Search…")
-                            .desired_width(f32::INFINITY),
-                    );
-                    // Focus only on the frame Ctrl+F fired; focusing every frame would
-                    // trap the caret and stop clicks from landing on results.
-                    if open_search {
-                        response.request_focus();
-                    }
-                    ui.separator();
+                    sidebar::search_bar(ui, &mut self.search_query, open_search);
                 }
                 // Refresh the cached walk outside the scroll closure (it needs the root
                 // path and query). Re-walk only when the trimmed query changes — egui
