@@ -445,4 +445,24 @@ mod tests {
             .collect();
         assert!(names.contains(&"match-me.jpg".to_string()));
     }
+
+    #[test]
+    fn dir_constructor_applies_prune_rule() {
+        let p = || PathBuf::from("/x");
+        let child = || SearchHit::file(PathBuf::from("/x/c.jpg"), "c.jpg".to_string());
+        // matched folder, no children -> kept
+        assert!(SearchHit::dir(p(), "x".to_string(), true, vec![]).is_some());
+        // unmatched folder, no children -> dropped
+        assert!(SearchHit::dir(p(), "x".to_string(), false, vec![]).is_none());
+        // unmatched folder with a kept child -> kept as scaffolding
+        assert!(SearchHit::dir(p(), "x".to_string(), false, vec![child()]).is_some());
+        // matched folder with a child -> kept
+        assert!(SearchHit::dir(p(), "x".to_string(), true, vec![child()]).is_some());
+    }
+
+    #[test]
+    fn file_constructor_builds_file_hit() {
+        let hit = SearchHit::file(PathBuf::from("/a/b.jpg"), "b.jpg".to_string());
+        assert_eq!(flatten(&[hit]), vec![("b.jpg".to_string(), false)]);
+    }
 }
