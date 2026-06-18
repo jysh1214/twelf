@@ -601,6 +601,61 @@ fn deletion_order(mut entries: Vec<(PathBuf, bool)>) -> Vec<(PathBuf, bool)> {
     entries
 }
 
+/// An in-flight one-shot remote rename. Far simpler than `RemoteDelete` — a
+/// single `SftpSession::rename` round-trip, no walk and no cancel — so it just
+/// carries the target path and a channel that fires once with Ok or the error.
+pub struct RemoteRename {
+    target: PathBuf,
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    result: Option<Result<(), String>>,
+}
+
+impl RemoteRename {
+    /// Pull the completed result into the handle once it arrives (non-blocking).
+    pub fn poll(&mut self) {
+        if self.result.is_none()
+            && let Ok(res) = self.rx.try_recv()
+        {
+            self.result = Some(res);
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// The completed result, if it has arrived.
+    pub fn result(&self) -> Option<&Result<(), String>> {
+        self.result.as_ref()
+    }
+
+    /// The path being renamed — for the status label and the parent refresh.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+/// Spawn a single SFTP rename of `old` to `new` on the runtime. The result (Ok or
+/// the server's error string) is sent once and read from the handle via `poll`.
+pub fn spawn_remote_rename(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    old: PathBuf,
+    new: PathBuf,
+    ctx: &egui::Context,
+) -> RemoteRename {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx_task = ctx.clone();
+    let old_str = old.to_string_lossy().into_owned();
+    let new_str = new.to_string_lossy().into_owned();
+    runtime.spawn(async move {
+        let res = sftp.rename(old_str, new_str).await.map_err(|e| e.to_string());
+        let _ = tx.send(res);
+        ctx_task.request_repaint();
+    });
+    RemoteRename { target: old, rx, result: None }
+}
+
 /// URIs the Load action prefetches: every image under the loaded children, as
 /// `sftp://{host}{path}`. Videos (and anything else non-image) are skipped —
 /// the image pipeline would download them whole only to fail decoding.
