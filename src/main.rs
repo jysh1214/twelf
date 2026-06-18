@@ -382,6 +382,9 @@ impl eframe::App for TwelfApp {
         // Set by the remote tree's Download context-menu action, consumed after the
         // panel so the blocking folder picker runs outside the tree render.
         let mut download_request: Option<PathBuf> = None;
+        // Set by a Delete context-menu action in either tree (path, is_dir);
+        // consumed after the panel into `pending_delete`.
+        let mut delete_request: Option<(PathBuf, bool)> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -510,6 +513,7 @@ impl eframe::App for TwelfApp {
                                 &self.selected_remote,
                                 &mut self.scroll_target,
                                 &mut new_remote_selection,
+                                &mut delete_request,
                             );
                         }
                     } else {
@@ -547,6 +551,7 @@ impl eframe::App for TwelfApp {
                                 &self.selected_image,
                                 &mut self.scroll_target,
                                 &mut new_selection,
+                                &mut delete_request,
                             );
                         }
                     } else if let Some(root_node) = &mut self.root_node {
@@ -557,6 +562,7 @@ impl eframe::App for TwelfApp {
                             &self.selected_image,
                             &mut self.scroll_target,
                             &mut new_selection,
+                            &mut delete_request,
                         );
                     }
                 });
@@ -584,6 +590,12 @@ impl eframe::App for TwelfApp {
                     ctx,
                 ));
             }
+        }
+        // A Delete action was chosen this frame: park it for the confirm modal.
+        if let Some((path, is_dir)) = delete_request {
+            let is_remote =
+                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
+            self.pending_delete = Some(PendingDelete { path, is_dir, is_remote });
         }
         image_panel::render(self, ctx);
     }

@@ -180,6 +180,7 @@ pub fn render_tree(
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    delete_request: &mut Option<(PathBuf, bool)>,
 ) {
     match &mut node.kind {
         NodeKind::File => {
@@ -190,6 +191,7 @@ pub fn render_tree(
                 selected_image,
                 scroll_target,
                 new_selection,
+                delete_request,
             );
         }
         NodeKind::Dir { children } => {
@@ -206,7 +208,7 @@ pub fn render_tree(
             if force_open {
                 header = header.open(Some(true));
             }
-            header.show(ui, |ui| {
+            let resp = header.show(ui, |ui| {
                 if children.is_none() {
                     *children = Some(list_children(&path));
                 }
@@ -219,10 +221,20 @@ pub fn render_tree(
                             selected_image,
                             scroll_target,
                             new_selection,
+                            delete_request,
                         );
                     }
                 }
             });
+            // No Delete on the root row — it's the browse entry point.
+            if !is_root {
+                resp.header_response.context_menu(|ui| {
+                    if ui.button("Delete").clicked() {
+                        *delete_request = Some((path.clone(), true));
+                        ui.close();
+                    }
+                });
+            }
         }
     }
 }
@@ -234,6 +246,7 @@ fn render_file_row(
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    delete_request: &mut Option<(PathBuf, bool)>,
 ) {
     let is_selected = selected_image.as_deref() == Some(path);
     let response = ui.selectable_label(is_selected, name);
@@ -244,6 +257,12 @@ fn render_file_row(
     if response.clicked() {
         *new_selection = Some(path.to_path_buf());
     }
+    response.context_menu(|ui| {
+        if ui.button("Delete").clicked() {
+            *delete_request = Some((path.to_path_buf(), false));
+            ui.close();
+        }
+    });
 }
 
 /// Render pruned search results. Every folder is forced open (it only appears
@@ -255,6 +274,7 @@ pub fn render_search_results(
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    delete_request: &mut Option<(PathBuf, bool)>,
 ) {
     for hit in hits {
         match &hit.kind {
@@ -266,6 +286,7 @@ pub fn render_search_results(
                     selected_image,
                     scroll_target,
                     new_selection,
+                    delete_request,
                 );
             }
             SearchKind::Dir { children } => {
@@ -279,6 +300,7 @@ pub fn render_search_results(
                             selected_image,
                             scroll_target,
                             new_selection,
+                            delete_request,
                         );
                     });
             }
