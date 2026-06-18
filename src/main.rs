@@ -907,3 +907,36 @@ impl eframe::App for TwelfApp {
         image_panel::render(self, ctx);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_rename_accepts_only_a_changed_simple_name() {
+        assert!(valid_rename("new.jpg", "old.jpg"));
+        assert!(!valid_rename("   ", "old.jpg")); // blank
+        assert!(!valid_rename("old.jpg", "old.jpg")); // unchanged
+        assert!(!valid_rename("a/b.jpg", "old.jpg")); // path separator
+        assert!(!valid_rename("a\\b.jpg", "old.jpg")); // backslash separator
+    }
+
+    #[test]
+    fn rebase_path_follows_a_rename() {
+        // The renamed item itself follows.
+        assert_eq!(
+            rebase_path(Path::new("/a/b"), Path::new("/a/b"), Path::new("/a/c")),
+            Some(PathBuf::from("/a/c"))
+        );
+        // A selected descendant of a renamed folder follows by prefix.
+        assert_eq!(
+            rebase_path(Path::new("/a/b/sub/x.jpg"), Path::new("/a/b"), Path::new("/a/c")),
+            Some(PathBuf::from("/a/c/sub/x.jpg"))
+        );
+        // An unrelated selection is left alone.
+        assert_eq!(
+            rebase_path(Path::new("/a/other.jpg"), Path::new("/a/b"), Path::new("/a/c")),
+            None
+        );
+    }
+}

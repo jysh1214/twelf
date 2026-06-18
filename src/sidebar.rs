@@ -606,4 +606,18 @@ mod tests {
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.remove_path(Path::new("/r/a.jpg")));
     }
+
+    #[test]
+    fn reload_resets_loaded_dir_and_noops_otherwise() {
+        let mut root = dir_node("/r", vec![dir_node("/r/sub", vec![file_node("/r/sub/a.jpg")])]);
+        // Re-list a loaded subdir: its children drop to None (re-read next render).
+        assert!(root.reload(Path::new("/r/sub")));
+        let NodeKind::Dir { children: Some(c) } = &root.kind else { unreachable!() };
+        assert!(matches!(c[0].kind, NodeKind::Dir { children: None }));
+
+        // Absent path and not-yet-loaded folder are no-ops.
+        assert!(!root.reload(Path::new("/r/zzz")));
+        let mut unloaded = TreeNode::root(PathBuf::from("/r"));
+        assert!(!unloaded.reload(Path::new("/r/sub")));
+    }
 }
