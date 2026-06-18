@@ -59,6 +59,17 @@ struct PendingDelete {
     is_remote: bool,
 }
 
+/// A rename in progress: the target, the backend, the editable new-name buffer,
+/// a one-shot focus flag, and any error to show in the dialog.
+struct PendingRename {
+    path: PathBuf,
+    is_dir: bool,
+    is_remote: bool,
+    name: String,
+    needs_focus: bool,
+    error: Option<String>,
+}
+
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
@@ -78,6 +89,7 @@ struct TwelfApp {
     remote_download: Option<remote::RemoteDownload>,
     remote_delete: Option<remote::RemoteDelete>,
     pending_delete: Option<PendingDelete>,
+    pending_rename: Option<PendingRename>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
@@ -111,6 +123,7 @@ impl TwelfApp {
             remote_download: None,
             remote_delete: None,
             pending_delete: None,
+            pending_rename: None,
             remote_listings_tx,
             remote_listings_rx,
             session_holder: Arc::new(Mutex::new(None)),
@@ -220,6 +233,24 @@ impl TwelfApp {
         self.remote_search = None;
         self.remote_search_changed = None;
     }
+
+    /// Carry out a confirmed rename. Backends are wired in later subtasks; for
+    /// now this just dismisses the dialog.
+    fn execute_rename(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
+        self.pending_rename = None;
+    }
+}
+
+/// Whether `name` is an acceptable new name for an item currently called
+/// `current`: non-empty after trimming, actually changed, and a single path
+/// component (no separator).
+fn valid_rename(name: &str, current: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed != current
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
 }
 
 impl eframe::App for TwelfApp {
@@ -245,6 +276,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search_changed = None;
                     self.remote_download = None;
                     self.pending_delete = None;
+                    self.pending_rename = None;
                     self.remote_delete = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
@@ -261,6 +293,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search_changed = None;
                     self.remote_download = None;
                     self.pending_delete = None;
+                    self.pending_rename = None;
                     self.remote_delete = None;
                     ssh::SshState::Failed { error }
                 }
@@ -420,6 +453,65 @@ impl eframe::App for TwelfApp {
             && let Some(pd) = self.pending_delete.take()
         {
             self.execute_delete(pd, ctx);
+        }
+
+        // Rename dialog. A right-click Rename in either tree parks its target in
+        // `pending_rename`; the entered name is applied only on Rename / Enter.
+        let mut do_rename = false;
+        let mut cancel_rename = false;
+        if let Some(pr) = self.pending_rename.as_mut() {
+            let current = pr
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| pr.path.display().to_string());
+            let mut open = true;
+            egui::Window::new("Rename")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(if pr.is_dir {
+                        format!("Rename folder \"{current}\" to:")
+                    } else {
+                        format!("Rename \"{current}\" to:")
+                    });
+                    let edit = ui.text_edit_singleline(&mut pr.name);
+                    if edit.changed() {
+                        pr.error = None;
+                    }
+                    if pr.needs_focus {
+                        edit.request_focus();
+                        pr.needs_focus = false;
+                    }
+                    let valid = valid_rename(&pr.name, &current);
+                    if valid
+                        && edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        do_rename = true;
+                    }
+                    if let Some(err) = &pr.error {
+                        ui.colored_label(egui::Color32::RED, err.as_str());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_rename = true;
+                        }
+                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
+                            do_rename = true;
+                        }
+                    });
+                });
+            // Window close button (X) counts as Cancel.
+            if !open {
+                cancel_rename = true;
+            }
+        }
+        if cancel_rename {
+            self.pending_rename = None;
+        } else if do_rename {
+            self.execute_rename(ctx);
         }
 
         let sftp = match &self.ssh {
