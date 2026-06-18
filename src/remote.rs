@@ -110,6 +110,32 @@ impl RemoteTreeNode {
         }
         false
     }
+
+    /// Mark the directory at `target` `Unloaded` so the next render re-lists it.
+    /// Used to refresh a folder after one of its entries is deleted.
+    pub fn reload(&mut self, target: &Path) -> bool {
+        if self.path == target {
+            if let RemoteNodeKind::Dir { children } = &mut self.kind {
+                *children = RemoteDirChildren::Unloaded;
+                return true;
+            }
+            return false;
+        }
+        if !target.starts_with(&self.path) {
+            return false;
+        }
+        if let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &mut self.kind
+        {
+            for child in c {
+                if target.starts_with(&child.path) && child.reload(target) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 async fn list_remote_children(

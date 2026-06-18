@@ -76,6 +76,7 @@ struct TwelfApp {
     remote_root: Option<remote::RemoteTreeNode>,
     selected_remote: Option<PathBuf>,
     remote_download: Option<remote::RemoteDownload>,
+    remote_delete: Option<remote::RemoteDelete>,
     pending_delete: Option<PendingDelete>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
@@ -108,6 +109,7 @@ impl TwelfApp {
             remote_root: None,
             selected_remote: None,
             remote_download: None,
+            remote_delete: None,
             pending_delete: None,
             remote_listings_tx,
             remote_listings_rx,
@@ -170,6 +172,16 @@ impl TwelfApp {
     /// remote backend is wired in a later subtask.
     fn execute_delete(&mut self, pd: PendingDelete, ctx: &egui::Context) {
         if pd.is_remote {
+            if let ssh::SshState::Connected { session, .. } = &self.ssh {
+                self.remote_delete = Some(remote::spawn_remote_delete(
+                    session.clone(),
+                    &self.runtime,
+                    pd.path.clone(),
+                    pd.is_dir,
+                    ctx,
+                ));
+            }
+            self.clear_after_delete(&pd.path, ctx);
             return;
         }
         let result = if pd.is_dir {
@@ -233,6 +245,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search_changed = None;
                     self.remote_download = None;
                     self.pending_delete = None;
+                    self.remote_delete = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -248,6 +261,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search_changed = None;
                     self.remote_download = None;
                     self.pending_delete = None;
+                    self.remote_delete = None;
                     ssh::SshState::Failed { error }
                 }
             };
@@ -477,6 +491,25 @@ impl eframe::App for TwelfApp {
                 }
                 if cancel_download {
                     self.remote_download = None;
+                }
+                if let Some(del) = self.remote_delete.as_mut() {
+                    del.poll();
+                }
+                if self.remote_delete.as_ref().is_some_and(|d| d.is_finished()) {
+                    if let Some(del) = self.remote_delete.take() {
+                        let target = del.target().to_path_buf();
+                        let failed = del.failed();
+                        if let Some(parent) = target.parent() {
+                            remote_root.reload(parent);
+                        }
+                        if failed > 0 {
+                            crate::log!("remote delete: {failed} item(s) could not be removed");
+                        }
+                    }
+                } else if let Some(del) = self.remote_delete.as_ref() {
+                    let name = del.target().file_name().unwrap_or_default().to_string_lossy();
+                    ui.label(egui::RichText::new(format!("Deleting {name}…")).italics());
+                    ctx.request_repaint();
                 }
                 if self.search_active {
                     sidebar::search_bar(ui, &mut self.search_query, open_search);
