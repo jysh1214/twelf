@@ -440,6 +440,141 @@ fn write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(target, bytes)
 }
 
+/// Max concurrent in-flight SFTP ops while enumerating a delete target.
+const REMOTE_DELETE_CONCURRENCY: usize = 8;
+
+/// An in-flight recursive delete. Like `RemoteDownload`, the walk runs off-thread
+/// and dropping the handle flips `cancel`; `rx` fires once when it finishes and
+/// `failed` counts entries that could not be removed.
+pub struct RemoteDelete {
+    target: PathBuf,
+    cancel: Arc<AtomicBool>,
+    failed: Arc<AtomicUsize>,
+    rx: std::sync::mpsc::Receiver<()>,
+    finished: bool,
+}
+
+impl RemoteDelete {
+    pub fn poll(&mut self) {
+        if !self.finished && self.rx.try_recv().is_ok() {
+            self.finished = true;
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn failed(&self) -> usize {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// The path being deleted — for the status label and the post-delete refresh.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+impl Drop for RemoteDelete {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a recursive delete of `target` on the runtime. A directory is enumerated
+/// in full and then removed deepest-first, so each dir is empty when removed
+/// (SFTP `remove_dir` only deletes empty dirs). Cancel by dropping the handle.
+pub fn spawn_remote_delete(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    target: PathBuf,
+    is_dir: bool,
+    ctx: &egui::Context,
+) -> RemoteDelete {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_task = cancel.clone();
+    let failed_task = failed.clone();
+    let ctx_task = ctx.clone();
+    let target_task = target.clone();
+    runtime.spawn(async move {
+        let sem = Semaphore::new(REMOTE_DELETE_CONCURRENCY);
+        if is_dir {
+            let mut entries =
+                collect_remote_paths(&sftp, &target_task, &cancel_task, &sem, 0).await;
+            entries.push((target_task.clone(), true));
+            for (path, path_is_dir) in deletion_order(entries) {
+                if cancel_task.load(Ordering::Relaxed) {
+                    break;
+                }
+                let path_str = path.to_string_lossy().into_owned();
+                let res = if path_is_dir {
+                    sftp.remove_dir(path_str).await
+                } else {
+                    sftp.remove_file(path_str).await
+                };
+                if res.is_err() {
+                    failed_task.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if sftp
+            .remove_file(target_task.to_string_lossy().into_owned())
+            .await
+            .is_err()
+        {
+            failed_task.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = tx.send(());
+        ctx_task.request_repaint();
+    });
+    RemoteDelete { target, cancel, failed, rx, finished: false }
+}
+
+/// Recursively list every path under `dir` (files and subdirectories, excluding
+/// `dir` itself) as `(path, is_dir)`. Concurrent read_dirs bounded by `sem`, the
+/// permit released before recursing — the same deadlock-avoidance as the search
+/// walk. A read error under one branch silently contributes nothing.
+async fn collect_remote_paths(
+    sftp: &SftpSession,
+    dir: &Path,
+    cancel: &AtomicBool,
+    sem: &Semaphore,
+    depth: usize,
+) -> Vec<(PathBuf, bool)> {
+    if depth > REMOTE_SEARCH_MAX_DEPTH || cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    let entries = {
+        let _permit = sem.acquire().await.expect("delete semaphore never closed");
+        match sftp.read_dir(dir.to_string_lossy().into_owned()).await {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        }
+    };
+    let children = entries.map(|entry| {
+        let is_dir = entry.metadata().is_dir();
+        let mut child = dir.to_path_buf();
+        child.push(entry.file_name());
+        Box::pin(async move {
+            let mut out = Vec::new();
+            if is_dir {
+                out.extend(collect_remote_paths(sftp, &child, cancel, sem, depth + 1).await);
+            }
+            out.push((child, is_dir));
+            out
+        })
+    });
+    join_all(children).await.into_iter().flatten().collect()
+}
+
+/// Order paths so each precedes its ancestors: deepest (most components) first.
+/// Deleting in this order keeps every directory empty when it is removed.
+fn deletion_order(mut entries: Vec<(PathBuf, bool)>) -> Vec<(PathBuf, bool)> {
+    entries.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    entries
+}
+
 /// URIs the Load action prefetches: every image under the loaded children, as
 /// `sftp://{host}{path}`. Videos (and anything else non-image) are skipped —
 /// the image pipeline would download them whole only to fail decoding.
