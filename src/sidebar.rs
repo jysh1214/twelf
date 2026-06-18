@@ -506,4 +506,64 @@ mod tests {
         let hit = SearchHit::file(PathBuf::from("/a/b.jpg"), "b.jpg".to_string());
         assert_eq!(flatten(&[hit]), vec![("b.jpg".to_string(), false)]);
     }
+
+    fn file_node(path: &str) -> TreeNode {
+        TreeNode { path: PathBuf::from(path), name: path.to_string(), kind: NodeKind::File }
+    }
+
+    fn dir_node(path: &str, children: Vec<TreeNode>) -> TreeNode {
+        TreeNode {
+            path: PathBuf::from(path),
+            name: path.to_string(),
+            kind: NodeKind::Dir { children: Some(children) },
+        }
+    }
+
+    fn child_paths(node: &TreeNode) -> Vec<String> {
+        match &node.kind {
+            NodeKind::Dir { children: Some(c) } => {
+                c.iter().map(|n| n.path.display().to_string()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remove_path_drops_node_and_keeps_siblings() {
+        let mut root = dir_node(
+            "/r",
+            vec![
+                file_node("/r/a.jpg"),
+                dir_node("/r/sub", vec![file_node("/r/sub/b.png")]),
+                file_node("/r/d.jpg"),
+            ],
+        );
+        assert!(root.remove_path(Path::new("/r/a.jpg")));
+        assert_eq!(child_paths(&root), vec!["/r/sub", "/r/d.jpg"]);
+    }
+
+    #[test]
+    fn remove_path_reaches_into_nested_dir() {
+        let mut root = dir_node(
+            "/r",
+            vec![dir_node(
+                "/r/sub",
+                vec![file_node("/r/sub/b.png"), file_node("/r/sub/c.png")],
+            )],
+        );
+        assert!(root.remove_path(Path::new("/r/sub/b.png")));
+        let NodeKind::Dir { children: Some(c) } = &root.kind else { unreachable!() };
+        assert_eq!(child_paths(&c[0]), vec!["/r/sub/c.png"]);
+    }
+
+    #[test]
+    fn remove_path_absent_or_unloaded_is_noop() {
+        let mut root = dir_node("/r", vec![file_node("/r/a.jpg")]);
+        assert!(!root.remove_path(Path::new("/r/zzz.jpg")));
+        assert_eq!(child_paths(&root), vec!["/r/a.jpg"]);
+
+        // A folder whose children haven't been loaded yet (children: None).
+        let mut unloaded = TreeNode::root(PathBuf::from("/r"));
+        assert!(!unloaded.remove_path(Path::new("/r/a.jpg")));
+    }
 }
