@@ -16,6 +16,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.remote_search = None;
                         app.remote_search_changed = None;
                         app.remote_download = None;
+                        app.pending_delete = None;
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;

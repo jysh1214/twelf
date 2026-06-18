@@ -51,6 +51,14 @@ fn main() -> eframe::Result {
 /// each remote read_dir is a network round-trip, so we don't walk per keystroke.
 const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// A delete the user has requested but not yet confirmed. Held while the confirm
+/// modal is open; `is_remote` selects the local-fs vs SFTP backend.
+struct PendingDelete {
+    path: PathBuf,
+    is_dir: bool,
+    is_remote: bool,
+}
+
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     selected_image: Option<PathBuf>,
@@ -68,6 +76,7 @@ struct TwelfApp {
     remote_root: Option<remote::RemoteTreeNode>,
     selected_remote: Option<PathBuf>,
     remote_download: Option<remote::RemoteDownload>,
+    pending_delete: Option<PendingDelete>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
@@ -99,6 +108,7 @@ impl TwelfApp {
             remote_root: None,
             selected_remote: None,
             remote_download: None,
+            pending_delete: None,
             remote_listings_tx,
             remote_listings_rx,
             session_holder: Arc::new(Mutex::new(None)),
@@ -155,6 +165,12 @@ impl TwelfApp {
             }
         }
     }
+
+    /// Carry out a confirmed delete. The local and remote backends are wired in
+    /// later subtasks; for now this only consumes the request.
+    fn execute_delete(&mut self, pd: PendingDelete, ctx: &egui::Context) {
+        let _ = (pd, ctx);
+    }
 }
 
 impl eframe::App for TwelfApp {
@@ -179,6 +195,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search = None;
                     self.remote_search_changed = None;
                     self.remote_download = None;
+                    self.pending_delete = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -193,6 +210,7 @@ impl eframe::App for TwelfApp {
                     self.remote_search = None;
                     self.remote_search_changed = None;
                     self.remote_download = None;
+                    self.pending_delete = None;
                     ssh::SshState::Failed { error }
                 }
             };
@@ -308,6 +326,51 @@ impl eframe::App for TwelfApp {
                 ctx_clone.request_repaint();
             });
         }
+        // Delete confirmation. A right-click Delete in either tree parks its
+        // target in `pending_delete`; nothing is removed until Confirm here.
+        let mut confirm_delete = false;
+        let mut cancel_delete = false;
+        if let Some(pd) = &self.pending_delete {
+            let name = pd
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| pd.path.display().to_string());
+            let mut open = true;
+            egui::Window::new("Delete")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    if pd.is_dir {
+                        ui.label(format!("Delete folder \"{name}\" and everything inside it?"));
+                    } else {
+                        ui.label(format!("Delete \"{name}\"?"));
+                    }
+                    ui.label(egui::RichText::new("This cannot be undone.").italics());
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_delete = true;
+                        }
+                        if ui.button("Delete").clicked() {
+                            confirm_delete = true;
+                        }
+                    });
+                });
+            // Window close button (X) counts as Cancel.
+            if !open {
+                cancel_delete = true;
+            }
+        }
+        if cancel_delete {
+            self.pending_delete = None;
+        }
+        if confirm_delete
+            && let Some(pd) = self.pending_delete.take()
+        {
+            self.execute_delete(pd, ctx);
+        }
+
         let sftp = match &self.ssh {
             ssh::SshState::Connected { session, .. } => Some(session.clone()),
             _ => None,
