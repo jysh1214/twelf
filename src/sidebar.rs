@@ -200,6 +200,7 @@ pub fn render_tree(
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
     delete_request: &mut Option<(PathBuf, bool)>,
+    rename_request: &mut Option<(PathBuf, bool)>,
 ) {
     match &mut node.kind {
         NodeKind::File => {
@@ -211,6 +212,7 @@ pub fn render_tree(
                 scroll_target,
                 new_selection,
                 delete_request,
+                rename_request,
             );
         }
         NodeKind::Dir { children } => {
@@ -241,13 +243,18 @@ pub fn render_tree(
                             scroll_target,
                             new_selection,
                             delete_request,
+                            rename_request,
                         );
                     }
                 }
             });
-            // No Delete on the root row — it's the browse entry point.
+            // No Rename/Delete on the root row — it's the browse entry point.
             if !is_root {
                 resp.header_response.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        *rename_request = Some((path.clone(), true));
+                        ui.close();
+                    }
                     if ui.button("Delete").clicked() {
                         *delete_request = Some((path.clone(), true));
                         ui.close();
@@ -266,6 +273,7 @@ fn render_file_row(
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
     delete_request: &mut Option<(PathBuf, bool)>,
+    rename_request: &mut Option<(PathBuf, bool)>,
 ) {
     let is_selected = selected_image.as_deref() == Some(path);
     let response = ui.selectable_label(is_selected, name);
@@ -277,6 +285,10 @@ fn render_file_row(
         *new_selection = Some(path.to_path_buf());
     }
     response.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            *rename_request = Some((path.to_path_buf(), false));
+            ui.close();
+        }
         if ui.button("Delete").clicked() {
             *delete_request = Some((path.to_path_buf(), false));
             ui.close();
@@ -294,6 +306,7 @@ pub fn render_search_results(
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
     delete_request: &mut Option<(PathBuf, bool)>,
+    rename_request: &mut Option<(PathBuf, bool)>,
 ) {
     for hit in hits {
         match &hit.kind {
@@ -306,6 +319,7 @@ pub fn render_search_results(
                     scroll_target,
                     new_selection,
                     delete_request,
+                    rename_request,
                 );
             }
             SearchKind::Dir { children } => {
@@ -320,6 +334,7 @@ pub fn render_search_results(
                             scroll_target,
                             new_selection,
                             delete_request,
+                            rename_request,
                         );
                     });
             }

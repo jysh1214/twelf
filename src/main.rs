@@ -528,6 +528,9 @@ impl eframe::App for TwelfApp {
         // Set by a Delete context-menu action in either tree (path, is_dir);
         // consumed after the panel into `pending_delete`.
         let mut delete_request: Option<(PathBuf, bool)> = None;
+        // Set by a Rename context-menu action in either tree (path, is_dir);
+        // consumed after the panel into `pending_rename`.
+        let mut rename_request: Option<(PathBuf, bool)> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -677,6 +680,7 @@ impl eframe::App for TwelfApp {
                                 &mut self.scroll_target,
                                 &mut new_remote_selection,
                                 &mut delete_request,
+                                &mut rename_request,
                             );
                         }
                     } else {
@@ -715,6 +719,7 @@ impl eframe::App for TwelfApp {
                                 &mut self.scroll_target,
                                 &mut new_selection,
                                 &mut delete_request,
+                                &mut rename_request,
                             );
                         }
                     } else if let Some(root_node) = &mut self.root_node {
@@ -726,6 +731,7 @@ impl eframe::App for TwelfApp {
                             &mut self.scroll_target,
                             &mut new_selection,
                             &mut delete_request,
+                            &mut rename_request,
                         );
                     }
                 });
@@ -759,6 +765,23 @@ impl eframe::App for TwelfApp {
             let is_remote =
                 matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
             self.pending_delete = Some(PendingDelete { path, is_dir, is_remote });
+        }
+        // A Rename action was chosen this frame: open the name-entry dialog.
+        if let Some((path, is_dir)) = rename_request {
+            let is_remote =
+                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.pending_rename = Some(PendingRename {
+                path,
+                is_dir,
+                is_remote,
+                name,
+                needs_focus: true,
+                error: None,
+            });
         }
         image_panel::render(self, ctx);
     }
