@@ -234,11 +234,65 @@ impl TwelfApp {
         self.remote_search_changed = None;
     }
 
-    /// Carry out a confirmed rename. Backends are wired in later subtasks; for
-    /// now this just dismisses the dialog.
+    /// Carry out a confirmed rename. Local renames run here synchronously; the
+    /// remote backend is wired in a later subtask. On failure the message is kept
+    /// in `pending_rename` so the dialog stays open for correction.
     fn execute_rename(&mut self, ctx: &egui::Context) {
-        let _ = ctx;
+        let Some(pr) = self.pending_rename.as_ref() else { return };
+        let old = pr.path.clone();
+        let is_remote = pr.is_remote;
+        let new_name = pr.name.trim().to_string();
+        let Some(parent) = old.parent().map(Path::to_path_buf) else {
+            self.pending_rename = None;
+            return;
+        };
+        let new = parent.join(&new_name);
+
+        if is_remote {
+            return;
+        }
+        if new.exists() {
+            if let Some(pr) = self.pending_rename.as_mut() {
+                pr.error = Some("A file or folder with that name already exists".to_string());
+            }
+            return;
+        }
+        if let Err(e) = std::fs::rename(&old, &new) {
+            if let Some(pr) = self.pending_rename.as_mut() {
+                pr.error = Some(e.to_string());
+            }
+            return;
+        }
+        if let Some(root) = self.root_node.as_mut() {
+            root.reload(&parent);
+        }
+        self.apply_rename_side_effects(&old, &new, ctx);
         self.pending_rename = None;
+    }
+
+    /// After a successful rename `old`→`new`: follow the selection to the new
+    /// path (including a selected descendant of a renamed folder) and close the
+    /// search so a stale row can't linger.
+    fn apply_rename_side_effects(&mut self, old: &Path, new: &Path, ctx: &egui::Context) {
+        let img = self.selected_image.as_deref().and_then(|s| rebase_path(s, old, new));
+        let rem = self.selected_remote.as_deref().and_then(|s| rebase_path(s, old, new));
+        let mut moved = false;
+        if let Some(p) = img {
+            self.selected_image = Some(p);
+            moved = true;
+        }
+        if let Some(p) = rem {
+            self.selected_remote = Some(p);
+            moved = true;
+        }
+        if moved {
+            ctx.forget_all_images();
+        }
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_cache = None;
+        self.remote_search = None;
+        self.remote_search_changed = None;
     }
 }
 
@@ -251,6 +305,15 @@ fn valid_rename(name: &str, current: &str) -> bool {
         && trimmed != current
         && !trimmed.contains('/')
         && !trimmed.contains('\\')
+}
+
+/// If `selected` is `old` (or lives under it, for a renamed folder), return the
+/// path with the `old` prefix swapped for `new`; otherwise `None`.
+fn rebase_path(selected: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+    if selected == old {
+        return Some(new.to_path_buf());
+    }
+    selected.strip_prefix(old).ok().map(|rest| new.join(rest))
 }
 
 impl eframe::App for TwelfApp {

@@ -104,6 +104,31 @@ impl TreeNode {
         false
     }
 
+    /// Mark the directory at `target` not-yet-loaded so the next render re-lists
+    /// it — used to refresh a folder after one of its entries is renamed. A no-op
+    /// for an absent or not-yet-loaded path.
+    pub fn reload(&mut self, target: &Path) -> bool {
+        if self.path == target {
+            if let NodeKind::Dir { children } = &mut self.kind {
+                *children = None;
+                return true;
+            }
+            return false;
+        }
+        if !target.starts_with(&self.path) {
+            return false;
+        }
+        let NodeKind::Dir { children: Some(children) } = &mut self.kind else {
+            return false;
+        };
+        for child in children {
+            if target.starts_with(&child.path) && child.reload(target) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn child(path: PathBuf) -> Self {
         let name = path
             .file_name()
