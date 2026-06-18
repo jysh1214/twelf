@@ -761,4 +761,22 @@ mod tests {
             PathBuf::from("/dl/my trip/a b.jpg")
         );
     }
+
+    #[test]
+    fn deletion_order_is_deepest_first() {
+        let entries = vec![
+            (PathBuf::from("/trip"), true),
+            (PathBuf::from("/trip/a.jpg"), false),
+            (PathBuf::from("/trip/sub"), true),
+            (PathBuf::from("/trip/sub/b.png"), false),
+        ];
+        let order: Vec<PathBuf> = deletion_order(entries).into_iter().map(|(p, _)| p).collect();
+        let pos = |s: &str| order.iter().position(|p| p == Path::new(s)).unwrap();
+        // Every entry is removed before its parent directory…
+        assert!(pos("/trip/sub/b.png") < pos("/trip/sub"));
+        assert!(pos("/trip/sub") < pos("/trip"));
+        assert!(pos("/trip/a.jpg") < pos("/trip"));
+        // …and the target directory itself is removed last.
+        assert_eq!(order.last().unwrap(), Path::new("/trip"));
+    }
 }
