@@ -15,6 +15,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.search_cache = None;
                         app.remote_search = None;
                         app.remote_search_changed = None;
+                        app.remote_download = None;
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;
@@ -55,7 +56,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     });
 }
 
-fn format_bytes(n: u64) -> String {
+pub(crate) fn format_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
