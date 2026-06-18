@@ -17,7 +17,7 @@ mod webp;
 
 use eframe::egui;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result {
@@ -166,10 +166,47 @@ impl TwelfApp {
         }
     }
 
-    /// Carry out a confirmed delete. The local and remote backends are wired in
-    /// later subtasks; for now this only consumes the request.
+    /// Carry out a confirmed delete. Local deletes run here synchronously; the
+    /// remote backend is wired in a later subtask.
     fn execute_delete(&mut self, pd: PendingDelete, ctx: &egui::Context) {
-        let _ = (pd, ctx);
+        if pd.is_remote {
+            return;
+        }
+        let result = if pd.is_dir {
+            std::fs::remove_dir_all(&pd.path)
+        } else {
+            std::fs::remove_file(&pd.path)
+        };
+        if let Err(e) = result {
+            crate::log!("failed to delete {}: {e}", pd.path.display());
+            return;
+        }
+        if let Some(root) = self.root_node.as_mut() {
+            root.remove_path(&pd.path);
+        }
+        self.clear_after_delete(&pd.path, ctx);
+    }
+
+    /// After a delete, drop any selection that pointed at (or under) `deleted`
+    /// and close the search so a stale result row can't linger.
+    fn clear_after_delete(&mut self, deleted: &Path, ctx: &egui::Context) {
+        let mut cleared = false;
+        if self.selected_image.as_deref().is_some_and(|p| p.starts_with(deleted)) {
+            self.selected_image = None;
+            cleared = true;
+        }
+        if self.selected_remote.as_deref().is_some_and(|p| p.starts_with(deleted)) {
+            self.selected_remote = None;
+            cleared = true;
+        }
+        if cleared {
+            ctx.forget_all_images();
+        }
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_cache = None;
+        self.remote_search = None;
+        self.remote_search_changed = None;
     }
 }
 

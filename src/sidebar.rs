@@ -85,6 +85,25 @@ impl TreeNode {
         }
     }
 
+    /// Remove the node at `target` from this loaded subtree, returning true once
+    /// found. A folder whose children aren't loaded (or a path not present) is a
+    /// no-op — it isn't on screen to remove.
+    pub fn remove_path(&mut self, target: &Path) -> bool {
+        let NodeKind::Dir { children: Some(children) } = &mut self.kind else {
+            return false;
+        };
+        if let Some(pos) = children.iter().position(|c| c.path == target) {
+            children.remove(pos);
+            return true;
+        }
+        for child in children {
+            if target.starts_with(&child.path) && child.remove_path(target) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn child(path: PathBuf) -> Self {
         let name = path
             .file_name()
