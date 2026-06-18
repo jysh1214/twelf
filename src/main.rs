@@ -90,6 +90,7 @@ struct TwelfApp {
     remote_delete: Option<remote::RemoteDelete>,
     pending_delete: Option<PendingDelete>,
     pending_rename: Option<PendingRename>,
+    remote_rename: Option<remote::RemoteRename>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
@@ -124,6 +125,7 @@ impl TwelfApp {
             remote_delete: None,
             pending_delete: None,
             pending_rename: None,
+            remote_rename: None,
             remote_listings_tx,
             remote_listings_rx,
             session_holder: Arc::new(Mutex::new(None)),
@@ -249,6 +251,20 @@ impl TwelfApp {
         let new = parent.join(&new_name);
 
         if is_remote {
+            // Already in flight — ignore a double submit.
+            if self.remote_rename.is_some() {
+                return;
+            }
+            if let ssh::SshState::Connected { session, .. } = &self.ssh {
+                self.remote_rename = Some(remote::spawn_remote_rename(
+                    session.clone(),
+                    &self.runtime,
+                    old,
+                    new,
+                    ctx,
+                ));
+            }
+            // Keep `pending_rename` open; the poll loop resolves success/error.
             return;
         }
         if new.exists() {
@@ -341,6 +357,7 @@ impl eframe::App for TwelfApp {
                     self.pending_delete = None;
                     self.pending_rename = None;
                     self.remote_delete = None;
+                    self.remote_rename = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -358,6 +375,7 @@ impl eframe::App for TwelfApp {
                     self.pending_delete = None;
                     self.pending_rename = None;
                     self.remote_delete = None;
+                    self.remote_rename = None;
                     ssh::SshState::Failed { error }
                 }
             };
@@ -522,6 +540,7 @@ impl eframe::App for TwelfApp {
         // `pending_rename`; the entered name is applied only on Rename / Enter.
         let mut do_rename = false;
         let mut cancel_rename = false;
+        let renaming = self.remote_rename.is_some();
         if let Some(pr) = self.pending_rename.as_mut() {
             let current = pr
                 .path
@@ -539,6 +558,11 @@ impl eframe::App for TwelfApp {
                     } else {
                         format!("Rename \"{current}\" to:")
                     });
+                    // A remote rename is in flight — show progress, no re-submit.
+                    if renaming {
+                        ui.label(egui::RichText::new("Renaming…").italics());
+                        return;
+                    }
                     let edit = ui.text_edit_singleline(&mut pr.name);
                     if edit.changed() {
                         pr.error = None;
@@ -846,6 +870,39 @@ impl eframe::App for TwelfApp {
                 needs_focus: true,
                 error: None,
             });
+        }
+        // Resolve an in-flight remote rename: refresh on success, surface the
+        // server's error in the still-open dialog on failure.
+        if let Some(rr) = self.remote_rename.as_mut() {
+            rr.poll();
+        }
+        if self.remote_rename.as_ref().is_some_and(|r| r.is_finished()) {
+            let rr = self.remote_rename.take().expect("just checked finished");
+            match rr.result() {
+                Some(Ok(())) => {
+                    let old = rr.target().to_path_buf();
+                    if let Some(parent) = old.parent()
+                        && let Some(root) = self.remote_root.as_mut()
+                    {
+                        root.reload(parent);
+                    }
+                    if let Some(pr) = self.pending_rename.take() {
+                        let new = old
+                            .parent()
+                            .map(|p| p.join(pr.name.trim()))
+                            .unwrap_or_else(|| old.clone());
+                        self.apply_rename_side_effects(&old, &new, ctx);
+                    }
+                }
+                Some(Err(msg)) => {
+                    if let Some(pr) = self.pending_rename.as_mut() {
+                        pr.error = Some(msg.clone());
+                    }
+                }
+                None => {}
+            }
+        } else if self.remote_rename.is_some() {
+            ctx.request_repaint();
         }
         image_panel::render(self, ctx);
     }
