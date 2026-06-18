@@ -463,6 +463,7 @@ pub fn render_remote_tree(
     selected_remote: &mut Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     prefetch: &mut VecDeque<String>,
+    download_request: &mut Option<PathBuf>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -518,6 +519,7 @@ pub fn render_remote_tree(
                             selected_remote,
                             scroll_target,
                             prefetch,
+                            download_request,
                             sftp,
                             tx,
                             runtime,
@@ -535,6 +537,10 @@ pub fn render_remote_tree(
                     if let RemoteDirChildren::Loaded(c) = children_ref {
                         prefetch.extend(image_prefetch_uris(c, host));
                     }
+                    ui.close();
+                }
+                if ui.button("Download").clicked() {
+                    *download_request = Some(path.clone());
                     ui.close();
                 }
             });
