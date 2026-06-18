@@ -527,6 +527,7 @@ impl eframe::App for TwelfApp {
                             &mut self.scroll_target,
                             &mut self.image_prefetch,
                             &mut download_request,
+                            &mut delete_request,
                             &sftp,
                             &self.remote_listings_tx,
                             &self.runtime,

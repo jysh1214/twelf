@@ -464,6 +464,7 @@ pub fn render_remote_tree(
     scroll_target: &mut Option<PathBuf>,
     prefetch: &mut VecDeque<String>,
     download_request: &mut Option<PathBuf>,
+    delete_request: &mut Option<(PathBuf, bool)>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -480,6 +481,12 @@ pub fn render_remote_tree(
             if response.clicked() {
                 *selected_remote = Some(node.path.clone());
             }
+            response.context_menu(|ui| {
+                if ui.button("Delete").clicked() {
+                    *delete_request = Some((node.path.clone(), false));
+                    ui.close();
+                }
+            });
         }
         RemoteNodeKind::Dir { children } => {
             let path = node.path.clone();
@@ -520,6 +527,7 @@ pub fn render_remote_tree(
                             scroll_target,
                             prefetch,
                             download_request,
+                            delete_request,
                             sftp,
                             tx,
                             runtime,
@@ -541,6 +549,10 @@ pub fn render_remote_tree(
                 }
                 if ui.button("Download").clicked() {
                     *download_request = Some(path.clone());
+                    ui.close();
+                }
+                if !is_root && ui.button("Delete").clicked() {
+                    *delete_request = Some((path.clone(), true));
                     ui.close();
                 }
             });
