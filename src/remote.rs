@@ -562,4 +562,30 @@ mod tests {
         let uris = image_prefetch_uris(&children, "nas");
         assert_eq!(uris, vec!["sftp://nas/photos/a.jpg".to_string()]);
     }
+
+    #[test]
+    fn local_target_recreates_folder_and_structure() {
+        let dest = PathBuf::from("/home/me/dl");
+        let root = PathBuf::from("/photos/trip");
+        assert_eq!(
+            local_target(&dest, &root, &PathBuf::from("/photos/trip/a.jpg")),
+            PathBuf::from("/home/me/dl/trip/a.jpg")
+        );
+        assert_eq!(
+            local_target(&dest, &root, &PathBuf::from("/photos/trip/sub/b.png")),
+            PathBuf::from("/home/me/dl/trip/sub/b.png")
+        );
+    }
+
+    #[test]
+    fn local_target_keeps_spaces_in_names() {
+        assert_eq!(
+            local_target(
+                &PathBuf::from("/dl"),
+                &PathBuf::from("/photos/my trip"),
+                &PathBuf::from("/photos/my trip/a b.jpg"),
+            ),
+            PathBuf::from("/dl/my trip/a b.jpg")
+        );
+    }
 }
