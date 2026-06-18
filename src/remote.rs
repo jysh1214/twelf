@@ -5,7 +5,7 @@ use russh_sftp::client::SftpSession;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 
@@ -142,6 +142,8 @@ const REMOTE_SEARCH_MAX_DEPTH: usize = 64;
 /// Max concurrent in-flight SFTP read_dirs during a search walk. russh-sftp
 /// pipelines requests by id, so this overlaps their round-trips.
 const REMOTE_SEARCH_CONCURRENCY: usize = 8;
+/// Max concurrent in-flight SFTP ops (read_dir + file reads) during a download.
+const REMOTE_DOWNLOAD_CONCURRENCY: usize = 8;
 
 /// An in-flight recursive remote search. The walk runs off-thread and sends one
 /// final pruned result back. The handle owns the result channel, so a superseded
@@ -246,6 +248,196 @@ async fn search_remote_dir(
         })
     });
     join_all(children).await.into_iter().flatten().collect()
+}
+
+/// Live counters for an in-flight download, shared with the walk task.
+#[derive(Default)]
+struct DownloadProgress {
+    files: AtomicUsize,
+    bytes: AtomicU64,
+    errors: AtomicUsize,
+}
+
+/// An in-flight recursive folder download. Like `RemoteSearchWalk`, the walk
+/// runs off-thread and dropping the handle flips `cancel` to stop it. The
+/// counters are read live each frame; `rx` fires once when the walk finishes.
+pub struct RemoteDownload {
+    target: PathBuf,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<DownloadProgress>,
+    rx: std::sync::mpsc::Receiver<()>,
+    finished: bool,
+}
+
+impl RemoteDownload {
+    /// Note completion once the walk signals it (non-blocking).
+    pub fn poll(&mut self) {
+        if !self.finished && self.rx.try_recv().is_ok() {
+            self.finished = true;
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn files(&self) -> usize {
+        self.progress.files.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.progress.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn errors(&self) -> usize {
+        self.progress.errors.load(Ordering::Relaxed)
+    }
+
+    /// Local folder the remote tree is copied into (`<dest>/<folder name>`).
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+impl Drop for RemoteDownload {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a recursive download of `root` into `dest` on the runtime. Every file
+/// under `root` is copied to `<dest>/<root name>/…`, preserving structure.
+/// Cancel by dropping the returned handle (see `Drop`).
+pub fn spawn_remote_download(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    root: PathBuf,
+    dest: PathBuf,
+    ctx: &egui::Context,
+) -> RemoteDownload {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(DownloadProgress::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_task = cancel.clone();
+    let progress_task = progress.clone();
+    let ctx_task = ctx.clone();
+    let dest_task = dest.clone();
+    let target = match root.file_name() {
+        Some(name) => dest.join(name),
+        None => dest,
+    };
+    runtime.spawn(async move {
+        let sem = Semaphore::new(REMOTE_DOWNLOAD_CONCURRENCY);
+        download_remote_dir(
+            &sftp,
+            &root,
+            &root,
+            &dest_task,
+            &cancel_task,
+            &sem,
+            &progress_task,
+            0,
+        )
+        .await;
+        let _ = tx.send(());
+        ctx_task.request_repaint();
+    });
+    RemoteDownload { target, cancel, progress, rx, finished: false }
+}
+
+/// Recursively copy `dir` (under `root`) to the local destination. Unfiltered —
+/// every file is fetched, unlike the media-only tree listing. Silent-skips a
+/// read_dir error and stops on cancel or past the depth cap, like the search walk.
+async fn download_remote_dir(
+    sftp: &SftpSession,
+    root: &Path,
+    dir: &Path,
+    dest: &Path,
+    cancel: &AtomicBool,
+    sem: &Semaphore,
+    progress: &DownloadProgress,
+    depth: usize,
+) {
+    if depth > REMOTE_SEARCH_MAX_DEPTH || cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let entries = {
+        // Hold a permit only for the round-trip, never across recursion — see
+        // search_remote_dir for the permit-pool deadlock this avoids.
+        let _permit = sem.acquire().await.expect("download semaphore never closed");
+        match sftp.read_dir(dir.to_string_lossy().into_owned()).await {
+            Ok(entries) => entries,
+            Err(_) => return,
+        }
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let children = entries.map(|entry| {
+        let is_dir = entry.metadata().is_dir();
+        let mut child = dir.to_path_buf();
+        child.push(entry.file_name());
+        Box::pin(async move {
+            if is_dir {
+                download_remote_dir(sftp, root, &child, dest, cancel, sem, progress, depth + 1)
+                    .await;
+            } else {
+                download_file(sftp, root, &child, dest, cancel, sem, progress).await;
+            }
+        })
+    });
+    join_all(children).await;
+}
+
+/// Fetch one remote file and write it under the destination. A read or write
+/// failure is counted but does not abort the rest of the walk.
+async fn download_file(
+    sftp: &SftpSession,
+    root: &Path,
+    remote_file: &Path,
+    dest: &Path,
+    cancel: &AtomicBool,
+    sem: &Semaphore,
+    progress: &DownloadProgress,
+) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let bytes = {
+        let _permit = sem.acquire().await.expect("download semaphore never closed");
+        match sftp.read(remote_file.to_string_lossy().into_owned()).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                progress.errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    };
+    if write_file(&local_target(dest, root, remote_file), &bytes).is_err() {
+        progress.errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    progress.files.fetch_add(1, Ordering::Relaxed);
+    progress.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+}
+
+/// Local path a remote file lands at: `<dest>/<root name>/<path relative to root>`.
+fn local_target(dest: &Path, root: &Path, remote_file: &Path) -> PathBuf {
+    let mut out = dest.to_path_buf();
+    if let Some(name) = root.file_name() {
+        out.push(name);
+    }
+    if let Ok(rel) = remote_file.strip_prefix(root) {
+        out.push(rel);
+    }
+    out
+}
+
+fn write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, bytes)
 }
 
 /// URIs the Load action prefetches: every image under the loaded children, as
