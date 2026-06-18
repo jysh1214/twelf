@@ -67,6 +67,7 @@ struct TwelfApp {
     ssh_dialog: ssh::ConnectDialog,
     remote_root: Option<remote::RemoteTreeNode>,
     selected_remote: Option<PathBuf>,
+    remote_download: Option<remote::RemoteDownload>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
@@ -97,6 +98,7 @@ impl TwelfApp {
             ssh_dialog: ssh::ConnectDialog::from_settings(config::load().ssh),
             remote_root: None,
             selected_remote: None,
+            remote_download: None,
             remote_listings_tx,
             remote_listings_rx,
             session_holder: Arc::new(Mutex::new(None)),
@@ -176,6 +178,7 @@ impl eframe::App for TwelfApp {
                     self.search_cache = None;
                     self.remote_search = None;
                     self.remote_search_changed = None;
+                    self.remote_download = None;
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -189,6 +192,7 @@ impl eframe::App for TwelfApp {
                     self.search_cache = None;
                     self.remote_search = None;
                     self.remote_search_changed = None;
+                    self.remote_download = None;
                     ssh::SshState::Failed { error }
                 }
             };
@@ -312,6 +316,9 @@ impl eframe::App for TwelfApp {
             ssh::SshState::Connected { info, .. } => info.host.clone(),
             _ => String::new(),
         };
+        // Set by the remote tree's Download context-menu action, consumed after the
+        // panel so the blocking folder picker runs outside the tree render.
+        let mut download_request: Option<PathBuf> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -333,6 +340,41 @@ impl eframe::App for TwelfApp {
             };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
                 let mut new_remote_selection: Option<PathBuf> = None;
+                let mut cancel_download = false;
+                if let Some(dl) = self.remote_download.as_mut() {
+                    dl.poll();
+                    let mut text = if dl.is_finished() {
+                        format!(
+                            "Downloaded {} file(s), {} → {}",
+                            dl.files(),
+                            menu_bar::format_bytes(dl.bytes()),
+                            dl.target().display()
+                        )
+                    } else {
+                        let name = dl.target().file_name().unwrap_or_default().to_string_lossy();
+                        format!(
+                            "Downloading {name}: {} file(s), {}…",
+                            dl.files(),
+                            menu_bar::format_bytes(dl.bytes())
+                        )
+                    };
+                    if dl.errors() > 0 {
+                        text.push_str(&format!(" ({} failed)", dl.errors()));
+                    }
+                    let finished = dl.is_finished();
+                    ui.horizontal(|ui| {
+                        ui.label(text);
+                        if !finished && ui.button("Cancel").clicked() {
+                            cancel_download = true;
+                        }
+                    });
+                    if !finished {
+                        ctx.request_repaint();
+                    }
+                }
+                if cancel_download {
+                    self.remote_download = None;
+                }
                 if self.search_active {
                     sidebar::search_bar(ui, &mut self.search_query, open_search);
                 }
@@ -381,6 +423,7 @@ impl eframe::App for TwelfApp {
                             &mut self.selected_remote,
                             &mut self.scroll_target,
                             &mut self.image_prefetch,
+                            &mut download_request,
                             &sftp,
                             &self.remote_listings_tx,
                             &self.runtime,
@@ -459,6 +502,26 @@ impl eframe::App for TwelfApp {
                 }
             }
         });
+        // A folder's Download action was chosen: pick a local destination and spawn
+        // the recursive copy. The picker runs here (not in the tree render) so it
+        // blocks the frame only once, and the still-connected session is reused.
+        if let Some(folder) = download_request {
+            let session = match &self.ssh {
+                ssh::SshState::Connected { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            if let Some(session) = session
+                && let Some(dest) = rfd::FileDialog::new().pick_folder()
+            {
+                self.remote_download = Some(remote::spawn_remote_download(
+                    session,
+                    &self.runtime,
+                    folder,
+                    dest,
+                    ctx,
+                ));
+            }
+        }
         image_panel::render(self, ctx);
     }
 }
