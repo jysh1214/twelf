@@ -328,4 +328,13 @@ mod tests {
             Some(b"hello".to_vec())
         );
     }
+
+    #[test]
+    fn larger_requested_size_is_a_miss() {
+        let (cache, _dir) = fresh_cache();
+        cache.put("sftp://host/a.jpg", b"hello", Some(100));
+        // A stat reporting a size larger than the stored blob must also miss —
+        // any size difference invalidates, not only a smaller one.
+        assert_eq!(cache.get("sftp://host/a.jpg", Some(100), Some(6)), None);
+    }
 }

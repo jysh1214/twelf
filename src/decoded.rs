@@ -259,4 +259,14 @@ mod tests {
         assert!(c.get("b").is_none());
         assert_eq!(c.byte_size(), 0);
     }
+
+    #[test]
+    fn filling_exactly_to_cap_evicts_nothing() {
+        let mut c = cache(80); // holds exactly two 40-byte entries
+        c.put("a".into(), img(10));
+        c.put("b".into(), img(10)); // total == cap: must not trigger eviction
+        assert!(c.get("a").is_some());
+        assert!(c.get("b").is_some());
+        assert_eq!(c.byte_size(), 80);
+    }
 }

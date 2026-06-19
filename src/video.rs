@@ -862,4 +862,11 @@ mod tests {
         let error = wait_for_error(&mut player, &ctx);
         assert!(error.contains("not UTF-8"), "unexpected error: {error}");
     }
+
+    #[test]
+    fn is_video_accepts_uppercase_extensions() {
+        assert!(is_video("CLIP.MKV"));
+        assert!(is_video("movie.MP4"));
+        assert!(!is_video("song.MP3"));
+    }
 }

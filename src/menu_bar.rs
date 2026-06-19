@@ -74,3 +74,18 @@ pub(crate) fn format_bytes(n: u64) -> String {
         format!("{n} B")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_each_unit_at_its_threshold() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B"); // just below KB
+        assert_eq!(format_bytes(1024), "1.0 KB"); // exact KB threshold (>=)
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+}

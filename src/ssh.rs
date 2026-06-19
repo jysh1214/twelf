@@ -147,3 +147,29 @@ fn stringify<E: std::error::Error>(err: E) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_home_only_expands_a_tilde_slash_prefix() {
+        // Absolute and bare-relative paths pass through untouched.
+        assert_eq!(expand_home("/etc/ssh/key"), PathBuf::from("/etc/ssh/key"));
+        assert_eq!(expand_home("key"), PathBuf::from("key"));
+        // A leading "~" without a slash is not expansion syntax — left as-is.
+        assert_eq!(expand_home("~user/key"), PathBuf::from("~user/key"));
+        // "~/" expands against $HOME.
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(expand_home("~/.ssh/id"), PathBuf::from(home).join(".ssh/id"));
+        }
+    }
+
+    #[test]
+    fn dialog_defaults_blank_port_to_22() {
+        let blank = config::SshSettings::default();
+        assert_eq!(ConnectDialog::from_settings(blank).port, "22");
+        let set = config::SshSettings { port: "2222".to_string(), ..Default::default() };
+        assert_eq!(ConnectDialog::from_settings(set).port, "2222");
+    }
+}

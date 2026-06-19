@@ -620,4 +620,24 @@ mod tests {
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.reload(Path::new("/r/sub")));
     }
+
+    #[test]
+    fn search_matches_uppercase_query_against_lowercase_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("photo.jpg"));
+        // The query is lowercased too (not just the name), so an uppercase query
+        // still matches a lowercase filename.
+        assert_eq!(
+            flatten(&search_tree(root, "PHOTO")),
+            vec![("photo.jpg".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn is_image_accepts_uppercase_extensions() {
+        assert!(is_image(Path::new("holiday.JPG")));
+        assert!(is_image(Path::new("scan.HEIC")));
+        assert!(!is_image(Path::new("notes.TXT")));
+    }
 }
