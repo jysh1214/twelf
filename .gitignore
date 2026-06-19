@@ -1,1 +1,4 @@
 /target
+.mezcal/
+.tequila/
+Cargo.lock
