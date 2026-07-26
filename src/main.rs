@@ -6,6 +6,7 @@ mod fonts;
 mod heic;
 mod image_panel;
 mod logging;
+mod lru;
 mod menu_bar;
 mod nav;
 mod remote;
@@ -64,6 +65,13 @@ const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// is synchronous over the whole tree, so honouring every filesystem event would
 /// hit the disk on every frame for as long as a folder is being written into.
 const LOCAL_SEARCH_REWALK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many prefetch fetches may be in flight at once. `SftpBytesLoader` spawns
+/// a task per URI with no bound of its own, so draining the whole queue turned a
+/// "Load" over a folder of 800 images into 800 concurrent whole-file reads down
+/// the single SSH channel — with the image the user actually clicked queued
+/// behind all of them. Every other remote walk is bounded the same way.
+const PREFETCH_IN_FLIGHT: usize = 8;
 
 /// A delete the user has requested but not yet confirmed. Held while the confirm
 /// modal is open; `is_remote` selects the local-fs vs SFTP backend, and `error`
@@ -130,6 +138,9 @@ struct TwelfApp {
     /// this is the only channel these failures have.
     status_message: Option<String>,
     image_prefetch: VecDeque<String>,
+    /// Prefetch URIs whose fetch has been started and is still resolving,
+    /// capped at `PREFETCH_IN_FLIGHT`.
+    prefetch_in_flight: Vec<String>,
     /// URIs of the most recently displayed images, oldest first. Bounded, and
     /// anything falling out is forgotten — see `image_panel::retain_displayed`.
     displayed_uris: VecDeque<String>,
@@ -180,6 +191,7 @@ impl TwelfApp {
             cache: Arc::new(cache::ImageCache::new()),
             status_message: None,
             image_prefetch: VecDeque::new(),
+            prefetch_in_flight: Vec::new(),
             displayed_uris: VecDeque::new(),
             animation: None,
             anim_pending: None,
@@ -187,22 +199,31 @@ impl TwelfApp {
         }
     }
 
-    /// Re-poll queued prefetch URIs each frame, driving the bytes→decode
-    /// pipeline to completion for off-screen images. A one-shot poll wouldn't
-    /// work: the byte fetch is still in flight on the first call.
+    /// Drive the bytes→decode pipeline for off-screen images, at most
+    /// `PREFETCH_IN_FLIGHT` at a time. Started URIs must be re-polled every
+    /// frame — a one-shot poll never resolves, since the byte fetch is still in
+    /// flight on the first call — and only once one settles is the next one
+    /// started, which is what bounds the fan-out.
     fn drain_image_prefetch(&mut self, ctx: &egui::Context) {
-        if self.image_prefetch.is_empty() {
+        if self.image_prefetch.is_empty() && self.prefetch_in_flight.is_empty() {
             return;
         }
-        let mut remaining = VecDeque::with_capacity(self.image_prefetch.len());
-        while let Some(uri) = self.image_prefetch.pop_front() {
-            match ctx.try_load_image(&uri, egui::load::SizeHint::default()) {
-                Ok(egui::load::ImagePoll::Pending { .. }) => remaining.push_back(uri),
-                _ => {} // Ready (decoded + cached) or Err (give up) — drop it
+        // Ready (decoded + cached) and Err (give up) both drop out.
+        self.prefetch_in_flight.retain(|uri| {
+            matches!(
+                ctx.try_load_image(uri, egui::load::SizeHint::default()),
+                Ok(egui::load::ImagePoll::Pending { .. })
+            )
+        });
+        while self.prefetch_in_flight.len() < PREFETCH_IN_FLIGHT {
+            let Some(uri) = self.image_prefetch.pop_front() else { break };
+            if let Ok(egui::load::ImagePoll::Pending { .. }) =
+                ctx.try_load_image(&uri, egui::load::SizeHint::default())
+            {
+                self.prefetch_in_flight.push(uri);
             }
         }
-        self.image_prefetch = remaining;
-        if !self.image_prefetch.is_empty() {
+        if !self.image_prefetch.is_empty() || !self.prefetch_in_flight.is_empty() {
             ctx.request_repaint();
         }
     }

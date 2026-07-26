@@ -1,99 +1,23 @@
 use eframe::egui;
 use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use crate::backoff::BackOff;
+use crate::lru::{ByteLru, ByteSized};
 use egui::{ColorImage, Context};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DECODED_CACHE_CAP: usize = 512 * 1024 * 1024;
 const DECODE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
-struct Entry {
-    image: Arc<ColorImage>,
-    bytes: usize,
-    last_used: u64,
-}
-
-/// Byte-capped LRU of decoded images, keyed by URI.
-struct DecodedCache {
-    map: HashMap<String, Entry>,
-    total_bytes: usize,
-    seq: u64,
-    cap: usize,
-}
-
-impl DecodedCache {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            total_bytes: 0,
-            seq: 0,
-            cap: DECODED_CACHE_CAP,
-        }
-    }
-
-    fn get(&mut self, uri: &str) -> Option<Arc<ColorImage>> {
-        self.seq += 1;
-        let now = self.seq;
-        let entry = self.map.get_mut(uri)?;
-        entry.last_used = now;
-        Some(entry.image.clone())
-    }
-
-    fn put(&mut self, uri: String, image: Arc<ColorImage>) {
-        let bytes = image.size[0] * image.size[1] * 4;
-        if let Some(old) = self.map.remove(&uri) {
-            self.total_bytes -= old.bytes;
-        }
-        // Evict least-recently-used until the newcomer fits (always keep the
-        // newcomer, even if it alone exceeds the cap).
-        while self.total_bytes + bytes > self.cap {
-            let lru = self
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone());
-            match lru {
-                Some(k) => {
-                    if let Some(removed) = self.map.remove(&k) {
-                        self.total_bytes -= removed.bytes;
-                    }
-                }
-                None => break,
-            }
-        }
-        self.seq += 1;
-        let now = self.seq;
-        self.total_bytes += bytes;
-        self.map.insert(
-            uri,
-            Entry {
-                image,
-                bytes,
-                last_used: now,
-            },
-        );
-    }
-
-    fn forget(&mut self, uri: &str) {
-        if let Some(removed) = self.map.remove(uri) {
-            self.total_bytes -= removed.bytes;
-        }
-    }
-
-    fn forget_all(&mut self) {
-        self.map.clear();
-        self.total_bytes = 0;
-    }
-
+impl ByteSized for Arc<ColorImage> {
     fn byte_size(&self) -> usize {
-        self.total_bytes
+        self.size[0] * self.size[1] * 4
     }
 }
 
 struct LoaderState {
-    cache: DecodedCache,
+    cache: ByteLru<Arc<ColorImage>>,
     pending: HashSet<String>,
     failed: BackOff,
 }
@@ -111,7 +35,7 @@ impl DecodedImageLoader {
         Self {
             handle,
             state: Arc::new(Mutex::new(LoaderState {
-                cache: DecodedCache::new(),
+                cache: ByteLru::new(DECODED_CACHE_CAP),
                 pending: HashSet::new(),
                 failed: BackOff::new(DECODE_RETRY_BACKOFF),
             })),
@@ -207,66 +131,14 @@ fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
 mod tests {
     use super::*;
 
-    fn img(pixels: usize) -> Arc<ColorImage> {
-        Arc::new(ColorImage::from_rgba_unmultiplied(
-            [pixels, 1],
-            &vec![255u8; pixels * 4],
-        ))
-    }
-
-    fn cache(cap: usize) -> DecodedCache {
-        DecodedCache {
-            map: HashMap::new(),
-            total_bytes: 0,
-            seq: 0,
-            cap,
-        }
-    }
-
+    /// The eviction policy itself is covered in `lru`; this pins the size a
+    /// decoded image is charged, which is what makes the 512 MB cap meaningful.
     #[test]
-    fn evicts_least_recently_used_past_cap() {
-        let mut c = cache(100); // fits two 40-byte entries
-        c.put("a".into(), img(10));
-        c.put("b".into(), img(10));
-        c.put("c".into(), img(10)); // 120 > cap -> evict LRU (a)
-        assert!(c.get("a").is_none());
-        assert!(c.get("b").is_some());
-        assert!(c.get("c").is_some());
-        assert!(c.byte_size() <= 100);
-    }
-
-    #[test]
-    fn get_refreshes_recency() {
-        let mut c = cache(100);
-        c.put("a".into(), img(10));
-        c.put("b".into(), img(10));
-        assert!(c.get("a").is_some()); // bump a; b becomes LRU
-        c.put("c".into(), img(10)); // evict LRU (b)
-        assert!(c.get("a").is_some());
-        assert!(c.get("b").is_none());
-        assert!(c.get("c").is_some());
-    }
-
-    #[test]
-    fn forget_and_forget_all_drop_bytes() {
-        let mut c = cache(1000);
-        c.put("a".into(), img(10));
-        c.put("b".into(), img(10));
-        c.forget("a");
-        assert!(c.get("a").is_none());
-        assert_eq!(c.byte_size(), 40);
-        c.forget_all();
-        assert!(c.get("b").is_none());
-        assert_eq!(c.byte_size(), 0);
-    }
-
-    #[test]
-    fn filling_exactly_to_cap_evicts_nothing() {
-        let mut c = cache(80); // holds exactly two 40-byte entries
-        c.put("a".into(), img(10));
-        c.put("b".into(), img(10)); // total == cap: must not trigger eviction
-        assert!(c.get("a").is_some());
-        assert!(c.get("b").is_some());
-        assert_eq!(c.byte_size(), 80);
+    fn a_decoded_image_is_charged_its_rgba_size() {
+        let image: Arc<ColorImage> = Arc::new(ColorImage::from_rgba_unmultiplied(
+            [10, 4],
+            &vec![255u8; 10 * 4 * 4],
+        ));
+        assert_eq!(image.byte_size(), 10 * 4 * 4);
     }
 }

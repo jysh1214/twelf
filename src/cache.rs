@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Cap on the blob cache's total size. The schema has always tracked
+/// `last_accessed`, but nothing read it: every distinct remote image ever
+/// viewed stayed on disk forever, and once the partition filled every
+/// subsequent write failed silently.
+const MAX_CACHE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+
 pub struct ImageCache {
     inner: Mutex<Option<Inner>>,
 }
@@ -12,6 +18,7 @@ pub struct ImageCache {
 struct Inner {
     conn: Connection,
     blobs_dir: PathBuf,
+    max_bytes: i64,
 }
 
 impl ImageCache {
@@ -43,8 +50,14 @@ impl ImageCache {
 
     #[cfg(test)]
     fn initialize_at(&self, dir: &Path, key: &[u8]) {
+        self.initialize_at_with_cap(dir, key, MAX_CACHE_BYTES);
+    }
+
+    #[cfg(test)]
+    fn initialize_at_with_cap(&self, dir: &Path, key: &[u8], max_bytes: i64) {
         let key_hex = format!("{:x}", Sha256::digest(key));
-        let inner = Self::open_at(dir, &key_hex).expect("open test cache");
+        let mut inner = Self::open_at(dir, &key_hex).expect("open test cache");
+        inner.max_bytes = max_bytes;
         *self.inner.lock().unwrap() = Some(inner);
     }
 
@@ -66,7 +79,7 @@ impl ImageCache {
         let db_path = dir.join("cache.db");
 
         match Self::open_with_key(&db_path, key_hex) {
-            Ok(conn) => Ok(Inner { conn, blobs_dir }),
+            Ok(conn) => Ok(Inner { conn, blobs_dir, max_bytes: MAX_CACHE_BYTES }),
             Err(_) => {
                 let _ = fs::remove_file(&db_path);
                 if let Ok(iter) = fs::read_dir(&blobs_dir) {
@@ -76,7 +89,7 @@ impl ImageCache {
                 }
                 let conn = Self::open_with_key(&db_path, key_hex)
                     .map_err(|e| format!("failed to open encrypted cache after wipe: {e}"))?;
-                Ok(Inner { conn, blobs_dir })
+                Ok(Inner { conn, blobs_dir, max_bytes: MAX_CACHE_BYTES })
             }
         }
     }
@@ -221,11 +234,44 @@ impl ImageCache {
                     "UPDATE entries SET byte_size = ?1, mtime = ?2, last_accessed = ?3 WHERE rowid = ?4",
                     params![size, mtime, now, rowid],
                 );
+                Self::evict_over_cap(inner, rowid);
             } else if is_new {
                 let _ = inner
                     .conn
                     .execute("DELETE FROM entries WHERE rowid = ?1", params![rowid]);
             }
+        }
+    }
+
+    /// Drop least-recently-used entries, blob file and row together, until the
+    /// total is back under the cap. `keep` is the row just written, which is
+    /// exempt so a single oversized file still lands (it is also the newest, so
+    /// it would sort last anyway — this only matters when it is the last row).
+    /// Runs inside the caller's lock, keeping `get`'s rowid revalidation honest.
+    fn evict_over_cap(inner: &Inner, keep: i64) {
+        let Some(mut total) = sum_bytes(&inner.conn) else { return };
+        while total > inner.max_bytes {
+            let victim = inner
+                .conn
+                .query_row(
+                    "SELECT rowid, byte_size FROM entries WHERE rowid != ?1
+                     ORDER BY last_accessed ASC, rowid ASC LIMIT 1",
+                    params![keep],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let Some((rowid, size)) = victim else { break };
+            let _ = fs::remove_file(inner.blobs_dir.join(rowid.to_string()));
+            if inner
+                .conn
+                .execute("DELETE FROM entries WHERE rowid = ?1", params![rowid])
+                .is_err()
+            {
+                break;
+            }
+            total -= size;
         }
     }
 
@@ -248,23 +294,28 @@ impl ImageCache {
     pub fn total_size_bytes(&self) -> u64 {
         let Ok(guard) = self.inner.lock() else { return 0 };
         let Some(inner) = guard.as_ref() else { return 0 };
-        inner
-            .conn
-            .query_row(
-                "SELECT COALESCE(SUM(byte_size), 0) FROM entries",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .ok()
-            .map(|n| n.max(0) as u64)
-            .unwrap_or(0)
+        sum_bytes(&inner.conn).map(|n| n.max(0) as u64).unwrap_or(0)
     }
 }
 
+fn sum_bytes(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(byte_size), 0) FROM entries",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+}
+
+/// Milliseconds, not seconds: `last_accessed` orders LRU eviction, and a whole
+/// burst of images is viewed within one second while browsing — at second
+/// granularity they all tie and the tie-break degrades to insertion order.
+/// Older second-granularity rows simply sort as very old and are re-stamped on
+/// their next hit, so no migration is needed.
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -326,6 +377,52 @@ mod tests {
         assert_eq!(
             cache.get("sftp://host/a.jpg", Some(100), Some(5)),
             Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn eviction_drops_least_recently_used_past_the_cap() {
+        let dir = tempdir().expect("tempdir");
+        let cache = ImageCache::new();
+        cache.initialize_at_with_cap(dir.path(), b"test-key", 20);
+
+        // Separated so the recency stamps are distinct rather than tied — the
+        // ordering under test is the point, not the clock's resolution.
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(2));
+        cache.put("sftp://h/a.jpg", &[0u8; 8], Some(1));
+        tick();
+        cache.put("sftp://h/b.jpg", &[0u8; 8], Some(1));
+        tick();
+        // Touch a so b is the least recently used.
+        assert!(cache.get("sftp://h/a.jpg", Some(1), Some(8)).is_some());
+        tick();
+
+        // 24 > 20, so one entry has to go, and it must be b.
+        cache.put("sftp://h/c.jpg", &[0u8; 8], Some(1));
+        assert!(cache.get("sftp://h/b.jpg", Some(1), Some(8)).is_none());
+        assert!(cache.get("sftp://h/a.jpg", Some(1), Some(8)).is_some());
+        assert!(cache.get("sftp://h/c.jpg", Some(1), Some(8)).is_some());
+        assert!(cache.total_size_bytes() <= 20);
+
+        // The blob file goes with the row, or the cap would only be nominal.
+        let blobs = std::fs::read_dir(dir.path().join("blobs"))
+            .expect("blobs dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(blobs, 2);
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_cap_is_still_stored() {
+        let dir = tempdir().expect("tempdir");
+        let cache = ImageCache::new();
+        cache.initialize_at_with_cap(dir.path(), b"test-key", 10);
+        cache.put("sftp://h/big.jpg", &[0u8; 64], Some(1));
+        // Evicting everything else cannot get under the cap; the newcomer stays
+        // rather than being deleted immediately after being written.
+        assert_eq!(
+            cache.get("sftp://h/big.jpg", Some(1), Some(64)),
+            Some(vec![0u8; 64])
         );
     }
 

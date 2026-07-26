@@ -1,17 +1,31 @@
 use crate::backoff::BackOff;
 use crate::cache::ImageCache;
+use crate::lru::{ByteLru, ByteSized};
 use eframe::egui;
 use egui::Context;
 use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
 use russh_sftp::client::SftpSession;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Cap on the raw remote bytes held in memory. egui never evicts a custom bytes
+/// loader on its own, so before this every file fetched in a session stayed
+/// resident — a "Load" over a folder of 800 6 MB JPEGs kept ~4.8 GB. Compressed
+/// bytes are far smaller than the decoded images they feed, so this sits well
+/// under the decoded cache's own cap.
+const BYTES_CACHE_CAP: usize = 256 * 1024 * 1024;
+
+impl ByteSized for Bytes {
+    fn byte_size(&self) -> usize {
+        self.len()
+    }
+}
+
 struct LoaderState {
-    cache: HashMap<String, Bytes>,
+    cache: ByteLru<Bytes>,
     pending: HashSet<String>,
     failed: BackOff,
 }
@@ -33,7 +47,7 @@ impl SftpBytesLoader {
             session,
             handle,
             state: Arc::new(Mutex::new(LoaderState {
-                cache: HashMap::new(),
+                cache: ByteLru::new(BYTES_CACHE_CAP),
                 pending: HashSet::new(),
                 failed: BackOff::new(RETRY_BACKOFF),
             })),
@@ -52,8 +66,8 @@ impl BytesLoader for SftpBytesLoader {
             return Err(LoadError::NotSupported);
         };
         {
-            let state = self.state.lock().unwrap();
-            if let Some(bytes) = state.cache.get(uri).cloned() {
+            let mut state = self.state.lock().unwrap();
+            if let Some(bytes) = state.cache.get(uri) {
                 return Ok(BytesPoll::Ready {
                     size: None,
                     bytes,
@@ -102,7 +116,7 @@ impl BytesLoader for SftpBytesLoader {
             match bytes {
                 Some(vec) => {
                     state.failed.clear(&uri_owned);
-                    state.cache.insert(uri_owned, vec.into());
+                    state.cache.put(uri_owned, vec.into());
                 }
                 None => {
                     state.failed.record(uri_owned);
@@ -116,24 +130,18 @@ impl BytesLoader for SftpBytesLoader {
 
     fn forget(&self, uri: &str) {
         let mut state = self.state.lock().unwrap();
-        state.cache.remove(uri);
+        state.cache.forget(uri);
         state.failed.clear(uri);
     }
 
     fn forget_all(&self) {
         let mut state = self.state.lock().unwrap();
-        state.cache.clear();
+        state.cache.forget_all();
         state.failed.clear_all();
     }
 
     fn byte_size(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .cache
-            .values()
-            .map(|b| b.len())
-            .sum()
+        self.state.lock().unwrap().cache.byte_size()
     }
 
     fn has_pending(&self) -> bool {
