@@ -13,6 +13,7 @@ mod sftp_loader;
 mod sidebar;
 mod ssh;
 mod status_bar;
+mod watcher;
 mod video;
 mod webp;
 
@@ -73,6 +74,7 @@ struct PendingRename {
 
 struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
+    fs_watcher: Option<watcher::FsWatcher>,
     selected_image: Option<PathBuf>,
     scroll_target: Option<PathBuf>,
     search_active: bool,
@@ -108,6 +110,7 @@ impl TwelfApp {
         let (remote_listings_tx, remote_listings_rx) = tokio::sync::mpsc::channel(64);
         Self {
             root_node: None,
+            fs_watcher: None,
             selected_image: None,
             scroll_target: None,
             search_active: false,
@@ -338,6 +341,21 @@ impl eframe::App for TwelfApp {
         while let Ok((path, result)) = self.remote_listings_rx.try_recv() {
             if let Some(root) = self.remote_root.as_mut() {
                 root.apply_listing(&path, result);
+            }
+        }
+
+        // Apply external filesystem changes under the local root: re-list each
+        // touched directory and drop stale search results so the tree (and an
+        // open search) reflect the disk immediately.
+        if let Some(fs_watcher) = &self.fs_watcher {
+            let dirs = fs_watcher.changed_dirs();
+            if !dirs.is_empty() {
+                if let Some(root) = self.root_node.as_mut() {
+                    for dir in &dirs {
+                        root.reload(dir);
+                    }
+                }
+                self.search_cache = None;
             }
         }
 
@@ -621,6 +639,9 @@ impl eframe::App for TwelfApp {
         // Set by a Rename context-menu action in either tree (path, is_dir);
         // consumed after the panel into `pending_rename`.
         let mut rename_request: Option<(PathBuf, bool)> = None;
+        // Set by the remote tree's Refresh context-menu action; consumed after
+        // the panel into a reload of that folder's cached listing.
+        let mut refresh_request: Option<PathBuf> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -712,6 +733,7 @@ impl eframe::App for TwelfApp {
                             &mut download_request,
                             &mut delete_request,
                             &mut rename_request,
+                            &mut refresh_request,
                             &sftp,
                             &self.remote_listings_tx,
                             &self.runtime,
@@ -815,6 +837,13 @@ impl eframe::App for TwelfApp {
                     ctx,
                 ));
             }
+        }
+        // A Refresh action was chosen: drop the folder's cached remote listing
+        // so the next render re-lists it (expanded subfolders re-list lazily).
+        if let Some(path) = refresh_request
+            && let Some(root) = self.remote_root.as_mut()
+        {
+            root.reload(&path);
         }
         // A Delete action was chosen this frame: park it for the confirm modal.
         if let Some((path, is_dir)) = delete_request {

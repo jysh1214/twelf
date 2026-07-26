@@ -682,6 +682,7 @@ pub fn render_remote_tree(
     download_request: &mut Option<PathBuf>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
+    refresh_request: &mut Option<PathBuf>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -750,6 +751,7 @@ pub fn render_remote_tree(
                             download_request,
                             delete_request,
                             rename_request,
+                            refresh_request,
                             sftp,
                             tx,
                             runtime,
@@ -763,6 +765,11 @@ pub fn render_remote_tree(
                 });
             let children_ref: &RemoteDirChildren = &*children;
             collapsing.header_response.context_menu(|ui| {
+                // SFTP has no change notifications, so a re-list is on demand.
+                if ui.button("Refresh").clicked() {
+                    *refresh_request = Some(path.clone());
+                    ui.close();
+                }
                 if ui.button("Load").clicked() {
                     if let RemoteDirChildren::Loaded(c) = children_ref {
                         prefetch.extend(image_prefetch_uris(c, host));

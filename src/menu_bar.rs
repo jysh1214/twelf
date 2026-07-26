@@ -7,6 +7,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
             ui.menu_button("File", |ui| {
                 if ui.button("Open Folder").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        app.fs_watcher = crate::watcher::FsWatcher::spawn(&path, ctx);
                         app.root_node = Some(sidebar::TreeNode::root(path));
                         app.selected_image = None;
                         app.scroll_target = None;

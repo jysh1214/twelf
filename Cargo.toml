@@ -11,6 +11,7 @@ futures = "0.3"
 egui_extras = { version = "0.33", features = ["file", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 libheif-rs = "2.7"
+notify = "8"
 rfd = "0.17"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 russh = "0.60"

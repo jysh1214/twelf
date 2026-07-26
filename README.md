@@ -4,8 +4,8 @@ A Rust image viewer with direct NAS access.
 
 ## Features
 
-- Local folder browsing with a collapsible directory tree.
-- Remote browsing over SFTP — connect to a host, browse a remote root, and load images straight from the server. The NAS must have SFTP enabled.
+- Local folder browsing with a collapsible directory tree. The tree tracks the folder live: files added, removed, or renamed outside the app show up immediately.
+- Remote browsing over SFTP — connect to a host, browse a remote root, and load images straight from the server. The NAS must have SFTP enabled. Right-click a remote folder and choose Refresh to re-list it (SFTP has no change notifications).
 - Supported image formats: JPEG, PNG, GIF, BMP, WebP, HEIC.
 - Supported video formats: MP4, M4V, MKV, WebM, MOV, AVI, WMV, FLV, MPG, MPEG, TS.
 - Video playback for local and remote files: plays on selection (looping, scaled to fit, no audio), with an on-screen play/pause control, `Space` to toggle, and a draggable seek bar. Remote videos stream over SFTP and start playing before the whole file has downloaded.
