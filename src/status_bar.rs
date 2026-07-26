@@ -33,6 +33,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         dl.files(),
                         dl.bytes(),
                         dl.errors(),
+                        dl.skipped(),
                         dl.target(),
                     ));
                     if !finished {
@@ -81,13 +82,15 @@ fn selected_path_text(
     selected_image.map(|path| path.display().to_string())
 }
 
-/// The one-line progress text for a download: live counters while running,
-/// the local target once finished, a failure count when any file failed.
+/// The one-line progress text for a download: live counters while running, the
+/// local target once finished, and a parenthetical for anything that did not
+/// land — failures, and files left alone because a local copy already existed.
 fn download_status_text(
     finished: bool,
     files: usize,
     bytes: u64,
     errors: usize,
+    skipped: usize,
     target: &Path,
 ) -> String {
     let mut text = if finished {
@@ -103,8 +106,15 @@ fn download_status_text(
             menu_bar::format_bytes(bytes)
         )
     };
+    let mut notes = Vec::new();
     if errors > 0 {
-        text.push_str(&format!(" ({errors} failed)"));
+        notes.push(format!("{errors} failed"));
+    }
+    if skipped > 0 {
+        notes.push(format!("{skipped} already existed"));
+    }
+    if !notes.is_empty() {
+        text.push_str(&format!(" ({})", notes.join(", ")));
     }
     text
 }
@@ -151,7 +161,7 @@ mod tests {
     #[test]
     fn download_text_in_progress_uses_folder_name() {
         assert_eq!(
-            download_status_text(false, 3, 1536, 0, &PathBuf::from("/dl/trip")),
+            download_status_text(false, 3, 1536, 0, 0, &PathBuf::from("/dl/trip")),
             "Downloading trip: 3 file(s), 1.5 KB…"
         );
     }
@@ -159,7 +169,7 @@ mod tests {
     #[test]
     fn download_text_finished_shows_full_target() {
         assert_eq!(
-            download_status_text(true, 3, 1536, 0, &PathBuf::from("/dl/trip")),
+            download_status_text(true, 3, 1536, 0, 0, &PathBuf::from("/dl/trip")),
             "Downloaded 3 file(s), 1.5 KB → /dl/trip"
         );
     }
@@ -167,8 +177,20 @@ mod tests {
     #[test]
     fn download_text_appends_failure_count() {
         assert_eq!(
-            download_status_text(true, 2, 1024, 1, &PathBuf::from("/dl/trip")),
+            download_status_text(true, 2, 1024, 1, 0, &PathBuf::from("/dl/trip")),
             "Downloaded 2 file(s), 1.0 KB → /dl/trip (1 failed)"
+        );
+    }
+
+    #[test]
+    fn download_text_reports_skipped_and_combines_notes() {
+        assert_eq!(
+            download_status_text(true, 2, 1024, 0, 3, &PathBuf::from("/dl/trip")),
+            "Downloaded 2 file(s), 1.0 KB → /dl/trip (3 already existed)"
+        );
+        assert_eq!(
+            download_status_text(true, 2, 1024, 1, 3, &PathBuf::from("/dl/trip")),
+            "Downloaded 2 file(s), 1.0 KB → /dl/trip (1 failed, 3 already existed)"
         );
     }
 }

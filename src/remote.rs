@@ -428,6 +428,8 @@ struct DownloadProgress {
     files: AtomicUsize,
     bytes: AtomicU64,
     errors: AtomicUsize,
+    /// Files left untouched because a local copy already existed.
+    skipped: AtomicUsize,
 }
 
 /// An in-flight recursive folder download. Like `RemoteSearchWalk`, the walk
@@ -463,6 +465,10 @@ impl RemoteDownload {
 
     pub fn errors(&self) -> usize {
         self.progress.errors.load(Ordering::Relaxed)
+    }
+
+    pub fn skipped(&self) -> usize {
+        self.progress.skipped.load(Ordering::Relaxed)
     }
 
     /// Local folder the remote tree is copied into (`<dest>/<folder name>`).
@@ -560,24 +566,35 @@ async fn download_remote_dir(
                     .await;
             } else {
                 let local = local_target(dest, root, &child);
-                download_file(sftp, &child, &local, cancel, sem, progress).await;
+                download_file(sftp, &child, &local, false, cancel, sem, progress).await;
             }
         }))
     });
     join_all(children).await;
 }
 
-/// Fetch one remote file and write it to `local`. A read or write failure is
-/// counted but does not abort the rest of the walk.
+/// Fetch one remote file and write it to `local`. With `overwrite` false an
+/// existing local file is left alone and counted as skipped: the folder walk
+/// picks its destination with a directory picker, which carries no overwrite
+/// consent, so truncating the user's own copies there is data loss. The
+/// single-file path goes through a save dialog, which does ask. A read or write
+/// failure is counted but does not abort the rest of the walk.
 async fn download_file(
     sftp: &SftpSession,
     remote_file: &Path,
     local: &Path,
+    overwrite: bool,
     cancel: &AtomicBool,
     sem: &Semaphore,
     progress: &DownloadProgress,
 ) {
     if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    // Checked before the transfer, so re-running a folder copy costs nothing
+    // for what is already on disk; `create_new` below still closes the race.
+    if !overwrite && local.exists() {
+        progress.skipped.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let bytes = {
@@ -590,9 +607,16 @@ async fn download_file(
             }
         }
     };
-    if write_file(local, &bytes).is_err() {
-        progress.errors.fetch_add(1, Ordering::Relaxed);
-        return;
+    match write_file(local, &bytes, overwrite) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            progress.skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            progress.errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     }
     progress.files.fetch_add(1, Ordering::Relaxed);
     progress.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -617,7 +641,8 @@ pub fn spawn_remote_file_download(
     let target_task = target.clone();
     runtime.spawn(async move {
         let sem = Semaphore::new(1);
-        download_file(&sftp, &remote, &target_task, &cancel_task, &sem, &progress_task).await;
+        // The save dialog already asked about an existing file.
+        download_file(&sftp, &remote, &target_task, true, &cancel_task, &sem, &progress_task).await;
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
@@ -636,11 +661,20 @@ fn local_target(dest: &Path, root: &Path, remote_file: &Path) -> PathBuf {
     out
 }
 
-fn write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write `bytes` to `target`. Without `overwrite` an existing file makes this
+/// fail with `AlreadyExists` rather than truncating it.
+fn write_file(target: &Path, bytes: &[u8], overwrite: bool) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(target, bytes)
+    if overwrite {
+        return std::fs::write(target, bytes);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    std::io::Write::write_all(&mut file, bytes)
 }
 
 /// Max concurrent in-flight SFTP ops while enumerating a delete target.
@@ -1022,6 +1056,25 @@ mod tests {
             local_target(&dest, &root, &PathBuf::from("/photos/trip/sub/b.png")),
             PathBuf::from("/home/me/dl/trip/sub/b.png")
         );
+    }
+
+    #[test]
+    fn write_file_refuses_to_clobber_without_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("sub/a.jpg");
+        // Missing parents are created on the way.
+        write_file(&target, b"remote", false).expect("first write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"remote");
+
+        // The user's own edited copy must survive a re-run of the folder walk.
+        std::fs::write(&target, b"mine").unwrap();
+        let err = write_file(&target, b"remote", false).expect_err("must not clobber");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
+
+        // With overwrite — what the save dialog authorises — it truncates.
+        write_file(&target, b"remote", true).expect("overwrite");
+        assert_eq!(std::fs::read(&target).unwrap(), b"remote");
     }
 
     #[test]
