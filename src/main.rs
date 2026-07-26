@@ -60,6 +60,11 @@ const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_mi
 /// negligible next to image loads.
 const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Minimum gap between watcher-driven re-walks of an open local search. The walk
+/// is synchronous over the whole tree, so honouring every filesystem event would
+/// hit the disk on every frame for as long as a folder is being written into.
+const LOCAL_SEARCH_REWALK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A delete the user has requested but not yet confirmed. Held while the confirm
 /// modal is open; `is_remote` selects the local-fs vs SFTP backend, and `error`
 /// keeps a failed attempt on screen instead of closing the dialog on silence.
@@ -89,6 +94,10 @@ struct TwelfApp {
     search_active: bool,
     search_query: String,
     search_cache: Option<(String, Vec<sidebar::SearchHit>)>,
+    /// A watcher batch changed the local tree, so an open search's results are
+    /// stale. Re-walking is debounced by `LOCAL_SEARCH_REWALK`.
+    search_dirty: bool,
+    last_search_walk: Option<std::time::Instant>,
     remote_search: Option<remote::RemoteSearchWalk>,
     remote_search_changed: Option<(String, std::time::Instant)>,
     zoom: f32,
@@ -141,6 +150,8 @@ impl TwelfApp {
             search_active: false,
             search_query: String::new(),
             search_cache: None,
+            search_dirty: false,
+            last_search_walk: None,
             remote_search: None,
             remote_search_changed: None,
             zoom: 1.0,
@@ -426,7 +437,9 @@ impl eframe::App for TwelfApp {
                         root.reload(dir);
                     }
                 }
-                self.search_cache = None;
+                // Only flag the search stale; re-walking here would run the
+                // whole-tree walk once per frame while the folder churns.
+                self.search_dirty = true;
             }
         }
 
@@ -473,6 +486,19 @@ impl eframe::App for TwelfApp {
                     self.pending_rename = None;
                     self.remote_delete = None;
                     self.remote_rename = None;
+                    // Tear the remote side down as thoroughly as the Ok arm and
+                    // Open Folder do. Keeping `selected_remote` here wedged the
+                    // UI: the image panel gives it precedence over any local
+                    // selection, so clicking a local row did nothing visible,
+                    // while the stale `session_holder` kept the loader serving
+                    // the old host's bytes under a host-less sftp:/// URI.
+                    self.remote_root = None;
+                    self.selected_remote = None;
+                    self.scroll_target = None;
+                    self.last_remote_poll = None;
+                    self.remote_poll_running = Arc::new(AtomicBool::new(false));
+                    *self.session_holder.lock().unwrap() = None;
+                    self.forget_all_images(ctx);
                     ssh::SshState::Failed { error }
                 }
             };
@@ -921,9 +947,25 @@ impl eframe::App for TwelfApp {
                 let searching = self.search_active && !self.search_query.trim().is_empty();
                 if searching && let Some(root) = self.root_node.as_ref() {
                     let query = self.search_query.trim();
-                    if self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query) {
+                    let query_changed =
+                        self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query);
+                    // A watcher batch makes the results stale, but the walk is
+                    // synchronous and whole-tree, so it waits out the debounce.
+                    let refresh_due = self.search_dirty
+                        && self
+                            .last_search_walk
+                            .is_none_or(|t| t.elapsed() >= LOCAL_SEARCH_REWALK);
+                    if query_changed || refresh_due {
                         let hits = sidebar::search_tree(root.path(), query);
                         self.search_cache = Some((query.to_string(), hits));
+                        self.search_dirty = false;
+                        self.last_search_walk = Some(std::time::Instant::now());
+                    } else if self.search_dirty {
+                        let wait = self
+                            .last_search_walk
+                            .map(|t| LOCAL_SEARCH_REWALK.saturating_sub(t.elapsed()))
+                            .unwrap_or_default();
+                        ctx.request_repaint_after(wait);
                     }
                 }
                 scroll().show(ui, |ui| {

@@ -1,18 +1,28 @@
+use crate::backoff::BackOff;
 use eframe::egui;
 use egui::load::{ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::{ColorImage, Context};
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How long a HEIC that failed to decode is left alone before being retried.
+const DECODE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 pub struct HeicLoader {
     cache: Mutex<HashMap<String, Arc<ColorImage>>>,
+    /// Decoding runs synchronously on the UI thread and egui does not memoise a
+    /// loader error, so without this a file libheif cannot read is re-read and
+    /// re-decoded on every single repaint for as long as it stays selected.
+    failed: Mutex<BackOff>,
 }
 
 impl HeicLoader {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            failed: Mutex::new(BackOff::new(DECODE_RETRY_BACKOFF)),
         }
     }
 }
@@ -29,8 +39,17 @@ impl ImageLoader for HeicLoader {
         if let Some(cached) = self.cache.lock().unwrap().get(uri).cloned() {
             return Ok(ImagePoll::Ready { image: cached });
         }
+        if self.failed.lock().unwrap().is_backed_off(uri) {
+            return Err(LoadError::Loading("previous decode failed".to_string()));
+        }
         let path = uri.strip_prefix("file://").unwrap_or(uri);
-        let image = decode_heic(path).map_err(|e| LoadError::Loading(e.to_string()))?;
+        let image = match decode_heic(path) {
+            Ok(image) => image,
+            Err(e) => {
+                self.failed.lock().unwrap().record(uri.to_owned());
+                return Err(LoadError::Loading(e.to_string()));
+            }
+        };
         let arc = Arc::new(image);
         self.cache.lock().unwrap().insert(uri.to_owned(), arc.clone());
         Ok(ImagePoll::Ready { image: arc })
@@ -38,10 +57,12 @@ impl ImageLoader for HeicLoader {
 
     fn forget(&self, uri: &str) {
         self.cache.lock().unwrap().remove(uri);
+        self.failed.lock().unwrap().clear(uri);
     }
 
     fn forget_all(&self) {
         self.cache.lock().unwrap().clear();
+        self.failed.lock().unwrap().clear_all();
     }
 
     fn byte_size(&self) -> usize {
