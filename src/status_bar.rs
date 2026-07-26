@@ -3,7 +3,8 @@ use eframe::egui;
 use std::path::Path;
 
 /// The bottom status bar: the selected node's full path on the left (truncated
-/// when it doesn't fit), the in-flight download's progress on the right.
+/// when it doesn't fit), then any operation result awaiting acknowledgement,
+/// then the in-flight download's progress on the right.
 pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     let host = match &app.ssh {
         ssh::SshState::Connected { info, .. } => info.host.as_str(),
@@ -15,6 +16,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         app.selected_image.as_deref(),
     );
     let mut cancel_download = false;
+    let mut dismiss_message = false;
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             // Download progress hugs the right edge; the path truncates into
@@ -37,6 +39,15 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         ctx.request_repaint();
                     }
                 }
+                // Dismissable so a failure notice can't be missed, and can't
+                // linger past the point the user has taken it in.
+                if let Some(msg) = app.status_message.as_deref() {
+                    if ui.small_button("✕").clicked() {
+                        dismiss_message = true;
+                    }
+                    let color = ui.visuals().error_fg_color;
+                    ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).truncate());
+                }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::Label::new(path_text.unwrap_or_default()).truncate());
                 });
@@ -46,6 +57,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     // Dropping the handle flips its cancel flag, stopping the walk.
     if cancel_download {
         app.remote_download = None;
+    }
+    if dismiss_message {
+        app.status_message = None;
     }
 }
 

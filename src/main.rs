@@ -61,11 +61,13 @@ const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_mi
 const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A delete the user has requested but not yet confirmed. Held while the confirm
-/// modal is open; `is_remote` selects the local-fs vs SFTP backend.
+/// modal is open; `is_remote` selects the local-fs vs SFTP backend, and `error`
+/// keeps a failed attempt on screen instead of closing the dialog on silence.
 struct PendingDelete {
     path: PathBuf,
     is_dir: bool,
     is_remote: bool,
+    error: Option<String>,
 }
 
 /// A rename in progress: the target, the backend, the editable new-name buffer,
@@ -113,6 +115,11 @@ struct TwelfApp {
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
     runtime: tokio::runtime::Runtime,
     cache: Arc<cache::ImageCache>,
+    /// Outcome of the last operation that finished with nothing else to show it
+    /// (a partially-failed delete, a rejected request). Rendered in the status
+    /// bar until the user dismisses it — `log!` is a no-op in release builds, so
+    /// this is the only channel these failures have.
+    status_message: Option<String>,
     image_prefetch: VecDeque<String>,
     animation: Option<webp::Animation>,
     anim_pending: Option<String>,
@@ -157,6 +164,7 @@ impl TwelfApp {
                 .build()
                 .expect("failed to build tokio runtime"),
             cache: Arc::new(cache::ImageCache::new()),
+            status_message: None,
             image_prefetch: VecDeque::new(),
             animation: None,
             anim_pending: None,
@@ -206,35 +214,67 @@ impl TwelfApp {
         }
     }
 
-    /// Carry out a confirmed delete. Local deletes run here synchronously; the
-    /// remote backend is wired in a later subtask.
-    fn execute_delete(&mut self, pd: PendingDelete, ctx: &egui::Context) {
-        if pd.is_remote {
-            if let ssh::SshState::Connected { session, .. } = &self.ssh {
-                self.remote_delete = Some(remote::spawn_remote_delete(
-                    session.clone(),
-                    &self.runtime,
-                    pd.path.clone(),
-                    pd.is_dir,
-                    ctx,
-                ));
+    /// Carry out a confirmed delete. Local deletes run here synchronously; a
+    /// remote delete is spawned and resolved by the update loop. A failure keeps
+    /// its message in `pending_delete` so the dialog stays open, mirroring
+    /// `execute_rename` — the previous silent return left the row on screen with
+    /// no clue why.
+    fn execute_delete(&mut self, ctx: &egui::Context) {
+        let Some(pd) = self.pending_delete.as_ref() else { return };
+        let path = pd.path.clone();
+        let is_dir = pd.is_dir;
+        let is_remote = pd.is_remote;
+
+        if is_remote {
+            // One walk at a time. Assigning over a live handle drops it, and
+            // `RemoteDelete::drop` cancels the walk it owns: since removal is
+            // deepest-first, the abandoned target would be left with its files
+            // gone and its directory skeleton standing, reported to no one.
+            if self.remote_delete.is_some() {
+                self.fail_delete("Another delete is still running");
+                return;
             }
-            self.clear_after_delete(&pd.path, ctx);
+            let session = match &self.ssh {
+                ssh::SshState::Connected { session, .. } => Some(session.clone()),
+                _ => None,
+            };
+            let Some(session) = session else {
+                self.fail_delete("Not connected");
+                return;
+            };
+            self.remote_delete = Some(remote::spawn_remote_delete(
+                session,
+                &self.runtime,
+                path.clone(),
+                is_dir,
+                ctx,
+            ));
+            self.pending_delete = None;
+            self.clear_after_delete(&path, ctx);
             return;
         }
-        let result = if pd.is_dir {
-            std::fs::remove_dir_all(&pd.path)
+        let result = if is_dir {
+            std::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(&pd.path)
+            std::fs::remove_file(&path)
         };
         if let Err(e) = result {
-            crate::log!("failed to delete {}: {e}", pd.path.display());
+            self.fail_delete(&e.to_string());
             return;
         }
         if let Some(root) = self.root_node.as_mut() {
-            root.remove_path(&pd.path);
+            root.remove_path(&path);
         }
-        self.clear_after_delete(&pd.path, ctx);
+        self.pending_delete = None;
+        self.clear_after_delete(&path, ctx);
+    }
+
+    /// Hold the Delete dialog open with `msg` shown in it.
+    fn fail_delete(&mut self, msg: &str) {
+        crate::log!("delete failed: {msg}");
+        if let Some(pd) = self.pending_delete.as_mut() {
+            pd.error = Some(msg.to_string());
+        }
     }
 
     /// After a delete, drop any selection that pointed at (or under) `deleted`
@@ -611,6 +651,9 @@ impl eframe::App for TwelfApp {
                         ui.label(format!("Delete \"{name}\"?"));
                     }
                     ui.label(egui::RichText::new("This cannot be undone.").italics());
+                    if let Some(err) = &pd.error {
+                        ui.colored_label(egui::Color32::RED, err.as_str());
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             cancel_delete = true;
@@ -627,11 +670,8 @@ impl eframe::App for TwelfApp {
         }
         if cancel_delete {
             self.pending_delete = None;
-        }
-        if confirm_delete
-            && let Some(pd) = self.pending_delete.take()
-        {
-            self.execute_delete(pd, ctx);
+        } else if confirm_delete {
+            self.execute_delete(ctx);
         }
 
         // Rename dialog. A right-click Rename in either tree parks its target in
@@ -720,6 +760,9 @@ impl eframe::App for TwelfApp {
         // Set by the remote tree's Refresh context-menu action; consumed after
         // the panel into a reload of that folder's cached listing.
         let mut refresh_request: Option<PathBuf> = None;
+        // Set when a finished remote delete reports failures (name, count);
+        // consumed after the panel into `status_message`.
+        let mut delete_failed: Option<(String, usize)> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -752,7 +795,12 @@ impl eframe::App for TwelfApp {
                             remote_root.reload(parent);
                         }
                         if failed > 0 {
-                            crate::log!("remote delete: {failed} item(s) could not be removed");
+                            // Applied after the panel: `remote_root` holds a
+                            // borrow of self for this whole block.
+                            delete_failed = Some((
+                                target.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                                failed,
+                            ));
                         }
                     }
                 } else if let Some(del) = self.remote_delete.as_ref() {
@@ -908,7 +956,17 @@ impl eframe::App for TwelfApp {
                 ssh::SshState::Connected { session, .. } => Some(session.clone()),
                 _ => None,
             };
-            if let Some(session) = session {
+            // One transfer at a time: the new handle would replace the live one,
+            // and `RemoteDownload::drop` cancels the walk it owns — the first
+            // copy would stop wherever it got to, still reporting success.
+            let busy = self
+                .remote_download
+                .as_ref()
+                .is_some_and(|d| !d.is_finished());
+            if busy {
+                self.status_message =
+                    Some("A download is already running — wait for it or cancel it".to_string());
+            } else if let Some(session) = session {
                 if is_dir {
                     if let Some(dest) = rfd::FileDialog::new().pick_folder() {
                         self.remote_download = Some(remote::spawn_remote_download(
@@ -936,6 +994,12 @@ impl eframe::App for TwelfApp {
                 }
             }
         }
+        // A finished remote delete left entries behind: say so, since the
+        // optimistic UI already cleared the selection and closed the dialog.
+        if let Some((name, failed)) = delete_failed {
+            self.status_message =
+                Some(format!("Delete {name}: {failed} item(s) could not be removed"));
+        }
         // A Refresh action was chosen: drop the folder's cached remote listing
         // so the next render re-lists it (expanded subfolders re-list lazily).
         if let Some(path) = refresh_request
@@ -947,7 +1011,7 @@ impl eframe::App for TwelfApp {
         if let Some((path, is_dir)) = delete_request {
             let is_remote =
                 matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
-            self.pending_delete = Some(PendingDelete { path, is_dir, is_remote });
+            self.pending_delete = Some(PendingDelete { path, is_dir, is_remote, error: None });
         }
         // A Rename action was chosen this frame: open the name-entry dialog.
         if let Some((path, is_dir)) = rename_request {
