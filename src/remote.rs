@@ -223,7 +223,7 @@ pub fn spawn_remote_search(
     let ctx = ctx.clone();
     runtime.spawn(async move {
         let sem = Semaphore::new(REMOTE_SEARCH_CONCURRENCY);
-        let hits = search_remote_dir(&sftp, &root, &query_lc, &cancel_task, &sem, 0).await;
+        let hits = search_remote_dir(&sftp, &root, &query_lc, &cancel_task, &sem, 0, false).await;
         let _ = tx.send(hits);
         ctx.request_repaint();
     });
@@ -231,9 +231,11 @@ pub fn spawn_remote_search(
 }
 
 /// Recursively walk `dir` over SFTP, keeping entries whose name contains
-/// `query_lc` plus the ancestor folders that lead to a match. Empty on a read
-/// error (silent-skip, like the local walk), once `cancel` is set, or past the
-/// depth cap (which bounds a symlink loop without a per-dir round-trip).
+/// `query_lc` plus the ancestor folders that lead to a match; a matched
+/// folder keeps its full contents (`keep_all` below it), mirroring the local
+/// walk. Empty on a read error (silent-skip, like the local walk), once
+/// `cancel` is set, or past the depth cap (which bounds a symlink loop
+/// without a per-dir round-trip).
 async fn search_remote_dir(
     sftp: &SftpSession,
     dir: &Path,
@@ -241,6 +243,7 @@ async fn search_remote_dir(
     cancel: &AtomicBool,
     sem: &Semaphore,
     depth: usize,
+    keep_all: bool,
 ) -> Vec<sidebar::SearchHit> {
     if depth > REMOTE_SEARCH_MAX_DEPTH || cancel.load(Ordering::Relaxed) {
         return Vec::new();
@@ -264,11 +267,21 @@ async fn search_remote_dir(
             let RemoteTreeNode { path, name, kind } = node;
             let matches = name.to_lowercase().contains(query_lc);
             match kind {
-                RemoteNodeKind::File => matches.then(|| sidebar::SearchHit::file(path, name)),
+                RemoteNodeKind::File => {
+                    (matches || keep_all).then(|| sidebar::SearchHit::file(path, name))
+                }
                 RemoteNodeKind::Dir { .. } => {
-                    let children =
-                        search_remote_dir(sftp, &path, query_lc, cancel, sem, depth + 1).await;
-                    sidebar::SearchHit::dir(path, name, matches, children)
+                    let children = search_remote_dir(
+                        sftp,
+                        &path,
+                        query_lc,
+                        cancel,
+                        sem,
+                        depth + 1,
+                        keep_all || matches,
+                    )
+                    .await;
+                    sidebar::SearchHit::dir(path, name, matches, keep_all, children)
                 }
             }
         })

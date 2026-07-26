@@ -24,7 +24,12 @@ pub struct SearchHit {
 
 enum SearchKind {
     File,
-    Dir { children: Vec<SearchHit> },
+    Dir {
+        children: Vec<SearchHit>,
+        /// The folder's own name matched the query — its full contents were
+        /// kept, and it renders expanded-but-collapsible for browsing.
+        matched: bool,
+    },
 }
 
 impl SearchHit {
@@ -32,18 +37,21 @@ impl SearchHit {
         SearchHit { path, name, kind: SearchKind::File }
     }
 
-    /// Build a directory hit, applying the prune rule: a folder is kept only if
-    /// its own name matched or it has at least one kept descendant. Returns
-    /// `None` when it should be dropped. Single-sources the keep/drop rule for
-    /// both the local (`search_dir`) and remote walks.
+    /// Build a directory hit, applying the keep rule: a folder is kept if its
+    /// own name matched, if it lives under a matched ancestor (`keep_all` —
+    /// that ancestor's full contents stay browsable), or if it has at least
+    /// one kept descendant. Returns `None` when it should be dropped.
+    /// Single-sources the rule for both the local (`search_dir`) and remote
+    /// walks.
     pub(crate) fn dir(
         path: PathBuf,
         name: String,
-        matches: bool,
+        matched: bool,
+        keep_all: bool,
         children: Vec<SearchHit>,
     ) -> Option<Self> {
-        if matches || !children.is_empty() {
-            Some(SearchHit { path, name, kind: SearchKind::Dir { children } })
+        if matched || keep_all || !children.is_empty() {
+            Some(SearchHit { path, name, kind: SearchKind::Dir { children, matched } })
         } else {
             None
         }
@@ -161,17 +169,23 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
     nodes
 }
 
-/// Recursively walk the filesystem under `root`, keeping only entries whose name
+/// Recursively walk the filesystem under `root`, keeping entries whose name
 /// contains `query` (case-insensitive) plus the ancestor folders that lead to a
-/// match. Unlike the live `TreeNode`, the result is fully materialized, so it can
-/// never lazy-load an unfiltered directory when rendered.
+/// match. A folder whose own name matches keeps its full contents, so it can be
+/// browsed from the results. Unlike the live `TreeNode`, the result is fully
+/// materialized, so it can never lazy-load an unfiltered directory when rendered.
 pub fn search_tree(root: &Path, query: &str) -> Vec<SearchHit> {
     let query_lc = query.to_lowercase();
     let mut visited = HashSet::new();
-    search_dir(root, &query_lc, &mut visited)
+    search_dir(root, &query_lc, &mut visited, false)
 }
 
-fn search_dir(dir: &Path, query_lc: &str, visited: &mut HashSet<PathBuf>) -> Vec<SearchHit> {
+fn search_dir(
+    dir: &Path,
+    query_lc: &str,
+    visited: &mut HashSet<PathBuf>,
+    keep_all: bool,
+) -> Vec<SearchHit> {
     // Skip a directory already entered, so a symlink pointing back at an ancestor
     // can't make the walk loop forever (`is_dir()` follows symlinks).
     if let Ok(canonical) = dir.canonicalize() {
@@ -196,11 +210,11 @@ fn search_dir(dir: &Path, query_lc: &str, visited: &mut HashSet<PathBuf>) -> Vec
             .unwrap_or_default();
         let matches = name.to_lowercase().contains(query_lc);
         if path.is_dir() {
-            let children = search_dir(&path, query_lc, visited);
-            if let Some(hit) = SearchHit::dir(path, name, matches, children) {
+            let children = search_dir(&path, query_lc, visited, keep_all || matches);
+            if let Some(hit) = SearchHit::dir(path, name, matches, keep_all, children) {
                 hits.push(hit);
             }
-        } else if matches {
+        } else if matches || keep_all {
             hits.push(SearchHit::file(path, name));
         }
     }
@@ -321,12 +335,40 @@ fn render_file_row(
     });
 }
 
-/// Render pruned search results. Every folder is forced open (it only appears
-/// because it or a descendant matched) under a `search:`-prefixed id, so this
-/// transient expansion never touches the live tree's persisted state.
+/// Render pruned search results under `search:`-prefixed ids, so their
+/// expansion never touches the live tree's persisted state. Scaffolding
+/// folders (kept only because a descendant matched) are forced open so the
+/// chain to every match stays visible; a folder whose own name matched carries
+/// its full contents and is user-collapsible (open by default), as is
+/// everything below it.
 pub fn render_search_results(
     ui: &mut egui::Ui,
     hits: &[SearchHit],
+    selected_image: &Option<PathBuf>,
+    scroll_target: &mut Option<PathBuf>,
+    new_selection: &mut Option<PathBuf>,
+    delete_request: &mut Option<(PathBuf, bool)>,
+    rename_request: &mut Option<(PathBuf, bool)>,
+) {
+    render_search_hits(
+        ui,
+        hits,
+        false,
+        selected_image,
+        scroll_target,
+        new_selection,
+        delete_request,
+        rename_request,
+    );
+}
+
+/// `in_matched`: this level lies inside a matched folder's kept-in-full
+/// contents, where folders collapse normally (closed unless themselves
+/// matched) instead of being forced open.
+fn render_search_hits(
+    ui: &mut egui::Ui,
+    hits: &[SearchHit],
+    in_matched: bool,
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
@@ -347,21 +389,26 @@ pub fn render_search_results(
                     rename_request,
                 );
             }
-            SearchKind::Dir { children } => {
-                egui::CollapsingHeader::new(&hit.name)
-                    .id_salt(format!("search:{}", hit.path.display()))
-                    .open(Some(true))
-                    .show(ui, |ui| {
-                        render_search_results(
-                            ui,
-                            children,
-                            selected_image,
-                            scroll_target,
-                            new_selection,
-                            delete_request,
-                            rename_request,
-                        );
-                    });
+            SearchKind::Dir { children, matched } => {
+                let mut header = egui::CollapsingHeader::new(&hit.name)
+                    .id_salt(format!("search:{}", hit.path.display()));
+                if in_matched || *matched {
+                    header = header.default_open(*matched);
+                } else {
+                    header = header.open(Some(true));
+                }
+                header.show(ui, |ui| {
+                    render_search_hits(
+                        ui,
+                        children,
+                        in_matched || *matched,
+                        selected_image,
+                        scroll_target,
+                        new_selection,
+                        delete_request,
+                        rename_request,
+                    );
+                });
             }
         }
     }
@@ -396,7 +443,7 @@ mod tests {
         fn go(hit: &SearchHit, out: &mut Vec<(String, bool)>) {
             match &hit.kind {
                 SearchKind::File => out.push((hit.name.clone(), false)),
-                SearchKind::Dir { children } => {
+                SearchKind::Dir { children, .. } => {
                     out.push((hit.name.clone(), true));
                     for child in children {
                         go(child, out);
@@ -431,31 +478,40 @@ mod tests {
     }
 
     #[test]
-    fn matching_folder_kept_with_empty_children() {
+    fn matching_folder_includes_its_full_contents() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("holiday")).unwrap();
         touch(&root.join("holiday/a.jpg"));
         touch(&root.join("holiday/b.jpg"));
-        // The folder name matches; its children don't, so it is kept with no children.
+        // The folder name matches; its non-matching children are kept so the
+        // folder can be browsed from the results.
         assert_eq!(
             flatten(&search_tree(root, "holiday")),
-            vec![("holiday".to_string(), true)]
+            vec![
+                ("holiday".to_string(), true),
+                ("a.jpg".to_string(), false),
+                ("b.jpg".to_string(), false),
+            ]
         );
     }
 
     #[test]
-    fn matching_folder_keeps_only_matching_child() {
+    fn matching_folder_keeps_whole_subtree() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join("trip")).unwrap();
-        touch(&root.join("trip/trip-photo.jpg"));
+        fs::create_dir_all(root.join("trip/sub")).unwrap();
         touch(&root.join("trip/random.jpg"));
+        touch(&root.join("trip/sub/x.jpg"));
+        // Nothing under `trip` matches by name, yet the whole subtree —
+        // including the empty-of-matches subfolder — stays browsable.
         assert_eq!(
             flatten(&search_tree(root, "trip")),
             vec![
                 ("trip".to_string(), true),
-                ("trip-photo.jpg".to_string(), false),
+                ("random.jpg".to_string(), false),
+                ("sub".to_string(), true),
+                ("x.jpg".to_string(), false),
             ]
         );
     }
@@ -477,17 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn matches_file_name_not_path() {
+    fn matches_single_names_not_the_joined_path() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join("vacation")).unwrap();
-        touch(&root.join("vacation/sunset.jpg"));
-        // Query equals the ancestor folder name; the folder matches, but its
-        // non-matching child is not pulled in via the path.
-        assert_eq!(
-            flatten(&search_tree(root, "vacation")),
-            vec![("vacation".to_string(), true)]
-        );
+        fs::create_dir_all(root.join("ab")).unwrap();
+        touch(&root.join("ab/ba.jpg"));
+        // "abba" spans the folder/file boundary — neither single name contains
+        // it, so nothing matches even though the joined path nearly does.
+        assert!(search_tree(root, "abba").is_empty());
     }
 
     #[test]
@@ -528,17 +581,33 @@ mod tests {
     }
 
     #[test]
-    fn dir_constructor_applies_prune_rule() {
+    fn dir_constructor_applies_keep_rule() {
         let p = || PathBuf::from("/x");
         let child = || SearchHit::file(PathBuf::from("/x/c.jpg"), "c.jpg".to_string());
         // matched folder, no children -> kept
-        assert!(SearchHit::dir(p(), "x".to_string(), true, vec![]).is_some());
-        // unmatched folder, no children -> dropped
-        assert!(SearchHit::dir(p(), "x".to_string(), false, vec![]).is_none());
+        assert!(SearchHit::dir(p(), "x".to_string(), true, false, vec![]).is_some());
+        // unmatched folder, no children, outside any match -> dropped
+        assert!(SearchHit::dir(p(), "x".to_string(), false, false, vec![]).is_none());
         // unmatched folder with a kept child -> kept as scaffolding
-        assert!(SearchHit::dir(p(), "x".to_string(), false, vec![child()]).is_some());
-        // matched folder with a child -> kept
-        assert!(SearchHit::dir(p(), "x".to_string(), true, vec![child()]).is_some());
+        assert!(SearchHit::dir(p(), "x".to_string(), false, false, vec![child()]).is_some());
+        // unmatched, empty, but under a matched ancestor -> kept for browsing
+        assert!(SearchHit::dir(p(), "x".to_string(), false, true, vec![]).is_some());
+    }
+
+    #[test]
+    fn dir_constructor_stores_the_matched_flag() {
+        let matched = SearchHit::dir(PathBuf::from("/x"), "x".to_string(), true, false, vec![])
+            .expect("matched folder is kept");
+        assert!(matches!(matched.kind, SearchKind::Dir { matched: true, .. }));
+        let scaffolding = SearchHit::dir(
+            PathBuf::from("/x"),
+            "x".to_string(),
+            false,
+            true,
+            vec![],
+        )
+        .expect("keep_all folder is kept");
+        assert!(matches!(scaffolding.kind, SearchKind::Dir { matched: false, .. }));
     }
 
     #[test]
