@@ -243,6 +243,7 @@ pub fn render_tree(
 ) {
     match &mut node.kind {
         NodeKind::File => {
+            // The local tree offers no Download — the file is already local.
             render_file_row(
                 ui,
                 &node.path,
@@ -250,6 +251,7 @@ pub fn render_tree(
                 selected_image,
                 scroll_target,
                 new_selection,
+                None,
                 delete_request,
                 rename_request,
             );
@@ -311,6 +313,7 @@ fn render_file_row(
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
 ) {
@@ -324,6 +327,12 @@ fn render_file_row(
         *new_selection = Some(path.to_path_buf());
     }
     response.context_menu(|ui| {
+        if let Some(download_request) = download_request
+            && ui.button("Download").clicked()
+        {
+            *download_request = Some((path.to_path_buf(), false));
+            ui.close();
+        }
         if ui.button("Rename").clicked() {
             *rename_request = Some((path.to_path_buf(), false));
             ui.close();
@@ -340,13 +349,16 @@ fn render_file_row(
 /// folders (kept only because a descendant matched) are forced open so the
 /// chain to every match stays visible; a folder whose own name matched carries
 /// its full contents and is user-collapsible (open by default), as is
-/// everything below it.
+/// everything below it. `download_request` is `Some` only for remote results —
+/// a local file has nothing to download — and adds a Download action to every
+/// file row and folder header.
 pub fn render_search_results(
     ui: &mut egui::Ui,
     hits: &[SearchHit],
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
 ) {
@@ -357,6 +369,7 @@ pub fn render_search_results(
         selected_image,
         scroll_target,
         new_selection,
+        download_request,
         delete_request,
         rename_request,
     );
@@ -372,6 +385,7 @@ fn render_search_hits(
     selected_image: &Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     new_selection: &mut Option<PathBuf>,
+    mut download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
 ) {
@@ -385,6 +399,7 @@ fn render_search_hits(
                     selected_image,
                     scroll_target,
                     new_selection,
+                    download_request.as_deref_mut(),
                     delete_request,
                     rename_request,
                 );
@@ -397,7 +412,7 @@ fn render_search_hits(
                 } else {
                     header = header.open(Some(true));
                 }
-                header.show(ui, |ui| {
+                let resp = header.show(ui, |ui| {
                     render_search_hits(
                         ui,
                         children,
@@ -405,10 +420,19 @@ fn render_search_hits(
                         selected_image,
                         scroll_target,
                         new_selection,
+                        download_request.as_deref_mut(),
                         delete_request,
                         rename_request,
                     );
                 });
+                if let Some(download_request) = download_request.as_deref_mut() {
+                    resp.header_response.context_menu(|ui| {
+                        if ui.button("Download").clicked() {
+                            *download_request = Some((hit.path.clone(), true));
+                            ui.close();
+                        }
+                    });
+                }
             }
         }
     }

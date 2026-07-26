@@ -758,6 +758,7 @@ impl eframe::App for TwelfApp {
                                 &self.selected_remote,
                                 &mut self.scroll_target,
                                 &mut new_remote_selection,
+                                Some(&mut download_request),
                                 &mut delete_request,
                                 &mut rename_request,
                             );
@@ -797,6 +798,7 @@ impl eframe::App for TwelfApp {
                                 &self.selected_image,
                                 &mut self.scroll_target,
                                 &mut new_selection,
+                                None,
                                 &mut delete_request,
                                 &mut rename_request,
                             );
