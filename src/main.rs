@@ -12,6 +12,7 @@ mod remote;
 mod sftp_loader;
 mod sidebar;
 mod ssh;
+mod status_bar;
 mod video;
 mod webp;
 
@@ -438,6 +439,8 @@ impl eframe::App for TwelfApp {
         }
 
         menu_bar::render(self, ctx);
+        // Added before the side panel so the bar spans the full window width.
+        status_bar::render(self, ctx);
 
         let mut connect_clicked = false;
         let mut dialog_open = self.ssh_dialog.open;
@@ -639,41 +642,6 @@ impl eframe::App for TwelfApp {
             };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
                 let mut new_remote_selection: Option<PathBuf> = None;
-                let mut cancel_download = false;
-                if let Some(dl) = self.remote_download.as_mut() {
-                    dl.poll();
-                    let mut text = if dl.is_finished() {
-                        format!(
-                            "Downloaded {} file(s), {} → {}",
-                            dl.files(),
-                            menu_bar::format_bytes(dl.bytes()),
-                            dl.target().display()
-                        )
-                    } else {
-                        let name = dl.target().file_name().unwrap_or_default().to_string_lossy();
-                        format!(
-                            "Downloading {name}: {} file(s), {}…",
-                            dl.files(),
-                            menu_bar::format_bytes(dl.bytes())
-                        )
-                    };
-                    if dl.errors() > 0 {
-                        text.push_str(&format!(" ({} failed)", dl.errors()));
-                    }
-                    let finished = dl.is_finished();
-                    ui.horizontal(|ui| {
-                        ui.label(text);
-                        if !finished && ui.button("Cancel").clicked() {
-                            cancel_download = true;
-                        }
-                    });
-                    if !finished {
-                        ctx.request_repaint();
-                    }
-                }
-                if cancel_download {
-                    self.remote_download = None;
-                }
                 if let Some(del) = self.remote_delete.as_mut() {
                     del.poll();
                 }
