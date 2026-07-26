@@ -1089,21 +1089,28 @@ impl eframe::App for TwelfApp {
             self.pending_delete = Some(PendingDelete { path, is_dir, is_remote, error: None });
         }
         // A Rename action was chosen this frame: open the name-entry dialog.
+        // Refused while one is still in flight — the second dialog could not be
+        // submitted anyway (it renders as "Renaming…"), and replacing the target
+        // is how the completion handler used to pair the wrong pair of paths.
         if let Some((path, is_dir)) = rename_request {
-            let is_remote =
-                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.pending_rename = Some(PendingRename {
-                path,
-                is_dir,
-                is_remote,
-                name,
-                needs_focus: true,
-                error: None,
-            });
+            if self.remote_rename.is_some() {
+                self.status_message = Some("A rename is already running".to_string());
+            } else {
+                let is_remote = matches!(self.ssh, ssh::SshState::Connected { .. })
+                    && self.remote_root.is_some();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.pending_rename = Some(PendingRename {
+                    path,
+                    is_dir,
+                    is_remote,
+                    name,
+                    needs_focus: true,
+                    error: None,
+                });
+            }
         }
         // Resolve an in-flight remote rename: refresh on success, surface the
         // server's error in the still-open dialog on failure.
@@ -1114,19 +1121,18 @@ impl eframe::App for TwelfApp {
             let rr = self.remote_rename.take().expect("just checked finished");
             match rr.result() {
                 Some(Ok(())) => {
+                    // Both paths come from the handle, captured at spawn. Reading
+                    // the new name back out of `pending_rename` meant the dialog
+                    // being closed mid-flight skipped the side effects entirely.
                     let old = rr.target().to_path_buf();
+                    let new = rr.renamed().to_path_buf();
                     if let Some(parent) = old.parent()
                         && let Some(root) = self.remote_root.as_mut()
                     {
                         root.reload(parent);
                     }
-                    if let Some(pr) = self.pending_rename.take() {
-                        let new = old
-                            .parent()
-                            .map(|p| p.join(pr.name.trim()))
-                            .unwrap_or_else(|| old.clone());
-                        self.apply_rename_side_effects(&old, &new, ctx);
-                    }
+                    self.pending_rename = None;
+                    self.apply_rename_side_effects(&old, &new, ctx);
                 }
                 Some(Err(msg)) => {
                     if let Some(pr) = self.pending_rename.as_mut() {

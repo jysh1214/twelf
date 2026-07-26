@@ -114,13 +114,27 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
     let sftp = SftpSession::new(channel.into_stream())
         .await
         .map_err(stringify)?;
+    // Resolve the root on the server (SSH_FXP_REALPATH). The sftp:// URIs are
+    // built by concatenating a path onto "sftp://{host}", which assumes a
+    // leading slash — a relative root like "photos" would splice into the host
+    // ("sftp://nasphotos/a.jpg") and the loader, splitting at the first slash,
+    // would read back "/a.jpg": a different file from the one the tree listed.
+    // Resolving keeps the browsed directory identical while making the URI
+    // well-formed. A server that refuses leaves the entered value as-is.
+    let root = sftp
+        .canonicalize(req.root.clone())
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!("could not resolve root {:?}: {e}", req.root);
+            req.root.clone()
+        });
     Ok((
         Arc::new(sftp),
         ConnInfo {
             host: req.host,
             port: req.port,
             user: req.user,
-            root: req.root,
+            root,
             key_path: req.key_path,
         },
     ))

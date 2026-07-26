@@ -76,6 +76,10 @@ impl ImageCache {
         let blobs_dir = dir.join("blobs");
         fs::create_dir_all(&blobs_dir)
             .map_err(|e| format!("failed to create {}: {e}", blobs_dir.display()))?;
+        // The DB is encrypted but the blobs beside it are the image bytes in the
+        // clear, and create_dir_all leaves 0755 under the usual umask.
+        restrict(dir, 0o700);
+        restrict(&blobs_dir, 0o700);
         let db_path = dir.join("cache.db");
 
         match Self::open_with_key(&db_path, key_hex) {
@@ -212,7 +216,11 @@ impl ImageCache {
         let final_path = blobs_dir.join(&file_name);
         let tmp_path = blobs_dir.join(format!("{file_name}.tmp"));
         let blob_ok = match fs::write(&tmp_path, bytes) {
-            Ok(()) => match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => match {
+                // Owner-only before it is visible under its final name.
+                restrict(&tmp_path, 0o600);
+                fs::rename(&tmp_path, &final_path)
+            } {
                 Ok(()) => true,
                 Err(e) => {
                     crate::log!("failed to finalize {}: {e}", final_path.display());
@@ -297,6 +305,19 @@ impl ImageCache {
         sum_bytes(&inner.conn).map(|n| n.max(0) as u64).unwrap_or(0)
     }
 }
+
+/// Tighten `path` to `mode`. Best-effort: a cache that cannot be locked down is
+/// still a working cache, and the platforms without Unix modes have none to set.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+        crate::log!("failed to restrict {}: {e}", path.display());
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
 
 fn sum_bytes(conn: &Connection) -> Option<i64> {
     conn.query_row(

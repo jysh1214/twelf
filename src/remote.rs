@@ -877,6 +877,10 @@ fn deletion_order(mut entries: Vec<(PathBuf, bool)>) -> Vec<(PathBuf, bool)> {
 /// carries the target path and a channel that fires once with Ok or the error.
 pub struct RemoteRename {
     target: PathBuf,
+    /// The path `target` becomes, captured at spawn. The completion handler must
+    /// use this rather than reading back whatever dialog is open by then — they
+    /// are not necessarily about the same file.
+    renamed: PathBuf,
     rx: std::sync::mpsc::Receiver<Result<(), String>>,
     result: Option<Result<(), String>>,
 }
@@ -904,6 +908,11 @@ impl RemoteRename {
     pub fn target(&self) -> &Path {
         &self.target
     }
+
+    /// The path it becomes, for following the selection once it succeeds.
+    pub fn renamed(&self) -> &Path {
+        &self.renamed
+    }
 }
 
 /// Spawn a single SFTP rename of `old` to `new` on the runtime. The result (Ok or
@@ -924,7 +933,7 @@ pub fn spawn_remote_rename(
         let _ = tx.send(res);
         ctx_task.request_repaint();
     });
-    RemoteRename { target: old, rx, result: None }
+    RemoteRename { target: old, renamed: new, rx, result: None }
 }
 
 /// URIs the Load action prefetches: every image under the loaded children, as
