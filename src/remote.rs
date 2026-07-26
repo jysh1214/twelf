@@ -3,7 +3,7 @@ use eframe::egui;
 use futures::future::join_all;
 use russh_sftp::client::SftpSession;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
@@ -212,6 +212,24 @@ fn merge_children(old: Vec<RemoteTreeNode>, new: Vec<RemoteTreeNode>) -> Vec<Rem
         .collect()
 }
 
+/// Join a server-supplied entry name onto `dir`, rejecting anything that is not
+/// a single ordinary component. `PathBuf::push` normalises nothing: `../../x`
+/// escapes the subtree and an absolute name replaces the path outright, so an
+/// unchecked join lets a hostile or compromised server steer a download's writes
+/// — or a recursive delete's removals — outside the directory being walked.
+/// russh-sftp filters only the exact strings "." and "..", nothing containing a
+/// separator.
+fn child_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(single)) = components.next() else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    Some(dir.join(single))
+}
+
 async fn list_remote_children(
     sftp: &SftpSession,
     path: &Path,
@@ -222,8 +240,10 @@ async fn list_remote_children(
         .filter_map(|entry| {
             let name = entry.file_name();
             let is_dir = entry.metadata().is_dir();
-            let mut child_path = path.to_path_buf();
-            child_path.push(&name);
+            let Some(child_path) = child_path(path, &name) else {
+                crate::log!("skipping entry with unsafe name {name:?} in {}", path.display());
+                return None;
+            };
             if is_dir
                 || sidebar::is_image(&child_path)
                 || crate::video::is_video(&child_path.to_string_lossy())
@@ -525,11 +545,16 @@ async fn download_remote_dir(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let children = entries.map(|entry| {
+    let children = entries.filter_map(|entry| {
         let is_dir = entry.metadata().is_dir();
-        let mut child = dir.to_path_buf();
-        child.push(entry.file_name());
-        Box::pin(async move {
+        // A name that would escape `dir` is counted as a failure, not silently
+        // dropped: the copy is then visibly incomplete rather than quietly so.
+        let Some(child) = child_path(dir, &entry.file_name()) else {
+            crate::log!("refusing entry with unsafe name {:?}", entry.file_name());
+            progress.errors.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        Some(Box::pin(async move {
             if is_dir {
                 download_remote_dir(sftp, root, &child, dest, cancel, sem, progress, depth + 1)
                     .await;
@@ -537,7 +562,7 @@ async fn download_remote_dir(
                 let local = local_target(dest, root, &child);
                 download_file(sftp, &child, &local, cancel, sem, progress).await;
             }
-        })
+        }))
     });
     join_all(children).await;
 }
@@ -730,18 +755,22 @@ async fn collect_remote_paths(
             Err(_) => return Vec::new(),
         }
     };
-    let children = entries.map(|entry| {
+    let children = entries.filter_map(|entry| {
         let is_dir = entry.metadata().is_dir();
-        let mut child = dir.to_path_buf();
-        child.push(entry.file_name());
-        Box::pin(async move {
+        // Skipping leaves the entry in place, so the enclosing remove_dir fails
+        // and the delete is reported as partial rather than reaching outside.
+        let Some(child) = child_path(dir, &entry.file_name()) else {
+            crate::log!("refusing to delete entry with unsafe name {:?}", entry.file_name());
+            return None;
+        };
+        Some(Box::pin(async move {
             let mut out = Vec::new();
             if is_dir {
                 out.extend(collect_remote_paths(sftp, &child, cancel, sem, depth + 1).await);
             }
             out.push((child, is_dir));
             out
-        })
+        }))
     });
     join_all(children).await.into_iter().flatten().collect()
 }
@@ -962,6 +991,23 @@ mod tests {
         ];
         let uris = image_prefetch_uris(&children, "nas");
         assert_eq!(uris, vec!["sftp://nas/photos/a.jpg".to_string()]);
+    }
+
+    #[test]
+    fn child_path_rejects_names_that_escape_the_directory() {
+        let dir = Path::new("/photos/trip");
+        // Ordinary names — including ones with spaces and dots — join normally.
+        assert_eq!(child_path(dir, "a.jpg"), Some(PathBuf::from("/photos/trip/a.jpg")));
+        assert_eq!(child_path(dir, "my photo.jpg"), Some(PathBuf::from("/photos/trip/my photo.jpg")));
+        assert_eq!(child_path(dir, ".hidden"), Some(PathBuf::from("/photos/trip/.hidden")));
+        // Traversal, absolute, and nested names would all escape `dir` via push.
+        assert_eq!(child_path(dir, ".."), None);
+        assert_eq!(child_path(dir, "../../.config/autostart/evil.desktop"), None);
+        assert_eq!(child_path(dir, "/etc/cron.d/evil"), None);
+        assert_eq!(child_path(dir, "sub/a.jpg"), None);
+        // Degenerate names contribute no component at all.
+        assert_eq!(child_path(dir, "."), None);
+        assert_eq!(child_path(dir, ""), None);
     }
 
     #[test]
