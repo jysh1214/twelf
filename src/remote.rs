@@ -2,7 +2,7 @@ use crate::sidebar;
 use eframe::egui;
 use futures::future::join_all;
 use russh_sftp::client::SftpSession;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +28,8 @@ enum RemoteDirChildren {
 }
 
 pub type ListingResult = (PathBuf, Result<Vec<RemoteTreeNode>, String>);
+/// One successfully re-listed directory from a poll cycle (errors are skipped).
+pub type PollResult = (PathBuf, Vec<RemoteTreeNode>);
 
 impl RemoteTreeNode {
     pub fn root(path: PathBuf) -> Self {
@@ -136,6 +138,78 @@ impl RemoteTreeNode {
         }
         false
     }
+
+    fn is_dir(&self) -> bool {
+        matches!(self.kind, RemoteNodeKind::Dir { .. })
+    }
+
+    /// Paths of every directory whose listing is currently `Loaded`, root
+    /// included — the set a poll cycle re-lists. `Unloaded`/`Loading`/`Error`
+    /// folders were never opened (or are in flight) and are skipped.
+    pub fn loaded_dirs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.loaded_dirs_into(&mut out);
+        out
+    }
+
+    fn loaded_dirs_into(&self, out: &mut Vec<PathBuf>) {
+        if let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(children),
+        } = &self.kind
+        {
+            out.push(self.path.clone());
+            for child in children {
+                child.loaded_dirs_into(out);
+            }
+        }
+    }
+
+    /// Merge a freshly polled listing for `target` into the tree without
+    /// disturbing surviving entries: an existing child with the same path and
+    /// dir-ness is kept (preserving its loaded subtree), new entries are
+    /// inserted and vanished ones drop out, all in the new listing's order.
+    /// A no-op unless `target` is currently `Loaded` — an in-flight Refresh
+    /// or expansion owns the node then, and its own result is fresher.
+    pub fn merge_listing(&mut self, target: &Path, new_children: Vec<RemoteTreeNode>) -> bool {
+        if self.path == target {
+            if let RemoteNodeKind::Dir {
+                children: RemoteDirChildren::Loaded(children),
+            } = &mut self.kind
+            {
+                let old = std::mem::take(children);
+                *children = merge_children(old, new_children);
+                return true;
+            }
+            return false;
+        }
+        if !target.starts_with(&self.path) {
+            return false;
+        }
+        if let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &mut self.kind
+        {
+            for child in c {
+                if target.starts_with(&child.path) {
+                    return child.merge_listing(target, new_children);
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Membership and order come from the new listing; a surviving entry keeps its
+/// old node (and so its state) unless its kind flipped between file and dir.
+fn merge_children(old: Vec<RemoteTreeNode>, new: Vec<RemoteTreeNode>) -> Vec<RemoteTreeNode> {
+    let mut old_by_path: HashMap<PathBuf, RemoteTreeNode> =
+        old.into_iter().map(|n| (n.path.clone(), n)).collect();
+    new.into_iter()
+        .map(|n| match old_by_path.remove(&n.path) {
+            Some(o) if o.is_dir() == n.is_dir() => o,
+            _ => n,
+        })
+        .collect()
 }
 
 async fn list_remote_children(
@@ -287,6 +361,45 @@ async fn search_remote_dir(
         })
     });
     join_all(children).await.into_iter().flatten().collect()
+}
+
+/// Max concurrent in-flight read_dirs during a poll cycle — gentler than the
+/// search walk, this is background traffic.
+const REMOTE_POLL_CONCURRENCY: usize = 4;
+
+/// Spawn one poll cycle: re-list every directory in `dirs`, sending each
+/// successful listing (errors are silently skipped — a transient failure must
+/// not disturb the tree) for the UI loop to merge. `running` is flipped false
+/// when the whole cycle is done, gating the next one.
+pub fn spawn_remote_poll(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    dirs: Vec<PathBuf>,
+    tx: Sender<PollResult>,
+    running: Arc<AtomicBool>,
+    ctx: &egui::Context,
+) {
+    let ctx = ctx.clone();
+    runtime.spawn(async move {
+        let sem = Semaphore::new(REMOTE_POLL_CONCURRENCY);
+        let listings = dirs.into_iter().map(|dir| {
+            let sftp = &sftp;
+            let sem = &sem;
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            async move {
+                // No recursion here, so holding the permit across the whole
+                // read_dir round-trip cannot deadlock the pool.
+                let _permit = sem.acquire().await.expect("poll semaphore never closed");
+                if let Ok(nodes) = list_remote_children(sftp, &dir).await {
+                    let _ = tx.send((dir, nodes)).await;
+                    ctx.request_repaint();
+                }
+            }
+        });
+        join_all(listings).await;
+        running.store(false, Ordering::Relaxed);
+    });
 }
 
 /// Live counters for an in-flight download, shared with the walk task.
@@ -875,6 +988,112 @@ mod tests {
             ),
             PathBuf::from("/dl/my trip/a b.jpg")
         );
+    }
+
+    fn node_name(path: &str) -> String {
+        Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    }
+
+    fn rfile(path: &str) -> RemoteTreeNode {
+        RemoteTreeNode::child(PathBuf::from(path), node_name(path), false)
+    }
+
+    fn runloaded(path: &str) -> RemoteTreeNode {
+        RemoteTreeNode::child(PathBuf::from(path), node_name(path), true)
+    }
+
+    fn rloaded(path: &str, children: Vec<RemoteTreeNode>) -> RemoteTreeNode {
+        RemoteTreeNode {
+            path: PathBuf::from(path),
+            name: node_name(path),
+            kind: RemoteNodeKind::Dir {
+                children: RemoteDirChildren::Loaded(children),
+            },
+        }
+    }
+
+    fn loaded_child_paths(node: &RemoteTreeNode) -> Vec<String> {
+        match &node.kind {
+            RemoteNodeKind::Dir {
+                children: RemoteDirChildren::Loaded(c),
+            } => c.iter().map(|n| n.path.display().to_string()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn loaded_dirs_collects_only_loaded_dirs() {
+        let root = rloaded(
+            "/r",
+            vec![
+                rfile("/r/a.jpg"),
+                runloaded("/r/closed"),
+                rloaded("/r/open", vec![rfile("/r/open/b.jpg")]),
+            ],
+        );
+        assert_eq!(
+            root.loaded_dirs(),
+            vec![PathBuf::from("/r"), PathBuf::from("/r/open")]
+        );
+    }
+
+    #[test]
+    fn merge_listing_preserves_surviving_subtrees() {
+        let mut root = rloaded(
+            "/r",
+            vec![
+                rloaded("/r/sub", vec![rfile("/r/sub/x.jpg")]),
+                rfile("/r/old.jpg"),
+            ],
+        );
+        // The poll's fresh nodes are Unloaded; old.jpg vanished, new.jpg appeared.
+        assert!(root.merge_listing(
+            Path::new("/r"),
+            vec![rfile("/r/new.jpg"), runloaded("/r/sub")],
+        ));
+        assert_eq!(loaded_child_paths(&root), vec!["/r/new.jpg", "/r/sub"]);
+        // The surviving folder kept its loaded subtree instead of the fresh
+        // Unloaded node — nothing collapses or re-fetches.
+        let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &root.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(loaded_child_paths(&c[1]), vec!["/r/sub/x.jpg"]);
+    }
+
+    #[test]
+    fn merge_listing_reaches_nested_and_replaces_on_kind_change() {
+        let mut root = rloaded("/r", vec![rloaded("/r/sub", vec![runloaded("/r/sub/x")])]);
+        // Nested target; "/r/sub/x" flipped from dir to file, so the new node wins.
+        assert!(root.merge_listing(Path::new("/r/sub"), vec![rfile("/r/sub/x")]));
+        let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &root.kind
+        else {
+            unreachable!()
+        };
+        let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(sub),
+        } = &c[0].kind
+        else {
+            unreachable!()
+        };
+        assert!(!sub[0].is_dir());
+    }
+
+    #[test]
+    fn merge_listing_noops_unless_loaded() {
+        // An Unloaded folder (never opened, or a Refresh in flight owns it).
+        let mut unloaded = runloaded("/r");
+        assert!(!unloaded.merge_listing(Path::new("/r"), vec![rfile("/r/a.jpg")]));
+        // An absent target under a loaded root.
+        let mut root = rloaded("/r", vec![]);
+        assert!(!root.merge_listing(Path::new("/r/gone"), vec![]));
     }
 
     #[test]

@@ -20,6 +20,7 @@ mod webp;
 use eframe::egui;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result {
@@ -52,6 +53,12 @@ fn main() -> eframe::Result {
 /// How long the remote search query must be stable before launching a walk —
 /// each remote read_dir is a network round-trip, so we don't walk per keystroke.
 const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How often the expanded remote folders are re-listed so external changes
+/// show up without a manual Refresh. SFTP has no change notifications, so
+/// polling is the only automatic option; 30 s keeps the background traffic
+/// negligible next to image loads.
+const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A delete the user has requested but not yet confirmed. Held while the confirm
 /// modal is open; `is_remote` selects the local-fs vs SFTP backend.
@@ -96,6 +103,13 @@ struct TwelfApp {
     remote_rename: Option<remote::RemoteRename>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
+    remote_poll_tx: tokio::sync::mpsc::Sender<remote::PollResult>,
+    remote_poll_rx: tokio::sync::mpsc::Receiver<remote::PollResult>,
+    /// True while a poll cycle's task is still re-listing; the next cycle
+    /// waits for it. Replaced (not just cleared) on reconnect so a stale
+    /// cycle's completion can't unblock polling against the new session.
+    remote_poll_running: Arc<AtomicBool>,
+    last_remote_poll: Option<std::time::Instant>,
     session_holder: Arc<Mutex<Option<Arc<russh_sftp::client::SftpSession>>>>,
     runtime: tokio::runtime::Runtime,
     cache: Arc<cache::ImageCache>,
@@ -108,6 +122,7 @@ struct TwelfApp {
 impl TwelfApp {
     fn new() -> Self {
         let (remote_listings_tx, remote_listings_rx) = tokio::sync::mpsc::channel(64);
+        let (remote_poll_tx, remote_poll_rx) = tokio::sync::mpsc::channel(64);
         Self {
             root_node: None,
             fs_watcher: None,
@@ -132,6 +147,10 @@ impl TwelfApp {
             remote_rename: None,
             remote_listings_tx,
             remote_listings_rx,
+            remote_poll_tx,
+            remote_poll_rx,
+            remote_poll_running: Arc::new(AtomicBool::new(false)),
+            last_remote_poll: None,
             session_holder: Arc::new(Mutex::new(None)),
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -377,6 +396,13 @@ impl eframe::App for TwelfApp {
                     self.pending_rename = None;
                     self.remote_delete = None;
                     self.remote_rename = None;
+                    // Poll state restarts against the new session; drain any
+                    // stale cycle's listings so they can't merge into the new
+                    // tree, and give the (possibly still-running) old cycle
+                    // its own flag to finish with.
+                    self.last_remote_poll = None;
+                    self.remote_poll_running = Arc::new(AtomicBool::new(false));
+                    while self.remote_poll_rx.try_recv().is_ok() {}
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
                     ctx.forget_all_images();
@@ -399,6 +425,57 @@ impl eframe::App for TwelfApp {
                 }
             };
             self.ssh_rx = None;
+        }
+
+        // Periodic remote refresh: merge finished poll listings into the tree
+        // (kept nodes keep their loaded subtrees, so nothing flickers or
+        // collapses), then start the next cycle over the currently expanded
+        // folders once the interval elapsed. A cycle is skipped while the
+        // previous one still runs, while a search walk has the connection
+        // busy, or while a delete/rename is rewriting the tree (a listing
+        // read just before the op could resurrect its target).
+        if let ssh::SshState::Connected { session, .. } = &self.ssh
+            && self.remote_root.is_some()
+        {
+            let quiet = self.remote_delete.is_none() && self.remote_rename.is_none();
+            while let Ok((path, nodes)) = self.remote_poll_rx.try_recv() {
+                if quiet && let Some(root) = self.remote_root.as_mut() {
+                    root.merge_listing(&path, nodes);
+                }
+            }
+            let due = self
+                .last_remote_poll
+                .is_none_or(|t| t.elapsed() >= REMOTE_POLL_INTERVAL);
+            if due {
+                if quiet
+                    && self.remote_search.is_none()
+                    && !self.remote_poll_running.load(Ordering::Relaxed)
+                {
+                    let dirs = self
+                        .remote_root
+                        .as_ref()
+                        .map(|r| r.loaded_dirs())
+                        .unwrap_or_default();
+                    if !dirs.is_empty() {
+                        self.remote_poll_running.store(true, Ordering::Relaxed);
+                        remote::spawn_remote_poll(
+                            session.clone(),
+                            &self.runtime,
+                            dirs,
+                            self.remote_poll_tx.clone(),
+                            self.remote_poll_running.clone(),
+                            ctx,
+                        );
+                    }
+                }
+                self.last_remote_poll = Some(std::time::Instant::now());
+            }
+            // Wake up for the next cycle even when the app sits idle.
+            let remaining = self
+                .last_remote_poll
+                .map(|t| REMOTE_POLL_INTERVAL.saturating_sub(t.elapsed()))
+                .unwrap_or(REMOTE_POLL_INTERVAL);
+            ctx.request_repaint_after(remaining);
         }
 
         self.drain_image_prefetch(ctx);
