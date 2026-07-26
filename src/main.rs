@@ -121,6 +121,9 @@ struct TwelfApp {
     /// this is the only channel these failures have.
     status_message: Option<String>,
     image_prefetch: VecDeque<String>,
+    /// URIs of the most recently displayed images, oldest first. Bounded, and
+    /// anything falling out is forgotten — see `image_panel::retain_displayed`.
+    displayed_uris: VecDeque<String>,
     animation: Option<webp::Animation>,
     anim_pending: Option<String>,
     video: Option<video::VideoPlayer>,
@@ -166,6 +169,7 @@ impl TwelfApp {
             cache: Arc::new(cache::ImageCache::new()),
             status_message: None,
             image_prefetch: VecDeque::new(),
+            displayed_uris: VecDeque::new(),
             animation: None,
             anim_pending: None,
             video: None,
@@ -269,6 +273,14 @@ impl TwelfApp {
         self.clear_after_delete(&path, ctx);
     }
 
+    /// Drop every cached image. Also clears the displayed-URI window, whose
+    /// entries have just been forgotten wholesale — leaving them would waste
+    /// the window on URIs that no longer hold anything.
+    fn forget_all_images(&mut self, ctx: &egui::Context) {
+        self.displayed_uris.clear();
+        ctx.forget_all_images();
+    }
+
     /// Hold the Delete dialog open with `msg` shown in it.
     fn fail_delete(&mut self, msg: &str) {
         crate::log!("delete failed: {msg}");
@@ -290,7 +302,7 @@ impl TwelfApp {
             cleared = true;
         }
         if cleared {
-            ctx.forget_all_images();
+            self.forget_all_images(ctx);
         }
         self.search_active = false;
         self.search_query.clear();
@@ -365,7 +377,7 @@ impl TwelfApp {
             moved = true;
         }
         if moved {
-            ctx.forget_all_images();
+            self.forget_all_images(ctx);
         }
         self.search_active = false;
         self.search_query.clear();
@@ -445,7 +457,7 @@ impl eframe::App for TwelfApp {
                     while self.remote_poll_rx.try_recv().is_ok() {}
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
-                    ctx.forget_all_images();
+                    self.forget_all_images(ctx);
                     ssh::SshState::Connected { session, info }
                 }
                 Err(error) => {

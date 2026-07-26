@@ -1,6 +1,19 @@
 use crate::TwelfApp;
 use eframe::egui;
+use std::collections::VecDeque;
 use std::time::Duration;
+
+/// How many recently-displayed images keep their decoded copy and GPU texture.
+///
+/// egui never evicts these on its own: a raster image occupies a texture bucket
+/// of exactly one entry and `DefaultTextureLoader` only prunes a bucket holding
+/// two or more, while `reduce_texture_memory` (off by default) is what would
+/// drop the `egui_extras` byte and `ColorImage` copies. Without a window, every
+/// image ever shown is retained for the whole session — roughly 100 MB per 12 MP
+/// photo across all three layers, so a few hundred arrow-key presses exhaust RAM
+/// and VRAM. The window is wide enough that stepping back and forth, and the
+/// neighbours `drain_image_prefetch` warms, stay resident.
+const DISPLAYED_WINDOW: usize = 8;
 
 pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     let prev_zoom = app.zoom;
@@ -16,6 +29,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         app.animation = None;
         app.anim_pending = uri.clone();
         app.video = open_video(app);
+        if let Some(uri) = &uri {
+            retain_displayed(app, uri, ctx);
+        }
     }
     // Build the animation once its bytes are available. Remote bytes arrive
     // asynchronously, so keep retrying each frame until the decode resolves to
@@ -162,6 +178,42 @@ fn draw_seek_bar(ui: &mut egui::Ui, player: &mut crate::video::VideoPlayer, dura
     }
 }
 
+/// Record `uri` as the newest displayed image and forget whatever drops out of
+/// the window.
+fn retain_displayed(app: &mut TwelfApp, uri: &str, ctx: &egui::Context) {
+    for evicted in touch_displayed(&mut app.displayed_uris, uri) {
+        for key in forgettable_keys(&evicted) {
+            ctx.forget_image(&key);
+        }
+    }
+}
+
+/// Move `uri` to the newest end of `displayed`, returning the URIs that fall out
+/// of the window. A revisited URI is moved rather than appended again, so
+/// stepping back and forth through a folder cannot evict the whole window.
+fn touch_displayed(displayed: &mut VecDeque<String>, uri: &str) -> Vec<String> {
+    if let Some(pos) = displayed.iter().position(|u| u == uri) {
+        displayed.remove(pos);
+    }
+    displayed.push_back(uri.to_string());
+    let mut evicted = Vec::new();
+    while displayed.len() > DISPLAYED_WINDOW {
+        let Some(old) = displayed.pop_front() else { break };
+        evicted.push(old);
+    }
+    evicted
+}
+
+/// Every cache key one displayed URI can be held under. egui rewrites an
+/// animated-format URI to `uri#<frame>` before handing it to the texture loader
+/// (webp goes down this path even when single-frame), so forgetting the bare URI
+/// alone would leave that texture behind. Frame 0 is the only one the still
+/// path can produce — a real animation is played by `webp::Animation`, which
+/// owns its textures and drops them with the selection.
+fn forgettable_keys(uri: &str) -> [String; 2] {
+    [uri.to_string(), format!("{uri}#0")]
+}
+
 fn selected_uri(app: &TwelfApp) -> Option<String> {
     if let Some(path) = &app.selected_remote {
         let host = match &app.ssh {
@@ -239,4 +291,53 @@ fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
         return None;
     }
     Some(crate::video::VideoPlayer::open(uri, path.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill_window() -> VecDeque<String> {
+        let mut displayed = VecDeque::new();
+        for i in 0..DISPLAYED_WINDOW {
+            assert!(touch_displayed(&mut displayed, &format!("file:///{i}.jpg")).is_empty());
+        }
+        displayed
+    }
+
+    #[test]
+    fn window_holds_its_size_then_evicts_oldest_first() {
+        let mut displayed = fill_window();
+        assert_eq!(
+            touch_displayed(&mut displayed, "file:///new.jpg"),
+            vec!["file:///0.jpg".to_string()]
+        );
+        assert_eq!(displayed.len(), DISPLAYED_WINDOW);
+    }
+
+    #[test]
+    fn revisiting_moves_instead_of_duplicating() {
+        let mut displayed = fill_window();
+        // Stepping back to the oldest evicts nothing and does not grow the window.
+        assert!(touch_displayed(&mut displayed, "file:///0.jpg").is_empty());
+        assert_eq!(displayed.len(), DISPLAYED_WINDOW);
+        // It is now newest, so the next arrival drops what became oldest instead.
+        assert_eq!(
+            touch_displayed(&mut displayed, "file:///new.jpg"),
+            vec!["file:///1.jpg".to_string()]
+        );
+        assert!(displayed.iter().any(|u| u == "file:///0.jpg"));
+    }
+
+    #[test]
+    fn eviction_covers_the_animated_frame_key() {
+        // egui stores a webp texture under "…#0", so the bare URI is not enough.
+        assert_eq!(
+            forgettable_keys("sftp://nas/a.webp"),
+            [
+                "sftp://nas/a.webp".to_string(),
+                "sftp://nas/a.webp#0".to_string()
+            ]
+        );
+    }
 }
