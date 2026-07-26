@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 
@@ -573,12 +574,26 @@ async fn download_remote_dir(
     join_all(children).await;
 }
 
-/// Fetch one remote file and write it to `local`. With `overwrite` false an
-/// existing local file is left alone and counted as skipped: the folder walk
-/// picks its destination with a directory picker, which carries no overwrite
-/// consent, so truncating the user's own copies there is data loss. The
-/// single-file path goes through a save dialog, which does ask. A read or write
-/// failure is counted but does not abort the rest of the walk.
+/// Read size for the streaming copy. Large enough that a big file is not a
+/// round-trip storm, small enough that eight concurrent transfers hold a
+/// negligible amount of memory.
+const DOWNLOAD_CHUNK: usize = 256 * 1024;
+
+/// How one file's transfer ended.
+enum FileOutcome {
+    Written,
+    /// A local copy existed and `overwrite` was not set.
+    Skipped,
+    /// The whole download was cancelled part-way.
+    Cancelled,
+}
+
+/// Fetch one remote file into `local`. With `overwrite` false an existing local
+/// file is left alone and counted as skipped: the folder walk picks its
+/// destination with a directory picker, which carries no overwrite consent, so
+/// truncating the user's own copies there is data loss. The single-file path
+/// goes through a save dialog, which does ask. A read or write failure is
+/// counted but does not abort the rest of the walk.
 async fn download_file(
     sftp: &SftpSession,
     remote_file: &Path,
@@ -591,35 +606,91 @@ async fn download_file(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    // Checked before the transfer, so re-running a folder copy costs nothing
-    // for what is already on disk; `create_new` below still closes the race.
-    if !overwrite && local.exists() {
+    // Checked before the transfer so a re-run costs nothing for what is already
+    // on disk; checked again before the rename, once the bytes are here.
+    if !may_write(local, overwrite) {
         progress.skipped.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let bytes = {
-        let _permit = sem.acquire().await.expect("download semaphore never closed");
-        match sftp.read(remote_file.to_string_lossy().into_owned()).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                progress.errors.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+    // The permit covers the whole transfer: the file is streamed, so it stays
+    // in flight until its last chunk rather than for a single request.
+    let _permit = sem.acquire().await.expect("download semaphore never closed");
+    match stream_to_file(sftp, remote_file, local, overwrite, cancel, progress).await {
+        Ok(FileOutcome::Written) => {
+            progress.files.fetch_add(1, Ordering::Relaxed);
         }
-    };
-    match write_file(local, &bytes, overwrite) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        Ok(FileOutcome::Skipped) => {
             progress.skipped.fetch_add(1, Ordering::Relaxed);
-            return;
         }
+        Ok(FileOutcome::Cancelled) => {}
         Err(_) => {
             progress.errors.fetch_add(1, Ordering::Relaxed);
-            return;
         }
     }
-    progress.files.fetch_add(1, Ordering::Relaxed);
-    progress.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+}
+
+/// Copy `remote_file` to `local` a chunk at a time through a `.part` sibling,
+/// renamed into place only once the whole file has arrived.
+///
+/// Streaming is what keeps a multi-GB video from being materialised in memory:
+/// `SftpSession::read` is open + read_to_end into one `Vec`, and the walk runs
+/// several of those at once. The `.part` staging means an interrupted transfer
+/// leaves nothing a later run could mistake for a complete copy, and `bytes`
+/// advances per chunk instead of only when a whole file lands.
+async fn stream_to_file(
+    sftp: &SftpSession,
+    remote_file: &Path,
+    local: &Path,
+    overwrite: bool,
+    cancel: &AtomicBool,
+    progress: &DownloadProgress,
+) -> std::io::Result<FileOutcome> {
+    if let Some(parent) = local.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut remote = sftp
+        .open(remote_file.to_string_lossy().into_owned())
+        .await
+        .map_err(std::io::Error::other)?;
+    let part = part_path(local);
+    let mut out = tokio::fs::File::create(&part).await?;
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            drop(out);
+            let _ = tokio::fs::remove_file(&part).await;
+            return Ok(FileOutcome::Cancelled);
+        }
+        let read = remote.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buf[..read]).await?;
+        progress.bytes.fetch_add(read as u64, Ordering::Relaxed);
+    }
+    out.flush().await?;
+    drop(out);
+    // Re-checked now the transfer is done: the destination may have appeared
+    // while it ran, and the user's copy still wins.
+    if !may_write(local, overwrite) {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Ok(FileOutcome::Skipped);
+    }
+    tokio::fs::rename(&part, local).await?;
+    Ok(FileOutcome::Written)
+}
+
+/// Whether a transfer may land on `local`. An existing file is the user's own
+/// copy unless they authorised replacing it through a save dialog.
+fn may_write(local: &Path, overwrite: bool) -> bool {
+    overwrite || !local.exists()
+}
+
+/// Staging path a transfer writes to before being renamed into place.
+fn part_path(local: &Path) -> PathBuf {
+    let mut name = local.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
 }
 
 /// Spawn a download of the single remote file `remote` to the exact local path
@@ -661,21 +732,6 @@ fn local_target(dest: &Path, root: &Path, remote_file: &Path) -> PathBuf {
     out
 }
 
-/// Write `bytes` to `target`. Without `overwrite` an existing file makes this
-/// fail with `AlreadyExists` rather than truncating it.
-fn write_file(target: &Path, bytes: &[u8], overwrite: bool) -> std::io::Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if overwrite {
-        return std::fs::write(target, bytes);
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)?;
-    std::io::Write::write_all(&mut file, bytes)
-}
 
 /// Max concurrent in-flight SFTP ops while enumerating a delete target.
 const REMOTE_DELETE_CONCURRENCY: usize = 8;
@@ -1059,22 +1115,26 @@ mod tests {
     }
 
     #[test]
-    fn write_file_refuses_to_clobber_without_overwrite() {
+    fn may_write_protects_an_existing_local_copy() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("sub/a.jpg");
-        // Missing parents are created on the way.
-        write_file(&target, b"remote", false).expect("first write");
-        assert_eq!(std::fs::read(&target).unwrap(), b"remote");
-
-        // The user's own edited copy must survive a re-run of the folder walk.
+        let target = dir.path().join("a.jpg");
+        // Nothing there yet: the transfer proceeds either way.
+        assert!(may_write(&target, false));
+        assert!(may_write(&target, true));
+        // The user's own edited copy survives a re-run of the folder walk…
         std::fs::write(&target, b"mine").unwrap();
-        let err = write_file(&target, b"remote", false).expect_err("must not clobber");
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
+        assert!(!may_write(&target, false));
+        // …but the save dialog's explicit confirmation replaces it.
+        assert!(may_write(&target, true));
+    }
 
-        // With overwrite — what the save dialog authorises — it truncates.
-        write_file(&target, b"remote", true).expect("overwrite");
-        assert_eq!(std::fs::read(&target).unwrap(), b"remote");
+    #[test]
+    fn part_path_stages_beside_the_target() {
+        // A sibling, so the rename into place stays on one filesystem.
+        assert_eq!(
+            part_path(Path::new("/dl/trip/a b.jpg")),
+            PathBuf::from("/dl/trip/a b.jpg.part")
+        );
     }
 
     #[test]
