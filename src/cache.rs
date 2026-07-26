@@ -216,18 +216,18 @@ impl ImageCache {
         let final_path = blobs_dir.join(&file_name);
         let tmp_path = blobs_dir.join(format!("{file_name}.tmp"));
         let blob_ok = match fs::write(&tmp_path, bytes) {
-            Ok(()) => match {
+            Ok(()) => {
                 // Owner-only before it is visible under its final name.
                 restrict(&tmp_path, 0o600);
-                fs::rename(&tmp_path, &final_path)
-            } {
-                Ok(()) => true,
-                Err(e) => {
-                    crate::log!("failed to finalize {}: {e}", final_path.display());
-                    let _ = fs::remove_file(&tmp_path);
-                    false
+                match fs::rename(&tmp_path, &final_path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::log!("failed to finalize {}: {e}", final_path.display());
+                        let _ = fs::remove_file(&tmp_path);
+                        false
+                    }
                 }
-            },
+            }
             Err(e) => {
                 crate::log!("failed to write {}: {e}", tmp_path.display());
                 false
