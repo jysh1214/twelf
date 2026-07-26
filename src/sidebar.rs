@@ -349,9 +349,9 @@ fn render_file_row(
 /// folders (kept only because a descendant matched) are forced open so the
 /// chain to every match stays visible; a folder whose own name matched carries
 /// its full contents and is user-collapsible (open by default), as is
-/// everything below it. `download_request` is `Some` only for remote results —
-/// a local file has nothing to download — and adds a Download action to every
-/// file row and folder header.
+/// everything below it. File rows and folder headers carry Rename/Delete
+/// context actions; `download_request` is `Some` only for remote results — a
+/// local file has nothing to download — and adds a Download action to both.
 pub fn render_search_results(
     ui: &mut egui::Ui,
     hits: &[SearchHit],
@@ -425,14 +425,22 @@ fn render_search_hits(
                         rename_request,
                     );
                 });
-                if let Some(download_request) = download_request.as_deref_mut() {
-                    resp.header_response.context_menu(|ui| {
-                        if ui.button("Download").clicked() {
-                            *download_request = Some((hit.path.clone(), true));
-                            ui.close();
-                        }
-                    });
-                }
+                resp.header_response.context_menu(|ui| {
+                    if let Some(download_request) = download_request.as_deref_mut()
+                        && ui.button("Download").clicked()
+                    {
+                        *download_request = Some((hit.path.clone(), true));
+                        ui.close();
+                    }
+                    if ui.button("Rename").clicked() {
+                        *rename_request = Some((hit.path.clone(), true));
+                        ui.close();
+                    }
+                    if ui.button("Delete").clicked() {
+                        *delete_request = Some((hit.path.clone(), true));
+                        ui.close();
+                    }
+                });
             }
         }
     }
