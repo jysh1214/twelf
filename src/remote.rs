@@ -408,20 +408,20 @@ async fn download_remote_dir(
                 download_remote_dir(sftp, root, &child, dest, cancel, sem, progress, depth + 1)
                     .await;
             } else {
-                download_file(sftp, root, &child, dest, cancel, sem, progress).await;
+                let local = local_target(dest, root, &child);
+                download_file(sftp, &child, &local, cancel, sem, progress).await;
             }
         })
     });
     join_all(children).await;
 }
 
-/// Fetch one remote file and write it under the destination. A read or write
-/// failure is counted but does not abort the rest of the walk.
+/// Fetch one remote file and write it to `local`. A read or write failure is
+/// counted but does not abort the rest of the walk.
 async fn download_file(
     sftp: &SftpSession,
-    root: &Path,
     remote_file: &Path,
-    dest: &Path,
+    local: &Path,
     cancel: &AtomicBool,
     sem: &Semaphore,
     progress: &DownloadProgress,
@@ -439,12 +439,38 @@ async fn download_file(
             }
         }
     };
-    if write_file(&local_target(dest, root, remote_file), &bytes).is_err() {
+    if write_file(local, &bytes).is_err() {
         progress.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     progress.files.fetch_add(1, Ordering::Relaxed);
     progress.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+}
+
+/// Spawn a download of the single remote file `remote` to the exact local path
+/// `target` (chosen in a save dialog; the recursive folder variant is
+/// `spawn_remote_download`). Cancel by dropping the returned handle.
+pub fn spawn_remote_file_download(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    remote: PathBuf,
+    target: PathBuf,
+    ctx: &egui::Context,
+) -> RemoteDownload {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(DownloadProgress::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_task = cancel.clone();
+    let progress_task = progress.clone();
+    let ctx_task = ctx.clone();
+    let target_task = target.clone();
+    runtime.spawn(async move {
+        let sem = Semaphore::new(1);
+        download_file(&sftp, &remote, &target_task, &cancel_task, &sem, &progress_task).await;
+        let _ = tx.send(());
+        ctx_task.request_repaint();
+    });
+    RemoteDownload { target, cancel, progress, rx, finished: false }
 }
 
 /// Local path a remote file lands at: `<dest>/<root name>/<path relative to root>`.
@@ -679,7 +705,7 @@ pub fn render_remote_tree(
     selected_remote: &mut Option<PathBuf>,
     scroll_target: &mut Option<PathBuf>,
     prefetch: &mut VecDeque<String>,
-    download_request: &mut Option<PathBuf>,
+    download_request: &mut Option<(PathBuf, bool)>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
     refresh_request: &mut Option<PathBuf>,
@@ -700,6 +726,10 @@ pub fn render_remote_tree(
                 *selected_remote = Some(node.path.clone());
             }
             response.context_menu(|ui| {
+                if ui.button("Download").clicked() {
+                    *download_request = Some((node.path.clone(), false));
+                    ui.close();
+                }
                 if ui.button("Rename").clicked() {
                     *rename_request = Some((node.path.clone(), false));
                     ui.close();
@@ -777,7 +807,7 @@ pub fn render_remote_tree(
                     ui.close();
                 }
                 if ui.button("Download").clicked() {
-                    *download_request = Some(path.clone());
+                    *download_request = Some((path.clone(), true));
                     ui.close();
                 }
                 if !is_root && ui.button("Rename").clicked() {

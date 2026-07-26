@@ -630,9 +630,10 @@ impl eframe::App for TwelfApp {
             ssh::SshState::Connected { info, .. } => info.host.clone(),
             _ => String::new(),
         };
-        // Set by the remote tree's Download context-menu action, consumed after the
-        // panel so the blocking folder picker runs outside the tree render.
-        let mut download_request: Option<PathBuf> = None;
+        // Set by the remote tree's Download context-menu action (path, is_dir),
+        // consumed after the panel so the blocking picker runs outside the tree
+        // render.
+        let mut download_request: Option<(PathBuf, bool)> = None;
         // Set by a Delete context-menu action in either tree (path, is_dir);
         // consumed after the panel into `pending_delete`.
         let mut delete_request: Option<(PathBuf, bool)> = None;
@@ -818,24 +819,42 @@ impl eframe::App for TwelfApp {
                 }
             }
         });
-        // A folder's Download action was chosen: pick a local destination and spawn
-        // the recursive copy. The picker runs here (not in the tree render) so it
-        // blocks the frame only once, and the still-connected session is reused.
-        if let Some(folder) = download_request {
+        // A Download action was chosen: pick a local destination and spawn the
+        // copy — a recursive walk into a picked folder for a directory, a save
+        // dialog prefilled with the file's name for a single file. The picker
+        // runs here (not in the tree render) so it blocks the frame only once,
+        // and the still-connected session is reused.
+        if let Some((path, is_dir)) = download_request {
             let session = match &self.ssh {
                 ssh::SshState::Connected { session, .. } => Some(session.clone()),
                 _ => None,
             };
-            if let Some(session) = session
-                && let Some(dest) = rfd::FileDialog::new().pick_folder()
-            {
-                self.remote_download = Some(remote::spawn_remote_download(
-                    session,
-                    &self.runtime,
-                    folder,
-                    dest,
-                    ctx,
-                ));
+            if let Some(session) = session {
+                if is_dir {
+                    if let Some(dest) = rfd::FileDialog::new().pick_folder() {
+                        self.remote_download = Some(remote::spawn_remote_download(
+                            session,
+                            &self.runtime,
+                            path,
+                            dest,
+                            ctx,
+                        ));
+                    }
+                } else {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if let Some(target) = rfd::FileDialog::new().set_file_name(name).save_file() {
+                        self.remote_download = Some(remote::spawn_remote_file_download(
+                            session,
+                            &self.runtime,
+                            path,
+                            target,
+                            ctx,
+                        ));
+                    }
+                }
             }
         }
         // A Refresh action was chosen: drop the folder's cached remote listing
