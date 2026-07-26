@@ -65,19 +65,20 @@ impl BytesLoader for SftpBytesLoader {
         let Some(path) = remote_path(uri) else {
             return Err(LoadError::NotSupported);
         };
+        let key = canonical_key(uri);
         {
             let mut state = self.state.lock().unwrap();
-            if let Some(bytes) = state.cache.get(uri) {
+            if let Some(bytes) = state.cache.get(&key) {
                 return Ok(BytesPoll::Ready {
                     size: None,
                     bytes,
                     mime: None,
                 });
             }
-            if state.pending.contains(uri) {
+            if state.pending.contains(&key) {
                 return Ok(BytesPoll::Pending { size: None });
             }
-            if state.failed.is_backed_off(uri) {
+            if state.failed.is_backed_off(&key) {
                 return Err(LoadError::Loading("previous load failed".to_string()));
             }
         }
@@ -86,10 +87,10 @@ impl BytesLoader for SftpBytesLoader {
             return Err(LoadError::Loading("not connected".to_string()));
         };
         let path = path.to_string();
-        self.state.lock().unwrap().pending.insert(uri.to_string());
+        self.state.lock().unwrap().pending.insert(key.clone());
         let state_clone = self.state.clone();
         let disk_clone = self.disk.clone();
-        let uri_owned = uri.to_string();
+        let key_owned = key;
         let ctx_clone = ctx.clone();
         self.handle.spawn(async move {
             // Fingerprint the remote file so a cached blob is reused only when its
@@ -98,28 +99,48 @@ impl BytesLoader for SftpBytesLoader {
             let meta = session.metadata(path.clone()).await.ok();
             let mtime = meta.as_ref().and_then(|m| m.mtime).map(|t| t as i64);
             let size = meta.as_ref().and_then(|m| m.size).map(|s| s as i64);
-            let bytes = match disk_clone.get(&uri_owned, mtime, size) {
+            // The disk cache is synchronous sqlite plus a whole-blob file read
+            // or write. Running it inline parks a tokio worker that also drives
+            // the SSH session, so it goes to the blocking pool — the same reason
+            // `decoded` hands its decode to `spawn_blocking`.
+            let hit = {
+                let disk = disk_clone.clone();
+                let key = key_owned.clone();
+                tokio::task::spawn_blocking(move || disk.get(&key, mtime, size))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let bytes = match hit {
                 Some(vec) => Some(vec),
                 None => match session.read(path).await {
                     Ok(vec) => {
-                        disk_clone.put(&uri_owned, &vec, mtime);
-                        Some(vec)
+                        let disk = disk_clone.clone();
+                        let key = key_owned.clone();
+                        // `vec` is moved in and handed back, so storing it does
+                        // not cost a second copy of the whole file.
+                        tokio::task::spawn_blocking(move || {
+                            disk.put(&key, &vec, mtime);
+                            vec
+                        })
+                        .await
+                        .ok()
                     }
                     Err(e) => {
-                        crate::log!("failed to read {uri_owned}: {e}");
+                        crate::log!("failed to read {key_owned}: {e}");
                         None
                     }
                 },
             };
             let mut state = state_clone.lock().unwrap();
-            state.pending.remove(&uri_owned);
+            state.pending.remove(&key_owned);
             match bytes {
                 Some(vec) => {
-                    state.failed.clear(&uri_owned);
-                    state.cache.put(uri_owned, vec.into());
+                    state.failed.clear(&key_owned);
+                    state.cache.put(key_owned, vec.into());
                 }
                 None => {
-                    state.failed.record(uri_owned);
+                    state.failed.record(key_owned);
                 }
             }
             drop(state);
@@ -129,9 +150,10 @@ impl BytesLoader for SftpBytesLoader {
     }
 
     fn forget(&self, uri: &str) {
+        let key = canonical_key(uri);
         let mut state = self.state.lock().unwrap();
-        state.cache.forget(uri);
-        state.failed.clear(uri);
+        state.cache.forget(&key);
+        state.failed.clear(&key);
     }
 
     fn forget_all(&self) {
@@ -147,6 +169,19 @@ impl BytesLoader for SftpBytesLoader {
     fn has_pending(&self) -> bool {
         !self.state.lock().unwrap().pending.is_empty()
     }
+}
+
+/// The single key one remote file is cached under, in memory and on disk.
+///
+/// egui rewrites an animated-format URI to `uri#<frame>` before asking for it,
+/// and a webp goes down that path even when it holds one frame — so the same
+/// file arrives here as both `…/a.webp` and `…/a.webp#0`. Keying on the raw URI
+/// fetched, transferred and stored it twice; the network read already strips the
+/// fragment, so the cache has to agree with it.
+fn canonical_key(uri: &str) -> String {
+    egui::decode_animated_image_uri(uri)
+        .map_or(uri, |(base, _)| base)
+        .to_string()
 }
 
 /// Recover the remote path from an `sftp://{host}{absolute_path}` URI, dropping
@@ -203,6 +238,32 @@ mod tests {
         loader.state.lock().unwrap().failed.record(uri.to_string());
         loader.forget_all();
         assert!(!loader.state.lock().unwrap().failed.is_backed_off(uri));
+    }
+
+    #[test]
+    fn canonical_key_collapses_the_frame_fragment() {
+        // Both forms egui asks for must land on one cache entry.
+        assert_eq!(canonical_key("sftp://host/a.webp#0"), "sftp://host/a.webp");
+        assert_eq!(canonical_key("sftp://host/a.webp"), "sftp://host/a.webp");
+        // A plain URI is untouched, fragment or not.
+        assert_eq!(canonical_key("sftp://host/a.jpg"), "sftp://host/a.jpg");
+    }
+
+    #[test]
+    fn a_fragmented_uri_hits_the_entry_stored_bare() {
+        let (loader, _rt) = make_loader();
+        loader
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .put("sftp://host/a.webp".to_string(), Bytes::from(vec![1u8, 2, 3]));
+        let ctx = egui::Context::default();
+        // Without the shared key this would miss and fetch the file again.
+        assert!(matches!(
+            loader.load(&ctx, "sftp://host/a.webp#0"),
+            Ok(BytesPoll::Ready { .. })
+        ));
     }
 
     #[test]
