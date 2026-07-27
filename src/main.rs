@@ -113,6 +113,8 @@ struct TwelfApp {
     ssh: ssh::SshState,
     ssh_rx: Option<tokio::sync::mpsc::Receiver<ssh::ConnectResult>>,
     ssh_dialog: ssh::ConnectDialog,
+    /// Saved connections, mirrored to `config.toml` whenever they change.
+    favorites: Vec<config::Favorite>,
     remote_root: Option<remote::RemoteTreeNode>,
     selected_remote: Option<PathBuf>,
     remote_download: Option<remote::RemoteDownload>,
@@ -153,6 +155,9 @@ impl TwelfApp {
     fn new() -> Self {
         let (remote_listings_tx, remote_listings_rx) = tokio::sync::mpsc::channel(64);
         let (remote_poll_tx, remote_poll_rx) = tokio::sync::mpsc::channel(64);
+        // Read once: loading it per field would drop whatever the other fields
+        // hold, which is how a save could lose the favorites.
+        let config = config::load();
         Self {
             root_node: None,
             fs_watcher: None,
@@ -169,7 +174,8 @@ impl TwelfApp {
             last_displayed: None,
             ssh: ssh::SshState::Disconnected,
             ssh_rx: None,
-            ssh_dialog: ssh::ConnectDialog::from_settings(config::load().ssh),
+            ssh_dialog: ssh::ConnectDialog::from_settings(config.ssh),
+            favorites: config.favorites,
             remote_root: None,
             selected_remote: None,
             remote_download: None,
@@ -303,6 +309,27 @@ impl TwelfApp {
         }
         self.pending_delete = None;
         self.clear_after_delete(&path, ctx);
+    }
+
+    /// Persist the whole config. Always writes both halves — writing only the
+    /// one that changed would blank the other.
+    fn save_config(&self) {
+        config::save(&config::Config {
+            ssh: self.ssh_dialog.to_settings(),
+            favorites: self.favorites.clone(),
+        });
+    }
+
+    /// Save `favorite`, reporting in the status bar either way — silently doing
+    /// nothing on a duplicate would read as the action having failed.
+    fn add_favorite(&mut self, favorite: config::Favorite) {
+        let label = favorite.label.clone();
+        if config::add_favorite(&mut self.favorites, favorite) {
+            self.save_config();
+            self.status_message = Some(format!("Saved favorite {label}"));
+        } else {
+            self.status_message = Some(format!("Already saved: {label}"));
+        }
     }
 
     /// Drop every cached image. Also clears the displayed-URI window, whose
@@ -638,6 +665,11 @@ impl eframe::App for TwelfApp {
 
         let mut connect_clicked = false;
         let mut dialog_open = self.ssh_dialog.open;
+        // Chosen in the favorites list, applied after the window closes its
+        // borrow of `self.ssh_dialog` / `self.favorites`.
+        let mut load_favorite: Option<usize> = None;
+        let mut remove_favorite: Option<usize> = None;
+        let mut save_favorite = false;
         egui::Window::new("Connect SSH")
             .open(&mut dialog_open)
             .resizable(false)
@@ -664,12 +696,58 @@ impl eframe::App for TwelfApp {
                 if ui.button("Connect").clicked() {
                     connect_clicked = true;
                 }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Favorites");
+                    if ui.button("Save current").clicked() {
+                        save_favorite = true;
+                    }
+                });
+                if self.favorites.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "None yet — save the fields above, or right-click a remote folder.",
+                        )
+                        .italics()
+                        .weak(),
+                    );
+                }
+                for (i, favorite) in self.favorites.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").clicked() {
+                            remove_favorite = Some(i);
+                        }
+                        // Full width so the whole row is the target, and long
+                        // paths truncate instead of widening the dialog.
+                        if ui
+                            .add(
+                                egui::Button::new(&favorite.label)
+                                    .truncate()
+                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+                            )
+                            .on_hover_text("Load into the fields above")
+                            .clicked()
+                        {
+                            load_favorite = Some(i);
+                        }
+                    });
+                }
             });
         self.ssh_dialog.open = dialog_open;
+        if let Some(i) = remove_favorite
+            && i < self.favorites.len()
+        {
+            self.favorites.remove(i);
+            self.save_config();
+        }
+        if let Some(favorite) = load_favorite.and_then(|i| self.favorites.get(i)).cloned() {
+            self.ssh_dialog.load_favorite(&favorite);
+        }
+        if save_favorite {
+            self.add_favorite(self.ssh_dialog.to_favorite());
+        }
         if connect_clicked {
-            config::save(&config::Config {
-                ssh: self.ssh_dialog.to_settings(),
-            });
+            self.save_config();
             let req = ssh::ConnectRequest {
                 host: self.ssh_dialog.host.clone(),
                 port: self.ssh_dialog.port.parse().unwrap_or(22),
@@ -822,6 +900,9 @@ impl eframe::App for TwelfApp {
         // Set when a finished remote delete reports failures (name, count);
         // consumed after the panel into `status_message`.
         let mut delete_failed: Option<(String, usize)> = None;
+        // Set by the remote tree's Add to Favorites action; consumed after the
+        // panel into the saved-connection list.
+        let mut favorite_request: Option<PathBuf> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -919,6 +1000,7 @@ impl eframe::App for TwelfApp {
                             &mut delete_request,
                             &mut rename_request,
                             &mut refresh_request,
+                            &mut favorite_request,
                             &sftp,
                             &self.remote_listings_tx,
                             &self.runtime,
@@ -1074,6 +1156,22 @@ impl eframe::App for TwelfApp {
         if let Some((name, failed)) = delete_failed {
             self.status_message =
                 Some(format!("Delete {name}: {failed} item(s) could not be removed"));
+        }
+        // An Add to Favorites action was chosen: save the live connection with
+        // that folder as its root, so reconnecting lands straight in it.
+        if let Some(path) = favorite_request
+            && let ssh::SshState::Connected { info, .. } = &self.ssh
+        {
+            let root = path.to_string_lossy().into_owned();
+            let favorite = config::Favorite {
+                label: config::Favorite::derive_label(&info.user, &info.host, &root),
+                host: info.host.clone(),
+                port: info.port.to_string(),
+                user: info.user.clone(),
+                key_path: info.key_path.clone(),
+                root,
+            };
+            self.add_favorite(favorite);
         }
         // A Refresh action was chosen: drop the folder's cached remote listing
         // so the next render re-lists it (expanded subfolders re-list lazily).

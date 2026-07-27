@@ -72,6 +72,27 @@ impl ConnectDialog {
             root: self.root.clone(),
         }
     }
+
+    /// Snapshot the dialog as a saveable favorite, labelled from its own fields.
+    pub fn to_favorite(&self) -> config::Favorite {
+        config::Favorite {
+            label: config::Favorite::derive_label(&self.user, &self.host, &self.root),
+            host: self.host.clone(),
+            port: self.port.clone(),
+            user: self.user.clone(),
+            key_path: self.key_path.clone(),
+            root: self.root.clone(),
+        }
+    }
+
+    /// Fill the dialog from a saved favorite, ready to connect.
+    pub fn load_favorite(&mut self, favorite: &config::Favorite) {
+        self.host = favorite.host.clone();
+        self.port = favorite.port.clone();
+        self.user = favorite.user.clone();
+        self.key_path = favorite.key_path.clone();
+        self.root = favorite.root.clone();
+    }
 }
 
 // MVP shortcut: accept any server key. Tightening to TOFU / known-hosts is deferred.
