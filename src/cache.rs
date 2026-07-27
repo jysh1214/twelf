@@ -455,4 +455,17 @@ mod tests {
         // any size difference invalidates, not only a smaller one.
         assert_eq!(cache.get("sftp://host/a.jpg", Some(100), Some(6)), None);
     }
+
+    #[test]
+    fn a_cache_filled_exactly_to_the_cap_evicts_nothing() {
+        let dir = tempdir().expect("tempdir");
+        let cache = ImageCache::new();
+        cache.initialize_at_with_cap(dir.path(), b"test-key", 16);
+        cache.put("sftp://h/a.jpg", &[0u8; 8], Some(1));
+        cache.put("sftp://h/b.jpg", &[0u8; 8], Some(1));
+        // Sitting exactly on the cap is not being over it.
+        assert!(cache.get("sftp://h/a.jpg", Some(1), Some(8)).is_some());
+        assert!(cache.get("sftp://h/b.jpg", Some(1), Some(8)).is_some());
+        assert_eq!(cache.total_size_bytes(), 16);
+    }
 }

@@ -112,3 +112,19 @@ fn heif_to_image(ctx: &HeifContext) -> Result<ColorImage, libheif_rs::HeifError>
         &pixels,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_heic_accepts_both_extensions_in_any_case() {
+        assert!(is_heic("file:///a/photo.heic"));
+        // .heif is the other half of the format the decoder handles.
+        assert!(is_heic("file:///a/photo.heif"));
+        // Extensions off a filesystem or a server are not reliably lowercase.
+        assert!(is_heic("file:///a/PHOTO.HEIC"));
+        assert!(is_heic("sftp://nas/a/Photo.Heif"));
+        assert!(!is_heic("file:///a/photo.jpg"));
+    }
+}

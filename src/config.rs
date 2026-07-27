@@ -187,4 +187,20 @@ mod tests {
         assert_eq!(parsed.ssh.host, "nas");
         assert!(parsed.favorites.is_empty());
     }
+
+    #[test]
+    fn favorites_differing_in_any_connection_field_are_distinct() {
+        let mut favorites = vec![favorite("nas", "/photos")];
+        // Same folder path, different machine — an entirely different place.
+        assert!(add_favorite(&mut favorites, favorite("backup", "/photos")));
+        // Same machine and folder, different account.
+        let mut other_user = favorite("nas", "/photos");
+        other_user.user = "root".to_string();
+        assert!(add_favorite(&mut favorites, other_user));
+        // Same machine and folder, different port.
+        let mut other_port = favorite("nas", "/photos");
+        other_port.port = "2222".to_string();
+        assert!(add_favorite(&mut favorites, other_port));
+        assert_eq!(favorites.len(), 4);
+    }
 }

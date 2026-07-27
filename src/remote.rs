@@ -1289,4 +1289,34 @@ mod tests {
         // …and the target directory itself is removed last.
         assert_eq!(order.last().unwrap(), Path::new("/trip"));
     }
+
+    #[test]
+    fn apply_listing_fills_the_directory_it_was_requested_for() {
+        // A subfolder the user just expanded, its listing still in flight.
+        let mut root = rloaded("/r", vec![runloaded("/r/sub")]);
+        assert!(root.apply_listing(Path::new("/r/sub"), Ok(vec![rfile("/r/sub/a.jpg")])));
+        // The listing lands one level down; the root keeps its own children.
+        assert_eq!(loaded_child_paths(&root), vec!["/r/sub"]);
+        let RemoteNodeKind::Dir { children: RemoteDirChildren::Loaded(c) } = &root.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(loaded_child_paths(&c[0]), vec!["/r/sub/a.jpg"]);
+    }
+
+    #[test]
+    fn reload_unloads_the_directory_it_was_requested_for() {
+        let mut root = rloaded("/r", vec![rloaded("/r/sub", vec![rfile("/r/sub/a.jpg")])]);
+        assert!(root.reload(Path::new("/r/sub")));
+        // Only the named subfolder is dropped; the root keeps its listing.
+        assert_eq!(loaded_child_paths(&root), vec!["/r/sub"]);
+        let RemoteNodeKind::Dir { children: RemoteDirChildren::Loaded(c) } = &root.kind
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            c[0].kind,
+            RemoteNodeKind::Dir { children: RemoteDirChildren::Unloaded }
+        ));
+    }
 }

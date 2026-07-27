@@ -112,3 +112,16 @@ impl Animation {
         (self.frames.len() - 1, MIN_FRAME_DELAY)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_webp_accepts_uppercase_extensions() {
+        assert!(is_webp("file:///a/anim.webp"));
+        assert!(is_webp("sftp://nas/a/ANIM.WEBP"));
+        assert!(is_webp("file:///a/Anim.WebP"));
+        assert!(!is_webp("file:///a/anim.gif"));
+    }
+}
