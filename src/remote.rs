@@ -974,7 +974,7 @@ pub fn render_remote_tree(
             let is_selected = selected_remote.as_deref() == Some(node.path.as_path());
             let response = ui.selectable_label(is_selected, &node.name);
             if scroll_target.as_deref() == Some(node.path.as_path()) {
-                response.scroll_to_me(Some(egui::Align::Center));
+                sidebar::scroll_row_into_view(ui, &response);
                 *scroll_target = None;
             }
             if response.clicked() {

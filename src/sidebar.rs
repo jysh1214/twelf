@@ -306,6 +306,19 @@ pub fn render_tree(
     }
 }
 
+/// Center `response`'s row vertically without moving the tree sideways. The
+/// sidebar's `ScrollArea` scrolls both axes and `Response::scroll_to_me`
+/// targets both, so centering a long-named row used to drag the whole tree
+/// horizontally. With a centered alignment the horizontal correction is the
+/// distance between the target's center and the viewport's center, so
+/// substituting the viewport's own x-range makes it exactly zero.
+pub fn scroll_row_into_view(ui: &egui::Ui, response: &egui::Response) {
+    let mut rect = response.rect;
+    rect.min.x = ui.clip_rect().min.x;
+    rect.max.x = ui.clip_rect().max.x;
+    ui.scroll_to_rect(rect, Some(egui::Align::Center));
+}
+
 fn render_file_row(
     ui: &mut egui::Ui,
     path: &Path,
@@ -320,7 +333,7 @@ fn render_file_row(
     let is_selected = selected_image.as_deref() == Some(path);
     let response = ui.selectable_label(is_selected, name);
     if scroll_target.as_deref() == Some(path) {
-        response.scroll_to_me(Some(egui::Align::Center));
+        scroll_row_into_view(ui, &response);
         *scroll_target = None;
     }
     if response.clicked() {
@@ -733,6 +746,42 @@ mod tests {
             flatten(&search_tree(root, "PHOTO")),
             vec![("photo.jpg".to_string(), false)]
         );
+    }
+
+    /// Drive a headless two-axis ScrollArea for a few frames: centering a row
+    /// far wider than the viewport must scroll vertically only.
+    #[test]
+    fn scroll_row_into_view_never_scrolls_horizontally() {
+        let ctx = egui::Context::default();
+        let mut offset = egui::Vec2::ZERO;
+        for frame in 0..10 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(120.0, 100.0),
+                )),
+                // Jump a second per frame so the scroll animation finishes.
+                time: Some(frame as f64),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let out = egui::ScrollArea::both().show(ui, |ui| {
+                        for i in 0..50 {
+                            let name = format!("{i}-long-name-{}.jpg", "x".repeat(120));
+                            let response = ui.selectable_label(false, name);
+                            if i == 40 && frame == 0 {
+                                scroll_row_into_view(ui, &response);
+                            }
+                        }
+                    });
+                    offset = out.state.offset;
+                });
+            });
+        }
+        assert!(offset.x.abs() < 0.5, "tree shifted horizontally: {offset:?}");
+        assert!(offset.y > 0.0, "row 40 is off-screen, so it must scroll vertically");
     }
 
     #[test]
