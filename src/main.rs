@@ -421,17 +421,25 @@ impl TwelfApp {
     }
 
     /// After a successful rename `old`→`new`: follow the selection to the new
-    /// path (including a selected descendant of a renamed folder) and close the
-    /// search so a stale row can't linger.
+    /// path (including a selected descendant of a renamed folder), scroll the
+    /// tree to it, and close the search so a stale row can't linger.
     fn apply_rename_side_effects(&mut self, old: &Path, new: &Path, ctx: &egui::Context) {
         let img = self.selected_image.as_deref().and_then(|s| rebase_path(s, old, new));
         let rem = self.selected_remote.as_deref().and_then(|s| rebase_path(s, old, new));
+        // Following the path alone still loses the row from view: the new name
+        // may sort somewhere off-screen, a renamed folder gets a fresh
+        // collapsing-state id and renders collapsed over the selection, and a
+        // rename from search results closes into a tree whose ancestors were
+        // never expanded. The scroll target force-opens the chain and centers
+        // the row, so the selection visibly survives the rename.
         let mut moved = false;
         if let Some(p) = img {
+            self.scroll_target = Some(p.clone());
             self.selected_image = Some(p);
             moved = true;
         }
         if let Some(p) = rem {
+            self.scroll_target = Some(p.clone());
             self.selected_remote = Some(p);
             moved = true;
         }
@@ -466,6 +474,20 @@ fn rebase_path(selected: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     selected.strip_prefix(old).ok().map(|rest| new.join(rest))
 }
 
+/// Chase `selected` through a batch of external rename pairs in event order:
+/// a selection under a renamed folder follows the folder, and a file renamed
+/// twice in one batch lands on its final name. `None` when no pair touched it.
+fn follow_renames(selected: Option<&Path>, renames: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    let selected = selected?;
+    let mut followed: Option<PathBuf> = None;
+    for (old, new) in renames {
+        if let Some(p) = rebase_path(followed.as_deref().unwrap_or(selected), old, new) {
+            followed = Some(p);
+        }
+    }
+    followed
+}
+
 impl eframe::App for TwelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok((path, result)) = self.remote_listings_rx.try_recv() {
@@ -477,17 +499,31 @@ impl eframe::App for TwelfApp {
         // Apply external filesystem changes under the local root: re-list each
         // touched directory and drop stale search results so the tree (and an
         // open search) reflect the disk immediately.
-        if let Some(fs_watcher) = &self.fs_watcher {
-            let dirs = fs_watcher.changed_dirs();
-            if !dirs.is_empty() {
+        let changes = self.fs_watcher.as_ref().map(|w| w.drain_changes());
+        if let Some(changes) = changes {
+            if !changes.dirs.is_empty() {
                 if let Some(root) = self.root_node.as_mut() {
-                    for dir in &dirs {
+                    for dir in &changes.dirs {
                         root.reload(dir);
                     }
                 }
                 // Only flag the search stale; re-walking here would run the
                 // whole-tree walk once per frame while the folder churns.
                 self.search_dirty = true;
+            }
+            // A rename outside the app moved the selected file (or a folder
+            // above it): follow it, like an in-app rename does. The scroll is
+            // set only while the local tree is the one on screen — with the
+            // remote tree or search results showing, the target would dangle
+            // unconsumed and force-open folders toward a row that isn't there.
+            if let Some(p) = follow_renames(self.selected_image.as_deref(), &changes.renames) {
+                let remote_shown = matches!(self.ssh, ssh::SshState::Connected { .. })
+                    && self.remote_root.is_some();
+                if !remote_shown && !self.search_active {
+                    self.scroll_target = Some(p.clone());
+                }
+                self.selected_image = Some(p);
+                self.forget_all_images(ctx);
             }
         }
 
@@ -1276,5 +1312,75 @@ mod tests {
             rebase_path(Path::new("/a/other.jpg"), Path::new("/a/b"), Path::new("/a/c")),
             None
         );
+    }
+
+    #[test]
+    fn follow_renames_chases_file_folder_and_chained_pairs() {
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        // The renamed file itself.
+        assert_eq!(
+            follow_renames(Some(Path::new("/r/a.jpg")), &[pair("/r/a.jpg", "/r/b.jpg")]),
+            Some(PathBuf::from("/r/b.jpg"))
+        );
+        // A selection inside a renamed folder.
+        assert_eq!(
+            follow_renames(Some(Path::new("/r/d/a.jpg")), &[pair("/r/d", "/r/e")]),
+            Some(PathBuf::from("/r/e/a.jpg"))
+        );
+        // Two pairs in one drained batch chain onto the final name.
+        assert_eq!(
+            follow_renames(
+                Some(Path::new("/r/a.jpg")),
+                &[pair("/r/a.jpg", "/r/b.jpg"), pair("/r/b.jpg", "/r/c.jpg")]
+            ),
+            Some(PathBuf::from("/r/c.jpg"))
+        );
+    }
+
+    #[test]
+    fn follow_renames_ignores_unrelated_pairs_and_no_selection() {
+        let pairs = [(PathBuf::from("/r/a.jpg"), PathBuf::from("/r/b.jpg"))];
+        assert_eq!(follow_renames(Some(Path::new("/r/keep.jpg")), &pairs), None);
+        assert_eq!(follow_renames(None, &pairs), None);
+    }
+
+    #[test]
+    fn rename_side_effects_follow_and_scroll_to_the_selection() {
+        let mut app = TwelfApp::new();
+        let ctx = egui::Context::default();
+        app.selected_image = Some(PathBuf::from("/r/old.jpg"));
+        app.search_active = true;
+        app.apply_rename_side_effects(Path::new("/r/old.jpg"), Path::new("/r/new.jpg"), &ctx);
+        assert_eq!(app.selected_image.as_deref(), Some(Path::new("/r/new.jpg")));
+        // The tree must also walk open and scroll to the followed selection —
+        // the new name may sort off-screen, and a rename from search results
+        // closes into a tree whose ancestors were never expanded.
+        assert_eq!(app.scroll_target.as_deref(), Some(Path::new("/r/new.jpg")));
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn rename_side_effects_follow_a_remote_selection_too() {
+        let mut app = TwelfApp::new();
+        let ctx = egui::Context::default();
+        app.selected_remote = Some(PathBuf::from("/srv/pics/old.jpg"));
+        app.apply_rename_side_effects(
+            Path::new("/srv/pics/old.jpg"),
+            Path::new("/srv/pics/new.jpg"),
+            &ctx,
+        );
+        assert_eq!(app.selected_remote.as_deref(), Some(Path::new("/srv/pics/new.jpg")));
+        assert_eq!(app.scroll_target.as_deref(), Some(Path::new("/srv/pics/new.jpg")));
+    }
+
+    #[test]
+    fn rename_side_effects_leave_an_unrelated_selection_alone() {
+        let mut app = TwelfApp::new();
+        let ctx = egui::Context::default();
+        app.selected_image = Some(PathBuf::from("/r/keep.jpg"));
+        app.apply_rename_side_effects(Path::new("/r/a.jpg"), Path::new("/r/b.jpg"), &ctx);
+        assert_eq!(app.selected_image.as_deref(), Some(Path::new("/r/keep.jpg")));
+        // No scroll either — nothing moved, so the tree must not jump.
+        assert_eq!(app.scroll_target, None);
     }
 }
