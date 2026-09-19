@@ -885,6 +885,35 @@ impl TwelfApp {
         }
     }
 
+    /// Let go of whatever local file `gone` says no longer exists: deleted from
+    /// outside the app, or moved to the trash. The selection is dropped — the
+    /// panel used to go on showing the deleted picture from its cache, with no
+    /// row in the tree to go with it — and a Rename or Delete dialog about it is
+    /// closed, since there is nothing left for it to act on.
+    fn local_files_gone(&mut self, gone: impl Fn(&Path) -> bool, ctx: &egui::Context) {
+        if let Some(path) = self.selected_image.clone()
+            && gone(&path)
+        {
+            image_panel::forget_local_image(ctx, &path);
+            self.selected_image = None;
+            self.local_scroll_target = None;
+        }
+        if self
+            .pending_delete
+            .as_ref()
+            .is_some_and(|p| !p.is_remote && gone(&p.path))
+        {
+            self.pending_delete = None;
+        }
+        if self
+            .pending_rename
+            .as_ref()
+            .is_some_and(|p| !p.is_remote && gone(&p.path))
+        {
+            self.pending_rename = None;
+        }
+    }
+
     /// Point an open Rename or Delete dialog at where its target is now. Each
     /// holds the path it was opened on; when that file — or a folder above it —
     /// was renamed meanwhile, confirming failed with a bare "No such file or
@@ -980,6 +1009,31 @@ enum Followed {
     /// there with different contents: an editor's atomic save, or a
     /// backup-then-replace that first moved the old file aside.
     Replaced,
+    /// It was moved into a trash folder. To the user that is a delete, and a
+    /// file manager does it with a rename: on a mounted drive, or with the home
+    /// directory as the root, the trash is inside the watched tree, and the
+    /// selection used to follow the file in — folders forced open down to
+    /// `.Trash-1000/files`, the "deleted" photo still on screen.
+    Trashed,
+}
+
+/// Whether `path` lies in a trash folder: the freedesktop ones a file manager
+/// uses (`.Trash-<uid>` or `.Trash/<uid>` at the top of a mounted drive,
+/// `~/.local/share/Trash`), or macOS's `.Trashes`.
+fn is_in_trash(path: &Path) -> bool {
+    let mut previous: Option<&std::ffi::OsStr> = None;
+    for component in path.components() {
+        let name = component.as_os_str();
+        let text = name.to_string_lossy();
+        if text == ".Trash" || text == ".Trashes" || text.starts_with(".Trash-") {
+            return true;
+        }
+        if text == "Trash" && previous.is_some_and(|p| p == "share") {
+            return true;
+        }
+        previous = Some(name);
+    }
+    false
 }
 
 /// Chase `selected` through a batch of external rename pairs in event order:
@@ -1007,10 +1061,16 @@ fn follow_renames(selected: Option<&Path>, renames: &[(PathBuf, PathBuf)]) -> Op
         }
     }
     if replaced {
-        Some(Followed::Replaced)
-    } else {
-        followed.map(Followed::Moved)
+        return Some(Followed::Replaced);
     }
+    followed.map(|now| {
+        // Something selected inside the trash may be moved about in there.
+        if is_in_trash(&now) && !is_in_trash(selected) {
+            Followed::Trashed
+        } else {
+            Followed::Moved(now)
+        }
+    })
 }
 
 impl eframe::App for TwelfApp {
@@ -1060,11 +1120,19 @@ impl eframe::App for TwelfApp {
             // Only the affected file's cache entries are dropped. Forgetting every
             // image also threw away whatever the remote tree had loaded, when
             // that was the one on screen.
+            // What was deleted outright, plus what a file manager "deleted" by
+            // renaming it into a trash folder.
+            let gone = |path: &Path| {
+                follow_renames(Some(path), &changes.renames) == Some(Followed::Trashed)
+                    || (changes.removed.iter().any(|r| path.starts_with(r)) && !path.exists())
+            };
+            self.local_files_gone(gone, ctx);
             self.rebase_pending_dialogs(false, |path| {
                 match follow_renames(Some(path), &changes.renames) {
                     Some(Followed::Moved(now)) => Some(now),
                     // Renamed onto: the name the dialog is about is still there.
-                    Some(Followed::Replaced) | None => None,
+                    // Trashed: `local_files_gone` has closed the dialog already.
+                    Some(Followed::Replaced | Followed::Trashed) | None => None,
                 }
             });
             let followed = follow_renames(self.selected_image.as_deref(), &changes.renames);
@@ -1084,7 +1152,8 @@ impl eframe::App for TwelfApp {
                 Some(Followed::Replaced) if self.selected_remote.is_none() => {
                     self.last_displayed = None;
                 }
-                Some(Followed::Replaced) | None => {}
+                // Trashed: `local_files_gone` has dropped the selection already.
+                Some(Followed::Replaced | Followed::Trashed) | None => {}
             }
         }
 
@@ -1896,6 +1965,90 @@ mod tests {
             ),
             Some(Followed::Moved(PathBuf::from("/r/b.jpg")))
         );
+    }
+
+    #[test]
+    fn a_move_to_the_trash_is_a_delete_not_a_rename_to_follow() {
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        // A mounted drive's own trash, which sits inside the watched root.
+        assert_eq!(
+            follow_renames(
+                Some(Path::new("/mnt/photos/a.jpg")),
+                &[pair(
+                    "/mnt/photos/a.jpg",
+                    "/mnt/photos/.Trash-1000/files/a.jpg"
+                )]
+            ),
+            Some(Followed::Trashed)
+        );
+        // The home trash, with the home directory as the root.
+        assert_eq!(
+            follow_renames(
+                Some(Path::new("/home/alex/pics/a.jpg")),
+                &[pair(
+                    "/home/alex/pics/a.jpg",
+                    "/home/alex/.local/share/Trash/files/a.jpg"
+                )]
+            ),
+            Some(Followed::Trashed)
+        );
+        // A whole folder trashed takes the selection inside it along.
+        assert_eq!(
+            follow_renames(
+                Some(Path::new("/mnt/photos/d/a.jpg")),
+                &[pair("/mnt/photos/d", "/mnt/photos/.Trash-1000/files/d")]
+            ),
+            Some(Followed::Trashed)
+        );
+        // Browsing the trash itself: moving things about in there is a move.
+        assert_eq!(
+            follow_renames(
+                Some(Path::new("/mnt/photos/.Trash-1000/files/a.jpg")),
+                &[pair(
+                    "/mnt/photos/.Trash-1000/files/a.jpg",
+                    "/mnt/photos/.Trash-1000/files/b.jpg"
+                )]
+            ),
+            Some(Followed::Moved(PathBuf::from(
+                "/mnt/photos/.Trash-1000/files/b.jpg"
+            )))
+        );
+        // A folder that merely has "Trash" in its name is an ordinary folder.
+        assert!(!is_in_trash(Path::new("/r/Trash/a.jpg")));
+        assert!(!is_in_trash(Path::new("/r/TrashCan/.Trashy/a.jpg")));
+    }
+
+    #[test]
+    fn a_file_that_is_gone_is_let_go_of() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::for_test();
+        app.selected_image = Some(PathBuf::from("/r/d/a.jpg"));
+        app.local_scroll_target = Some(PathBuf::from("/r/d/a.jpg"));
+        app.pending_delete = Some(PendingDelete {
+            path: PathBuf::from("/r/d/a.jpg"),
+            is_dir: false,
+            is_remote: false,
+            error: None,
+        });
+        // A remote dialog about the same path is about another machine's file.
+        app.pending_rename = Some(PendingRename {
+            path: PathBuf::from("/r/d/a.jpg"),
+            is_dir: false,
+            is_remote: true,
+            name: "b.jpg".to_string(),
+            needs_focus: false,
+            error: None,
+        });
+
+        // Something else went; nothing here changes.
+        app.local_files_gone(|path| path == Path::new("/r/other.jpg"), &ctx);
+        assert!(app.selected_image.is_some() && app.pending_delete.is_some());
+
+        app.local_files_gone(|path| path.starts_with("/r/d"), &ctx);
+        assert_eq!(app.selected_image, None);
+        assert_eq!(app.local_scroll_target, None);
+        assert!(app.pending_delete.is_none());
+        assert!(app.pending_rename.is_some());
     }
 
     #[test]

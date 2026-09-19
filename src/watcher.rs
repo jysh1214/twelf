@@ -59,6 +59,7 @@ fn collect_changes(results: impl Iterator<Item = notify::Result<notify::Event>>)
                 collect_reload_dirs(&event, &mut changes.dirs);
                 collect_rename_pair(&event, &mut changes.renames);
                 collect_rewritten(&event, &mut changes.rewritten);
+                collect_removed(&event, &mut changes.removed);
             }
             Err(e) => changes.error = Some(e.to_string()),
         }
@@ -78,6 +79,9 @@ pub struct Changes {
     /// changes, so nothing above notices — but whatever is cached for them is
     /// now a picture of the old contents.
     pub rewritten: Vec<PathBuf>,
+    /// Files and folders that were deleted. A save that deletes and recreates
+    /// its file shows up here too, so whoever acts on this checks the disk.
+    pub removed: Vec<PathBuf>,
     /// Events were lost, so `dirs` and `renames` are not the whole story: the
     /// tree has to be checked against the disk everywhere it is loaded.
     pub rescan: bool,
@@ -105,6 +109,18 @@ fn collect_reload_dirs(event: &notify::Event, out: &mut Vec<PathBuf>) {
             if !out.iter().any(|d| d == parent) {
                 out.push(parent.to_path_buf());
             }
+        }
+    }
+}
+
+/// Push every path a remove event names.
+fn collect_removed(event: &notify::Event, out: &mut Vec<PathBuf>) {
+    if !matches!(event.kind, notify::EventKind::Remove(_)) {
+        return;
+    }
+    for path in &event.paths {
+        if !out.contains(path) {
+            out.push(path.clone());
         }
     }
 }
@@ -226,6 +242,23 @@ mod tests {
                 .rewritten
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn removals_are_reported_by_path() {
+        let results = vec![
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(PathBuf::from("/r/a.jpg"))),
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::Folder))
+                .add_path(PathBuf::from("/r/old"))),
+        ];
+        let changes = collect_changes(results.into_iter());
+        assert_eq!(
+            changes.removed,
+            vec![PathBuf::from("/r/a.jpg"), PathBuf::from("/r/old")]
+        );
+        // Their listings need re-reading as well.
+        assert_eq!(changes.dirs, vec![PathBuf::from("/r")]);
     }
 
     #[test]
