@@ -146,7 +146,7 @@ struct TwelfApp {
     /// (a partially-failed delete, a rejected request). Rendered in the status
     /// bar until the user dismisses it — `log!` is a no-op in release builds, so
     /// this is the only channel these failures have.
-    status_message: Option<String>,
+    status_message: Option<status_bar::Message>,
     /// The config file exists but could not be loaded. The next save renames it
     /// to `config.toml.bad` instead of writing the defaults over it.
     config_unusable: bool,
@@ -170,10 +170,10 @@ impl TwelfApp {
         // hold, which is how a save could lose the favorites.
         let config::Loaded { config, problem } = config::load();
         let status_message = problem.as_ref().map(|problem| {
-            format!(
+            status_bar::Message::error(format!(
                 "config.toml was not loaded ({problem}); using defaults. \
                  It will be kept as config.toml.bad"
-            )
+            ))
         });
         Self {
             root_node: None,
@@ -384,9 +384,9 @@ impl TwelfApp {
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy();
-                self.status_message = Some(format!(
+                self.status_message = Some(status_bar::Message::error(format!(
                     "Delete {name}: {failed} item(s) could not be removed"
-                ));
+                )));
             }
         }
     }
@@ -405,7 +405,9 @@ impl TwelfApp {
                 true
             }
             Err(e) => {
-                self.status_message = Some(format!("Settings not saved: {e}"));
+                self.status_message = Some(status_bar::Message::error(format!(
+                    "Settings not saved: {e}"
+                )));
                 false
             }
         }
@@ -416,9 +418,11 @@ impl TwelfApp {
     fn add_favorite(&mut self, favorite: config::Favorite) {
         let label = favorite.label.clone();
         if !config::add_favorite(&mut self.favorites, favorite) {
-            self.status_message = Some(format!("Already saved: {label}"));
+            self.status_message =
+                Some(status_bar::Message::info(format!("Already saved: {label}")));
         } else if self.save_config() {
-            self.status_message = Some(format!("Saved favorite {label}"));
+            self.status_message =
+                Some(status_bar::Message::info(format!("Saved favorite {label}")));
         }
     }
 
@@ -1279,8 +1283,9 @@ impl eframe::App for TwelfApp {
                 .as_ref()
                 .is_some_and(|d| !d.is_finished());
             if busy {
-                self.status_message =
-                    Some("A download is already running — wait for it or cancel it".to_string());
+                self.status_message = Some(status_bar::Message::error(
+                    "A download is already running — wait for it or cancel it",
+                ));
             } else if let Some(session) = session {
                 if is_dir {
                     if let Some(dest) = rfd::FileDialog::new().pick_folder() {
@@ -1349,7 +1354,8 @@ impl eframe::App for TwelfApp {
         // is how the completion handler used to pair the wrong pair of paths.
         if let Some((path, is_dir)) = rename_request {
             if self.remote_rename.is_some() {
-                self.status_message = Some("A rename is already running".to_string());
+                self.status_message =
+                    Some(status_bar::Message::error("A rename is already running"));
             } else {
                 let is_remote = matches!(self.ssh, ssh::SshState::Connected { .. })
                     && self.remote_root.is_some();
@@ -1547,8 +1553,10 @@ mod tests {
         app.resolve_remote_deletes();
         assert!(app.detached_deletes.is_empty());
         assert_eq!(
-            app.status_message.as_deref(),
-            Some("Delete trip: 2 item(s) could not be removed")
+            app.status_message,
+            Some(status_bar::Message::error(
+                "Delete trip: 2 item(s) could not be removed"
+            ))
         );
     }
 

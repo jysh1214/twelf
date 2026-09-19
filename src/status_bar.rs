@@ -2,6 +2,39 @@ use crate::{TwelfApp, menu_bar, ssh};
 use eframe::egui;
 use std::path::Path;
 
+/// A notice shown in the status bar until dismissed. It carries how it should
+/// read, because painting every message in the error colour made "Saved
+/// favorite" look exactly like "3 item(s) could not be removed".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    pub text: String,
+    pub is_error: bool,
+}
+
+impl Message {
+    /// Something happened as asked.
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    /// Something failed, or a request was refused.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
+    }
+
+    /// The colour to override the label with: errors only. A plain notice keeps
+    /// the theme's text colour.
+    fn color(&self, visuals: &egui::Visuals) -> Option<egui::Color32> {
+        self.is_error.then_some(visuals.error_fg_color)
+    }
+}
+
 /// The bottom status bar: the selected node's full path on the left (truncated
 /// when it doesn't fit), then any operation result awaiting acknowledgement,
 /// then the in-flight download's progress on the right.
@@ -42,12 +75,15 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                 }
                 // Dismissable so a failure notice can't be missed, and can't
                 // linger past the point the user has taken it in.
-                if let Some(msg) = app.status_message.as_deref() {
+                if let Some(msg) = app.status_message.as_ref() {
                     if ui.small_button("✕").clicked() {
                         dismiss_message = true;
                     }
-                    let color = ui.visuals().error_fg_color;
-                    ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).truncate());
+                    let mut text = egui::RichText::new(&msg.text);
+                    if let Some(color) = msg.color(ui.visuals()) {
+                        text = text.color(color);
+                    }
+                    ui.add(egui::Label::new(text).truncate());
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::Label::new(path_text.unwrap_or_default()).truncate());
@@ -122,6 +158,19 @@ fn download_status_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_error_is_painted_in_the_error_colour() {
+        let visuals = egui::Visuals::dark();
+        assert_eq!(
+            Message::info("Saved favorite nas:/photos").color(&visuals),
+            None
+        );
+        assert_eq!(
+            Message::error("Delete trip: 3 item(s) could not be removed").color(&visuals),
+            Some(visuals.error_fg_color)
+        );
+    }
     use std::path::PathBuf;
 
     #[test]
