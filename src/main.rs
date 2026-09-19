@@ -416,7 +416,7 @@ impl TwelfApp {
                 ctx,
             ));
             self.pending_delete = None;
-            self.clear_after_delete(&path, ctx);
+            self.clear_after_delete(&path, true, ctx);
             return;
         }
         let result = if is_dir {
@@ -432,7 +432,7 @@ impl TwelfApp {
             root.remove_path(&path);
         }
         self.pending_delete = None;
-        self.clear_after_delete(&path, ctx);
+        self.clear_after_delete(&path, false, ctx);
     }
 
     /// Drop everything that belongs to the remote session the app is on, so
@@ -749,27 +749,22 @@ impl TwelfApp {
         }
     }
 
-    /// After a delete, drop any selection that pointed at (or under) `deleted`
-    /// and close the search so a stale result row can't linger.
-    fn clear_after_delete(&mut self, deleted: &Path, ctx: &egui::Context) {
-        let mut cleared = false;
-        if self
-            .selected_image
-            .as_deref()
-            .is_some_and(|p| p.starts_with(deleted))
-        {
-            self.selected_image = None;
-            cleared = true;
-        }
-        if self
-            .selected_remote
-            .as_deref()
-            .is_some_and(|p| p.starts_with(deleted))
-        {
-            self.selected_remote = None;
-            cleared = true;
-        }
-        if cleared {
+    /// After a delete on the local tree, or the remote one when `is_remote`,
+    /// drop that tree's selection if it pointed at (or under) `deleted`, and
+    /// close the search so a stale result row can't linger.
+    ///
+    /// Only that side's. Both selections used to be tested by path prefix, so
+    /// with the same library path on both machines, deleting a folder on the
+    /// server deselected the local file of the same path — still there, and
+    /// nothing to do with it. `apply_rename_side_effects` had the same flaw.
+    fn clear_after_delete(&mut self, deleted: &Path, is_remote: bool, ctx: &egui::Context) {
+        let selection = if is_remote {
+            &mut self.selected_remote
+        } else {
+            &mut self.selected_image
+        };
+        if selection.as_deref().is_some_and(|p| p.starts_with(deleted)) {
+            *selection = None;
             self.forget_all_images(ctx);
         }
         self.search_active = false;
@@ -2204,6 +2199,26 @@ mod tests {
             app.pending_delete.as_ref().unwrap().path,
             PathBuf::from("/r/e/a.jpg")
         );
+    }
+
+    #[test]
+    fn a_delete_on_one_side_leaves_the_same_path_on_the_other_selected() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::for_test();
+        // The same library path on this machine and on the server.
+        let file = PathBuf::from("/home/alex/pics/d/x.jpg");
+        app.selected_image = Some(file.clone());
+        app.selected_remote = Some(file.clone());
+
+        app.clear_after_delete(Path::new("/home/alex/pics/d"), true, &ctx);
+        assert_eq!(app.selected_remote, None);
+        // The local folder was not deleted; its file is still selected.
+        assert_eq!(app.selected_image, Some(file.clone()));
+
+        app.selected_remote = Some(file.clone());
+        app.clear_after_delete(Path::new("/home/alex/pics/d"), false, &ctx);
+        assert_eq!(app.selected_image, None);
+        assert_eq!(app.selected_remote, Some(file));
     }
 
     #[test]
