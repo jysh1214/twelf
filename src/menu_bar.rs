@@ -21,21 +21,11 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         };
                         app.root_node = Some(sidebar::TreeNode::root(path));
                         app.selected_image = None;
-                        app.scroll_target = None;
-                        app.search_active = false;
-                        app.search_query.clear();
-                        app.search_cache = None;
-                        app.remote_search = None;
-                        app.remote_search_changed = None;
-                        app.pending_delete = None;
-                        app.pending_rename = None;
-                        app.detach_remote_delete();
-                        app.remote_rename = None;
-                        app.remote_root = None;
-                        app.selected_remote = None;
-                        *app.session_holder.lock().unwrap() = None;
-                        app.clear_image_prefetch();
-                        app.forget_all_images(ctx);
+                        // Browsing locally now. Without this the menu bar went on
+                        // saying "Connected" over a local tree, with the session
+                        // kept alive and no way back to it short of reconnecting.
+                        app.leave_remote_session(ctx);
+                        app.ssh = ssh::SshState::Disconnected;
                     }
                     ui.close();
                 }

@@ -342,6 +342,41 @@ impl TwelfApp {
         self.clear_after_delete(&path, ctx);
     }
 
+    /// Drop everything that belongs to the remote session the app is on, so
+    /// nothing of it can show up in, or act on, wherever the app looks next.
+    /// Both connect outcomes and Open Folder go through here; they used to keep
+    /// three hand-copied lists, which had drifted — Open Folder left the poll
+    /// state and the Connected label behind.
+    ///
+    /// `selected_remote` has to go because the image panel gives it precedence
+    /// over any local selection: left set, clicking a local row did nothing
+    /// visible. `session_holder` has to go because the loader would keep serving
+    /// the old host's bytes. The search is closed so no walk or result list is
+    /// stranded against the old host. A running delete is detached, not dropped.
+    fn leave_remote_session(&mut self, ctx: &egui::Context) {
+        self.remote_root = None;
+        self.selected_remote = None;
+        self.scroll_target = None;
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_cache = None;
+        self.remote_search = None;
+        self.remote_search_changed = None;
+        self.pending_delete = None;
+        self.pending_rename = None;
+        self.detach_remote_delete();
+        self.remote_rename = None;
+        // Poll state restarts with the next session: drain the old cycle's
+        // listings so they can't merge into a new tree, and give the (possibly
+        // still-running) old cycle its own flag to finish with.
+        self.last_remote_poll = None;
+        self.remote_poll_running = Arc::new(AtomicBool::new(false));
+        while self.remote_poll_rx.try_recv().is_ok() {}
+        *self.session_holder.lock().unwrap() = None;
+        self.clear_image_prefetch();
+        self.forget_all_images(ctx);
+    }
+
     /// Leave the current session without stopping a delete it is in the middle
     /// of; see `detached_deletes`.
     fn detach_remote_delete(&mut self) {
@@ -707,26 +742,9 @@ impl eframe::App for TwelfApp {
         {
             self.ssh = match result {
                 Ok((session, info)) => {
+                    self.leave_remote_session(ctx);
                     self.remote_root =
                         Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
-                    self.selected_remote = None;
-                    self.scroll_target = None;
-                    self.search_active = false;
-                    self.search_query.clear();
-                    self.search_cache = None;
-                    self.remote_search = None;
-                    self.remote_search_changed = None;
-                    self.pending_delete = None;
-                    self.pending_rename = None;
-                    self.detach_remote_delete();
-                    self.remote_rename = None;
-                    // Poll state restarts against the new session; drain any
-                    // stale cycle's listings so they can't merge into the new
-                    // tree, and give the (possibly still-running) old cycle
-                    // its own flag to finish with.
-                    self.last_remote_poll = None;
-                    self.remote_poll_running = Arc::new(AtomicBool::new(false));
-                    while self.remote_poll_rx.try_recv().is_ok() {}
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     // Off the update loop: opening the cache is sqlite and file
                     // I/O, and rebuilding a corrupt one unlinks every blob. Until
@@ -735,36 +753,10 @@ impl eframe::App for TwelfApp {
                     let key_path = ssh::expand_home(&info.key_path);
                     self.runtime
                         .spawn_blocking(move || cache.initialize(&key_path));
-                    self.clear_image_prefetch();
-                    self.forget_all_images(ctx);
                     ssh::SshState::Connected { session, info }
                 }
                 Err(error) => {
-                    // A failed reconnect with the search bar open would otherwise
-                    // strand a walk/results against the old host.
-                    self.search_active = false;
-                    self.search_query.clear();
-                    self.search_cache = None;
-                    self.remote_search = None;
-                    self.remote_search_changed = None;
-                    self.pending_delete = None;
-                    self.pending_rename = None;
-                    self.detach_remote_delete();
-                    self.remote_rename = None;
-                    // Tear the remote side down as thoroughly as the Ok arm and
-                    // Open Folder do. Keeping `selected_remote` here wedged the
-                    // UI: the image panel gives it precedence over any local
-                    // selection, so clicking a local row did nothing visible,
-                    // while the stale `session_holder` kept the loader serving
-                    // the old host's bytes under a host-less sftp:/// URI.
-                    self.remote_root = None;
-                    self.selected_remote = None;
-                    self.scroll_target = None;
-                    self.last_remote_poll = None;
-                    self.remote_poll_running = Arc::new(AtomicBool::new(false));
-                    *self.session_holder.lock().unwrap() = None;
-                    self.clear_image_prefetch();
-                    self.forget_all_images(ctx);
+                    self.leave_remote_session(ctx);
                     ssh::SshState::Failed { error }
                 }
             };
@@ -1627,6 +1619,34 @@ mod tests {
             Some("Not connected")
         );
         assert!(app.remote_rename.is_none());
+    }
+
+    #[test]
+    fn leaving_the_remote_session_takes_everything_of_it_along() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
+        app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
+        app.scroll_target = Some(PathBuf::from("/photos/a.jpg"));
+        app.search_active = true;
+        app.search_query = "trip".to_string();
+        app.image_prefetch
+            .push_back("sftp://nas/photos/b.jpg".to_string());
+        let (delete, worker) = remote::RemoteDelete::running("/photos/old");
+        app.remote_delete = Some(delete);
+
+        app.leave_remote_session(&ctx);
+
+        assert!(app.remote_root.is_none());
+        // Left set, this would shadow every local selection in the image panel.
+        assert_eq!(app.selected_remote, None);
+        assert_eq!(app.scroll_target, None);
+        assert!(!app.search_active && app.search_query.is_empty());
+        assert!(app.image_prefetch.is_empty());
+        assert!(app.session_holder.lock().unwrap().is_none());
+        // The delete carries on, detached.
+        assert_eq!(app.detached_deletes.len(), 1);
+        assert!(!worker.is_cancelled());
     }
 
     #[test]
