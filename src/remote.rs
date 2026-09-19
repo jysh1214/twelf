@@ -817,6 +817,39 @@ impl Drop for RemoteDelete {
     }
 }
 
+/// The worker's end of a `RemoteDelete`, for tests that need a delete in a
+/// known state without an SFTP server behind it.
+#[cfg(test)]
+pub(crate) struct DeleteProbe {
+    cancel: Arc<AtomicBool>,
+    failed: Arc<AtomicUsize>,
+    tx: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl DeleteProbe {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// End the walk as the worker would, with `failed` entries left behind.
+    pub(crate) fn finish(&self, failed: usize) {
+        self.failed.store(failed, Ordering::Relaxed);
+        let _ = self.tx.send(());
+    }
+}
+
+#[cfg(test)]
+impl RemoteDelete {
+    pub(crate) fn running(target: &str) -> (Self, DeleteProbe) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = DeleteProbe { cancel: cancel.clone(), failed: failed.clone(), tx };
+        (Self { target: PathBuf::from(target), cancel, failed, rx, finished: false }, probe)
+    }
+}
+
 /// Spawn a recursive delete of `target` on the runtime. A directory is enumerated
 /// in full and then removed deepest-first, so each dir is empty when removed
 /// (SFTP `remove_dir` only deletes empty dirs). Cancel by dropping the handle.

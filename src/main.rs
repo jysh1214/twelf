@@ -119,6 +119,12 @@ struct TwelfApp {
     selected_remote: Option<PathBuf>,
     remote_download: Option<remote::RemoteDownload>,
     remote_delete: Option<remote::RemoteDelete>,
+    /// Deletes started on a session the app has since left (a reconnect, Open
+    /// Folder). They run to completion and report here: dropping the handle
+    /// would cancel a deepest-first walk halfway, leaving the files gone and the
+    /// directory skeleton standing, with nobody told. Kept apart from
+    /// `remote_delete` so they don't hold up a delete on the new session.
+    detached_deletes: Vec<remote::RemoteDelete>,
     pending_delete: Option<PendingDelete>,
     pending_rename: Option<PendingRename>,
     remote_rename: Option<remote::RemoteRename>,
@@ -189,6 +195,7 @@ impl TwelfApp {
             selected_remote: None,
             remote_download: None,
             remote_delete: None,
+            detached_deletes: Vec::new(),
             pending_delete: None,
             pending_rename: None,
             remote_rename: None,
@@ -319,6 +326,50 @@ impl TwelfApp {
         }
         self.pending_delete = None;
         self.clear_after_delete(&path, ctx);
+    }
+
+    /// Leave the current session without stopping a delete it is in the middle
+    /// of; see `detached_deletes`.
+    fn detach_remote_delete(&mut self) {
+        self.detached_deletes.extend(self.remote_delete.take());
+    }
+
+    /// Settle every remote delete that has finished, whichever session it ran
+    /// on and whatever is on screen by now: a failure count goes to the status
+    /// bar, since the optimistic UI already cleared the selection and closed the
+    /// dialog. Only the current session's delete refreshes the tree — a detached
+    /// one belongs to a tree that is gone.
+    fn resolve_remote_deletes(&mut self) {
+        let mut finished = Vec::new();
+        if let Some(del) = self.remote_delete.as_mut() {
+            del.poll();
+        }
+        if self.remote_delete.as_ref().is_some_and(|d| d.is_finished())
+            && let Some(del) = self.remote_delete.take()
+        {
+            if let Some(parent) = del.target().parent()
+                && let Some(root) = self.remote_root.as_mut()
+            {
+                root.reload(parent);
+            }
+            finished.push(del);
+        }
+        for del in &mut self.detached_deletes {
+            del.poll();
+        }
+        let (done, running) = std::mem::take(&mut self.detached_deletes)
+            .into_iter()
+            .partition(|d| d.is_finished());
+        self.detached_deletes = running;
+        finished.extend::<Vec<_>>(done);
+        for del in finished {
+            let failed = del.failed();
+            if failed > 0 {
+                let name = del.target().file_name().unwrap_or_default().to_string_lossy();
+                self.status_message =
+                    Some(format!("Delete {name}: {failed} item(s) could not be removed"));
+            }
+        }
     }
 
     /// Persist the whole config. Always writes both halves — writing only the
@@ -569,10 +620,9 @@ impl eframe::App for TwelfApp {
                     self.search_cache = None;
                     self.remote_search = None;
                     self.remote_search_changed = None;
-                    self.remote_download = None;
                     self.pending_delete = None;
                     self.pending_rename = None;
-                    self.remote_delete = None;
+                    self.detach_remote_delete();
                     self.remote_rename = None;
                     // Poll state restarts against the new session; drain any
                     // stale cycle's listings so they can't merge into the new
@@ -595,10 +645,9 @@ impl eframe::App for TwelfApp {
                     self.search_cache = None;
                     self.remote_search = None;
                     self.remote_search_changed = None;
-                    self.remote_download = None;
                     self.pending_delete = None;
                     self.pending_rename = None;
-                    self.remote_delete = None;
+                    self.detach_remote_delete();
                     self.remote_rename = None;
                     // Tear the remote side down as thoroughly as the Ok arm and
                     // Open Folder do. Keeping `selected_remote` here wedged the
@@ -958,6 +1007,8 @@ impl eframe::App for TwelfApp {
             self.execute_rename(ctx);
         }
 
+        self.resolve_remote_deletes();
+
         let sftp = match &self.ssh {
             ssh::SshState::Connected { session, .. } => Some(session.clone()),
             _ => None,
@@ -979,9 +1030,6 @@ impl eframe::App for TwelfApp {
         // Set by the remote tree's Refresh context-menu action; consumed after
         // the panel into a reload of that folder's cached listing.
         let mut refresh_request: Option<PathBuf> = None;
-        // Set when a finished remote delete reports failures (name, count);
-        // consumed after the panel into `status_message`.
-        let mut delete_failed: Option<(String, usize)> = None;
         // Set by the remote tree's Add to Favorites action; consumed after the
         // panel into the saved-connection list.
         let mut favorite_request: Option<PathBuf> = None;
@@ -1006,26 +1054,7 @@ impl eframe::App for TwelfApp {
             };
             if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
                 let mut new_remote_selection: Option<PathBuf> = None;
-                if let Some(del) = self.remote_delete.as_mut() {
-                    del.poll();
-                }
-                if self.remote_delete.as_ref().is_some_and(|d| d.is_finished()) {
-                    if let Some(del) = self.remote_delete.take() {
-                        let target = del.target().to_path_buf();
-                        let failed = del.failed();
-                        if let Some(parent) = target.parent() {
-                            remote_root.reload(parent);
-                        }
-                        if failed > 0 {
-                            // Applied after the panel: `remote_root` holds a
-                            // borrow of self for this whole block.
-                            delete_failed = Some((
-                                target.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                                failed,
-                            ));
-                        }
-                    }
-                } else if let Some(del) = self.remote_delete.as_ref() {
+                if let Some(del) = self.remote_delete.as_ref() {
                     let name = del.target().file_name().unwrap_or_default().to_string_lossy();
                     ui.label(egui::RichText::new(format!("Deleting {name}…")).italics());
                     ctx.request_repaint();
@@ -1233,12 +1262,6 @@ impl eframe::App for TwelfApp {
                 }
             }
         }
-        // A finished remote delete left entries behind: say so, since the
-        // optimistic UI already cleared the selection and closed the dialog.
-        if let Some((name, failed)) = delete_failed {
-            self.status_message =
-                Some(format!("Delete {name}: {failed} item(s) could not be removed"));
-        }
         // An Add to Favorites action was chosen: save the live connection with
         // that folder as its root, so reconnecting lands straight in it.
         if let Some(path) = favorite_request
@@ -1428,5 +1451,46 @@ mod tests {
         assert_eq!(app.selected_image.as_deref(), Some(Path::new("/r/keep.jpg")));
         // No scroll either — nothing moved, so the tree must not jump.
         assert_eq!(app.scroll_target, None);
+    }
+
+    #[test]
+    fn leaving_the_session_lets_a_running_delete_finish_and_report() {
+        let mut app = TwelfApp::new();
+        app.status_message = None;
+        let (delete, worker) = remote::RemoteDelete::running("/photos/trip");
+        app.remote_delete = Some(delete);
+
+        // What a reconnect or Open Folder does to it.
+        app.detach_remote_delete();
+        assert!(!worker.is_cancelled(), "the walk must not be stopped halfway");
+        // The new session can start a delete of its own meanwhile.
+        assert!(app.remote_delete.is_none());
+
+        // Still running: nothing to report yet, and the handle is kept.
+        app.resolve_remote_deletes();
+        assert_eq!(app.detached_deletes.len(), 1);
+        assert_eq!(app.status_message, None);
+
+        worker.finish(2);
+        app.resolve_remote_deletes();
+        assert!(app.detached_deletes.is_empty());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Delete trip: 2 item(s) could not be removed")
+        );
+    }
+
+    #[test]
+    fn a_clean_delete_on_the_current_session_settles_quietly() {
+        let mut app = TwelfApp::new();
+        app.status_message = None;
+        app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
+        let (delete, worker) = remote::RemoteDelete::running("/photos/trip");
+        app.remote_delete = Some(delete);
+        worker.finish(0);
+        app.resolve_remote_deletes();
+        assert!(app.remote_delete.is_none());
+        // A clean delete has nothing to say.
+        assert_eq!(app.status_message, None);
     }
 }

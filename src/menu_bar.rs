@@ -16,10 +16,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.search_cache = None;
                         app.remote_search = None;
                         app.remote_search_changed = None;
-                        app.remote_download = None;
                         app.pending_delete = None;
                         app.pending_rename = None;
-                        app.remote_delete = None;
+                        app.detach_remote_delete();
                         app.remote_rename = None;
                         app.remote_root = None;
                         app.selected_remote = None;
