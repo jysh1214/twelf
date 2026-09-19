@@ -1,9 +1,9 @@
 use eframe::egui::{self, ColorImage};
-use ffmpeg_next as ffmpeg;
 use ffmpeg::format::Pixel;
+use ffmpeg::frame::Video;
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
-use ffmpeg::frame::Video;
+use ffmpeg_next as ffmpeg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::File;
 use std::collections::VecDeque;
@@ -114,8 +114,12 @@ impl VideoDecoder {
             }
             (*ctx).pb = avio;
             (*ctx).flags |= ffmpeg::ffi::AVFMT_FLAG_CUSTOM_IO as c_int;
-            let ret =
-                ffmpeg::ffi::avformat_open_input(&mut ctx, ptr::null(), ptr::null(), ptr::null_mut());
+            let ret = ffmpeg::ffi::avformat_open_input(
+                &mut ctx,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+            );
             if ret < 0 {
                 // open_input frees `ctx` on failure but leaves our custom pb.
                 free_avio(avio, reader);
@@ -127,7 +131,13 @@ impl VideoDecoder {
                 return Err(ffmpeg::Error::Unknown);
             }
             let input = ffmpeg::format::context::Input::wrap(ctx);
-            Self::from_input(Some(AvioGuard { avio, opaque: reader }), input)
+            Self::from_input(
+                Some(AvioGuard {
+                    avio,
+                    opaque: reader,
+                }),
+                input,
+            )
         }
     }
 
@@ -215,7 +225,8 @@ impl VideoDecoder {
         while self.decoder.receive_frame(&mut decoded).is_ok() {
             let mut rgba = Video::empty();
             self.scaler.run(&decoded, &mut rgba)?;
-            let pts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0) as f64 * self.time_base;
+            let pts =
+                decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0) as f64 * self.time_base;
             self.pending.push_back(Frame {
                 image: to_color_image(&rgba),
                 pts,
@@ -334,7 +345,11 @@ unsafe extern "C" fn avio_seek(opaque: *mut c_void, offset: i64, whence: c_int) 
         let reader = unsafe { &mut *(opaque as *mut SftpReader) };
         let whence = whence & !AVSEEK_FORCE;
         if whence & AVSEEK_SIZE != 0 {
-            return if reader.size > 0 { reader.size as i64 } else { -1 };
+            return if reader.size > 0 {
+                reader.size as i64
+            } else {
+                -1
+            };
         }
         let new = match whence {
             SEEK_SET => offset,
@@ -424,14 +439,18 @@ impl VideoPlayer {
         Self::spawn(uri, move |tx, shared, cancel| {
             // ffmpeg-next unwraps to_str(), so a non-UTF-8 path would panic the worker.
             if path.to_str().is_none() {
-                report_error(&shared, format!("video path is not UTF-8: {}", path.display()));
+                report_error(
+                    &shared,
+                    format!("video path is not UTF-8: {}", path.display()),
+                );
                 return;
             }
             match VideoDecoder::open(&path) {
                 Ok(decoder) => decode_loop(decoder, &tx, &shared, &cancel),
-                Err(e) => {
-                    report_error(&shared, format!("video open failed for {}: {e}", path.display()))
-                }
+                Err(e) => report_error(
+                    &shared,
+                    format!("video open failed for {}: {e}", path.display()),
+                ),
             }
         })
     }
@@ -455,16 +474,20 @@ impl VideoPlayer {
             let file = match handle.block_on(session.open(remote_path.clone())) {
                 Ok(file) => file,
                 Err(e) => {
-                    report_error(&shared, format!("remote video open failed for {remote_path}: {e}"));
+                    report_error(
+                        &shared,
+                        format!("remote video open failed for {remote_path}: {e}"),
+                    );
                     return;
                 }
             };
             match VideoDecoder::open_sftp(handle, file, size, cancel.clone()) {
                 Ok(decoder) => decode_loop(decoder, &tx, &shared, &cancel),
                 // A cancelled probe is not a failure worth surfacing.
-                Err(e) if !cancel.load(Ordering::Relaxed) => {
-                    report_error(&shared, format!("remote video decode failed for {remote_path}: {e}"))
-                }
+                Err(e) if !cancel.load(Ordering::Relaxed) => report_error(
+                    &shared,
+                    format!("remote video decode failed for {remote_path}: {e}"),
+                ),
                 Err(_) => {}
             }
         })
@@ -549,14 +572,17 @@ impl VideoPlayer {
                     // Buffered frames drain first, so this is the worker's true end.
                     Err(TryRecvError::Disconnected) => {
                         if self.error.is_none() {
-                            self.error = Some(self.shared.lock().unwrap().error.clone().unwrap_or_else(
-                                || "playback stopped unexpectedly".to_string(),
-                            ));
+                            self.error =
+                                Some(self.shared.lock().unwrap().error.clone().unwrap_or_else(
+                                    || "playback stopped unexpectedly".to_string(),
+                                ));
                         }
                     }
                 }
             }
-            let Some(frame) = self.next.as_ref() else { break };
+            let Some(frame) = self.next.as_ref() else {
+                break;
+            };
             if frame.generation != self.generation {
                 self.next = None; // stale pre-seek frame
                 continue;
@@ -600,7 +626,9 @@ impl VideoPlayer {
         }
         let delay = match (self.anchor, self.next.as_ref()) {
             (Some((t0, p0)), Some(frame)) if frame.generation == self.generation => {
-                Duration::from_secs_f64(((frame.position - p0) - t0.elapsed().as_secs_f64()).max(0.0))
+                Duration::from_secs_f64(
+                    ((frame.position - p0) - t0.elapsed().as_secs_f64()).max(0.0),
+                )
             }
             _ => Duration::from_millis(5), // waiting on the decoder; poll again soon
         };
@@ -618,7 +646,10 @@ struct Pass {
 
 impl Pass {
     fn from_start() -> Self {
-        Self { began_at_start: true, produced: false }
+        Self {
+            began_at_start: true,
+            produced: false,
+        }
     }
 
     /// A seek may land past the last frame, so an empty pass after one proves
@@ -776,7 +807,12 @@ mod tests {
     }
 
     /// Poll for `hold`, asserting the position stays at `expected` throughout.
-    fn assert_position_holds(player: &mut VideoPlayer, ctx: &egui::Context, expected: f64, hold: Duration) {
+    fn assert_position_holds(
+        player: &mut VideoPlayer,
+        ctx: &egui::Context,
+        expected: f64,
+        hold: Duration,
+    ) {
         let until = Instant::now() + hold;
         while Instant::now() < until {
             player.frame(ctx);
@@ -863,9 +899,11 @@ mod tests {
     #[test]
     fn silent_worker_death_gets_fallback_message() {
         let ctx = egui::Context::default();
-        let mut player =
-            VideoPlayer::spawn("test://video".to_string(), |_tx, _shared, _cancel| {});
-        assert_eq!(wait_for_error(&mut player, &ctx), "playback stopped unexpectedly");
+        let mut player = VideoPlayer::spawn("test://video".to_string(), |_tx, _shared, _cancel| {});
+        assert_eq!(
+            wait_for_error(&mut player, &ctx),
+            "playback stopped unexpectedly"
+        );
     }
 
     #[test]

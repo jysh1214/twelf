@@ -14,8 +14,8 @@ mod sftp_loader;
 mod sidebar;
 mod ssh;
 mod status_bar;
-mod watcher;
 mod video;
+mod watcher;
 mod webp;
 
 use eframe::egui;
@@ -36,16 +36,18 @@ fn main() -> eframe::Result {
                 .add_image_loader(Arc::new(heic::HeicLoader::new()));
             fonts::apply_fonts(&cc.egui_ctx);
             let app = TwelfApp::new();
-            cc.egui_ctx.add_bytes_loader(Arc::new(sftp_loader::SftpBytesLoader::new(
-                app.session_holder.clone(),
-                app.runtime.handle().clone(),
-                app.cache.clone(),
-            )));
+            cc.egui_ctx
+                .add_bytes_loader(Arc::new(sftp_loader::SftpBytesLoader::new(
+                    app.session_holder.clone(),
+                    app.runtime.handle().clone(),
+                    app.cache.clone(),
+                )));
             // Registered after the others so egui's reverse-order lookup tries it
             // first for sftp:// images (decoded off-thread); it defers everything else.
-            cc.egui_ctx.add_image_loader(Arc::new(decoded::DecodedImageLoader::new(
-                app.runtime.handle().clone(),
-            )));
+            cc.egui_ctx
+                .add_image_loader(Arc::new(decoded::DecodedImageLoader::new(
+                    app.runtime.handle().clone(),
+                )));
             Ok(Box::new(app))
         }),
     )
@@ -239,7 +241,9 @@ impl TwelfApp {
             )
         });
         while self.prefetch_in_flight.len() < PREFETCH_IN_FLIGHT {
-            let Some(uri) = self.image_prefetch.pop_front() else { break };
+            let Some(uri) = self.image_prefetch.pop_front() else {
+                break;
+            };
             if let Ok(egui::load::ImagePoll::Pending { .. }) =
                 ctx.try_load_image(&uri, egui::load::SizeHint::default())
             {
@@ -252,15 +256,23 @@ impl TwelfApp {
     }
 
     fn navigate_image(&mut self, delta: i32) {
-        let remote_mode = matches!(self.ssh, ssh::SshState::Connected { .. })
-            && self.remote_root.is_some();
+        let remote_mode =
+            matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
         let (current, list) = if remote_mode {
-            let Some(current) = self.selected_remote.clone() else { return };
-            let Some(root) = self.remote_root.as_ref() else { return };
+            let Some(current) = self.selected_remote.clone() else {
+                return;
+            };
+            let Some(root) = self.remote_root.as_ref() else {
+                return;
+            };
             (current, root.collect_images())
         } else {
-            let Some(current) = self.selected_image.clone() else { return };
-            let Some(root) = self.root_node.as_ref() else { return };
+            let Some(current) = self.selected_image.clone() else {
+                return;
+            };
+            let Some(root) = self.root_node.as_ref() else {
+                return;
+            };
             (current, root.collect_images())
         };
         if let Some(new) = nav::navigate(&list, &current, delta) {
@@ -279,7 +291,9 @@ impl TwelfApp {
     /// `execute_rename` — the previous silent return left the row on screen with
     /// no clue why.
     fn execute_delete(&mut self, ctx: &egui::Context) {
-        let Some(pd) = self.pending_delete.as_ref() else { return };
+        let Some(pd) = self.pending_delete.as_ref() else {
+            return;
+        };
         let path = pd.path.clone();
         let is_dir = pd.is_dir;
         let is_remote = pd.is_remote;
@@ -365,9 +379,14 @@ impl TwelfApp {
         for del in finished {
             let failed = del.failed();
             if failed > 0 {
-                let name = del.target().file_name().unwrap_or_default().to_string_lossy();
-                self.status_message =
-                    Some(format!("Delete {name}: {failed} item(s) could not be removed"));
+                let name = del
+                    .target()
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                self.status_message = Some(format!(
+                    "Delete {name}: {failed} item(s) could not be removed"
+                ));
             }
         }
     }
@@ -432,11 +451,19 @@ impl TwelfApp {
     /// and close the search so a stale result row can't linger.
     fn clear_after_delete(&mut self, deleted: &Path, ctx: &egui::Context) {
         let mut cleared = false;
-        if self.selected_image.as_deref().is_some_and(|p| p.starts_with(deleted)) {
+        if self
+            .selected_image
+            .as_deref()
+            .is_some_and(|p| p.starts_with(deleted))
+        {
             self.selected_image = None;
             cleared = true;
         }
-        if self.selected_remote.as_deref().is_some_and(|p| p.starts_with(deleted)) {
+        if self
+            .selected_remote
+            .as_deref()
+            .is_some_and(|p| p.starts_with(deleted))
+        {
             self.selected_remote = None;
             cleared = true;
         }
@@ -454,7 +481,9 @@ impl TwelfApp {
     /// remote backend is wired in a later subtask. On failure the message is kept
     /// in `pending_rename` so the dialog stays open for correction.
     fn execute_rename(&mut self, ctx: &egui::Context) {
-        let Some(pr) = self.pending_rename.as_ref() else { return };
+        let Some(pr) = self.pending_rename.as_ref() else {
+            return;
+        };
         let old = pr.path.clone();
         let is_remote = pr.is_remote;
         let new_name = pr.name.trim().to_string();
@@ -504,8 +533,14 @@ impl TwelfApp {
     /// path (including a selected descendant of a renamed folder), scroll the
     /// tree to it, and close the search so a stale row can't linger.
     fn apply_rename_side_effects(&mut self, old: &Path, new: &Path, ctx: &egui::Context) {
-        let img = self.selected_image.as_deref().and_then(|s| rebase_path(s, old, new));
-        let rem = self.selected_remote.as_deref().and_then(|s| rebase_path(s, old, new));
+        let img = self
+            .selected_image
+            .as_deref()
+            .and_then(|s| rebase_path(s, old, new));
+        let rem = self
+            .selected_remote
+            .as_deref()
+            .and_then(|s| rebase_path(s, old, new));
         // Following the path alone still loses the row from view: the new name
         // may sort somewhere off-screen, a renamed folder gets a fresh
         // collapsing-state id and renders collapsed over the selection, and a
@@ -539,10 +574,7 @@ impl TwelfApp {
 /// component (no separator).
 fn valid_rename(name: &str, current: &str) -> bool {
     let trimmed = name.trim();
-    !trimmed.is_empty()
-        && trimmed != current
-        && !trimmed.contains('/')
-        && !trimmed.contains('\\')
+    !trimmed.is_empty() && trimmed != current && !trimmed.contains('/') && !trimmed.contains('\\')
 }
 
 /// If `selected` is `old` (or lives under it, for a renamed folder), return the
@@ -612,7 +644,8 @@ impl eframe::App for TwelfApp {
         {
             self.ssh = match result {
                 Ok((session, info)) => {
-                    self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
+                    self.remote_root =
+                        Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
                     self.selected_remote = None;
                     self.scroll_target = None;
                     self.search_active = false;
@@ -637,7 +670,8 @@ impl eframe::App for TwelfApp {
                     // it lands the loader uses the previous cache, or none.
                     let cache = self.cache.clone();
                     let key_path = ssh::expand_home(&info.key_path);
-                    self.runtime.spawn_blocking(move || cache.initialize(&key_path));
+                    self.runtime
+                        .spawn_blocking(move || cache.initialize(&key_path));
                     self.clear_image_prefetch();
                     self.forget_all_images(ctx);
                     ssh::SshState::Connected { session, info }
@@ -733,7 +767,9 @@ impl eframe::App for TwelfApp {
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp) {
                     Some(-1_i32)
-                } else if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowDown) {
+                } else if i.key_pressed(egui::Key::ArrowRight)
+                    || i.key_pressed(egui::Key::ArrowDown)
+                {
                     Some(1)
                 } else {
                     None
@@ -919,7 +955,9 @@ impl eframe::App for TwelfApp {
                 .collapsible(false)
                 .show(ctx, |ui| {
                     if pd.is_dir {
-                        ui.label(format!("Delete folder \"{name}\" and everything inside it?"));
+                        ui.label(format!(
+                            "Delete folder \"{name}\" and everything inside it?"
+                        ));
                     } else {
                         ui.label(format!("Delete \"{name}\"?"));
                     }
@@ -983,10 +1021,7 @@ impl eframe::App for TwelfApp {
                         pr.needs_focus = false;
                     }
                     let valid = valid_rename(&pr.name, &current);
-                    if valid
-                        && edit.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if valid && edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         do_rename = true;
                     }
                     if let Some(err) = &pr.error {
@@ -1043,182 +1078,189 @@ impl eframe::App for TwelfApp {
             .min_width(screen_w * 0.10)
             .max_width(screen_w * 0.50)
             .show(ctx, |ui| {
-            let panel_w = ui.available_width();
-            ui.set_min_width(panel_w);
-            ui.set_max_width(panel_w);
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            let scroll = || {
-                let area = egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                if reset_scroll {
-                    area.scroll_offset(egui::Vec2::ZERO)
-                } else {
-                    area
-                }
-            };
-            if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
-                let mut new_remote_selection: Option<PathBuf> = None;
-                if let Some(del) = self.remote_delete.as_ref() {
-                    let name = del.target().file_name().unwrap_or_default().to_string_lossy();
-                    ui.label(egui::RichText::new(format!("Deleting {name}…")).italics());
-                    ctx.request_repaint();
-                }
-                if self.search_active {
-                    sidebar::search_bar(ui, &mut self.search_query, open_search);
-                }
-                let searching = self.search_active && !self.search_query.trim().is_empty();
-                if searching {
-                    // Debounce: relaunch the recursive walk only once the query has been
-                    // stable for REMOTE_SEARCH_DEBOUNCE. Replacing self.remote_search drops
-                    // (and so cancels) any superseded walk.
-                    let query = self.search_query.trim().to_string();
-                    let same = matches!(&self.remote_search_changed, Some((q, _)) if *q == query);
-                    if !same {
-                        self.remote_search_changed =
-                            Some((query.clone(), std::time::Instant::now()));
-                    }
-                    let stable = self
-                        .remote_search_changed
-                        .as_ref()
-                        .map(|(_, since)| since.elapsed())
-                        .unwrap_or(std::time::Duration::ZERO);
-                    let needs_new =
-                        self.remote_search.as_ref().map(|w| w.query()) != Some(query.as_str());
-                    if needs_new {
-                        if stable >= REMOTE_SEARCH_DEBOUNCE {
-                            self.remote_search = Some(remote::spawn_remote_search(
-                                sftp.clone(),
-                                &self.runtime,
-                                remote_root.path().to_path_buf(),
-                                query,
-                                ctx,
-                            ));
-                        } else {
-                            ctx.request_repaint_after(REMOTE_SEARCH_DEBOUNCE - stable);
-                        }
-                    }
-                } else {
-                    self.remote_search = None;
-                    self.remote_search_changed = None;
-                }
-                scroll().show(ui, |ui| {
-                    if !searching {
-                        remote::render_remote_tree(
-                            ui,
-                            remote_root,
-                            true,
-                            &remote_host,
-                            &mut self.selected_remote,
-                            &mut self.scroll_target,
-                            &mut self.image_prefetch,
-                            &mut download_request,
-                            &mut delete_request,
-                            &mut rename_request,
-                            &mut refresh_request,
-                            &mut favorite_request,
-                            &sftp,
-                            &self.remote_listings_tx,
-                            &self.runtime,
-                            ctx,
+                let panel_w = ui.available_width();
+                ui.set_min_width(panel_w);
+                ui.set_max_width(panel_w);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                let scroll = || {
+                    let area = egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                         );
-                        return;
-                    }
-                    let ready = self
-                        .remote_search
-                        .as_mut()
-                        .map(|w| {
-                            w.poll();
-                            w.hits().is_some()
-                        })
-                        .unwrap_or(false);
-                    if ready {
-                        if let Some(hits) = self.remote_search.as_ref().and_then(|w| w.hits()) {
-                            sidebar::render_search_results(
-                                ui,
-                                hits,
-                                &self.selected_remote,
-                                &mut self.scroll_target,
-                                &mut new_remote_selection,
-                                Some(&mut download_request),
-                                &mut delete_request,
-                                &mut rename_request,
-                            );
-                        }
+                    if reset_scroll {
+                        area.scroll_offset(egui::Vec2::ZERO)
                     } else {
-                        ui.label(egui::RichText::new("searching…").italics());
+                        area
+                    }
+                };
+                if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
+                    let mut new_remote_selection: Option<PathBuf> = None;
+                    if let Some(del) = self.remote_delete.as_ref() {
+                        let name = del
+                            .target()
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        ui.label(egui::RichText::new(format!("Deleting {name}…")).italics());
                         ctx.request_repaint();
                     }
-                });
-                if let Some(path) = new_remote_selection {
-                    self.selected_remote = Some(path);
-                }
-            } else {
-                // Captures the clicked image path — deferred to dodge the borrow
-                // on `&mut self.root_node` taken by the renderers.
-                let mut new_selection: Option<PathBuf> = None;
-                if self.search_active {
-                    sidebar::search_bar(ui, &mut self.search_query, open_search);
-                }
-                // Refresh the cached walk outside the scroll closure (it needs the root
-                // path and query). Re-walk only when the trimmed query changes — egui
-                // repaints ~60x/s, so an ungated walk would hit the disk every frame.
-                let searching = self.search_active && !self.search_query.trim().is_empty();
-                if searching && let Some(root) = self.root_node.as_ref() {
-                    let query = self.search_query.trim();
-                    let query_changed =
-                        self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query);
-                    // A watcher batch makes the results stale, but the walk is
-                    // synchronous and whole-tree, so it waits out the debounce.
-                    let refresh_due = self.search_dirty
-                        && self
-                            .last_search_walk
-                            .is_none_or(|t| t.elapsed() >= LOCAL_SEARCH_REWALK);
-                    if query_changed || refresh_due {
-                        let hits = sidebar::search_tree(root.path(), query);
-                        self.search_cache = Some((query.to_string(), hits));
-                        self.search_dirty = false;
-                        self.last_search_walk = Some(std::time::Instant::now());
-                    } else if self.search_dirty {
-                        let wait = self
-                            .last_search_walk
-                            .map(|t| LOCAL_SEARCH_REWALK.saturating_sub(t.elapsed()))
-                            .unwrap_or_default();
-                        ctx.request_repaint_after(wait);
+                    if self.search_active {
+                        sidebar::search_bar(ui, &mut self.search_query, open_search);
                     }
-                }
-                scroll().show(ui, |ui| {
+                    let searching = self.search_active && !self.search_query.trim().is_empty();
                     if searching {
-                        if let Some((_, hits)) = &self.search_cache {
-                            sidebar::render_search_results(
+                        // Debounce: relaunch the recursive walk only once the query has been
+                        // stable for REMOTE_SEARCH_DEBOUNCE. Replacing self.remote_search drops
+                        // (and so cancels) any superseded walk.
+                        let query = self.search_query.trim().to_string();
+                        let same =
+                            matches!(&self.remote_search_changed, Some((q, _)) if *q == query);
+                        if !same {
+                            self.remote_search_changed =
+                                Some((query.clone(), std::time::Instant::now()));
+                        }
+                        let stable = self
+                            .remote_search_changed
+                            .as_ref()
+                            .map(|(_, since)| since.elapsed())
+                            .unwrap_or(std::time::Duration::ZERO);
+                        let needs_new =
+                            self.remote_search.as_ref().map(|w| w.query()) != Some(query.as_str());
+                        if needs_new {
+                            if stable >= REMOTE_SEARCH_DEBOUNCE {
+                                self.remote_search = Some(remote::spawn_remote_search(
+                                    sftp.clone(),
+                                    &self.runtime,
+                                    remote_root.path().to_path_buf(),
+                                    query,
+                                    ctx,
+                                ));
+                            } else {
+                                ctx.request_repaint_after(REMOTE_SEARCH_DEBOUNCE - stable);
+                            }
+                        }
+                    } else {
+                        self.remote_search = None;
+                        self.remote_search_changed = None;
+                    }
+                    scroll().show(ui, |ui| {
+                        if !searching {
+                            remote::render_remote_tree(
                                 ui,
-                                hits,
+                                remote_root,
+                                true,
+                                &remote_host,
+                                &mut self.selected_remote,
+                                &mut self.scroll_target,
+                                &mut self.image_prefetch,
+                                &mut download_request,
+                                &mut delete_request,
+                                &mut rename_request,
+                                &mut refresh_request,
+                                &mut favorite_request,
+                                &sftp,
+                                &self.remote_listings_tx,
+                                &self.runtime,
+                                ctx,
+                            );
+                            return;
+                        }
+                        let ready = self
+                            .remote_search
+                            .as_mut()
+                            .map(|w| {
+                                w.poll();
+                                w.hits().is_some()
+                            })
+                            .unwrap_or(false);
+                        if ready {
+                            if let Some(hits) = self.remote_search.as_ref().and_then(|w| w.hits()) {
+                                sidebar::render_search_results(
+                                    ui,
+                                    hits,
+                                    &self.selected_remote,
+                                    &mut self.scroll_target,
+                                    &mut new_remote_selection,
+                                    Some(&mut download_request),
+                                    &mut delete_request,
+                                    &mut rename_request,
+                                );
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("searching…").italics());
+                            ctx.request_repaint();
+                        }
+                    });
+                    if let Some(path) = new_remote_selection {
+                        self.selected_remote = Some(path);
+                    }
+                } else {
+                    // Captures the clicked image path — deferred to dodge the borrow
+                    // on `&mut self.root_node` taken by the renderers.
+                    let mut new_selection: Option<PathBuf> = None;
+                    if self.search_active {
+                        sidebar::search_bar(ui, &mut self.search_query, open_search);
+                    }
+                    // Refresh the cached walk outside the scroll closure (it needs the root
+                    // path and query). Re-walk only when the trimmed query changes — egui
+                    // repaints ~60x/s, so an ungated walk would hit the disk every frame.
+                    let searching = self.search_active && !self.search_query.trim().is_empty();
+                    if searching && let Some(root) = self.root_node.as_ref() {
+                        let query = self.search_query.trim();
+                        let query_changed =
+                            self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query);
+                        // A watcher batch makes the results stale, but the walk is
+                        // synchronous and whole-tree, so it waits out the debounce.
+                        let refresh_due = self.search_dirty
+                            && self
+                                .last_search_walk
+                                .is_none_or(|t| t.elapsed() >= LOCAL_SEARCH_REWALK);
+                        if query_changed || refresh_due {
+                            let hits = sidebar::search_tree(root.path(), query);
+                            self.search_cache = Some((query.to_string(), hits));
+                            self.search_dirty = false;
+                            self.last_search_walk = Some(std::time::Instant::now());
+                        } else if self.search_dirty {
+                            let wait = self
+                                .last_search_walk
+                                .map(|t| LOCAL_SEARCH_REWALK.saturating_sub(t.elapsed()))
+                                .unwrap_or_default();
+                            ctx.request_repaint_after(wait);
+                        }
+                    }
+                    scroll().show(ui, |ui| {
+                        if searching {
+                            if let Some((_, hits)) = &self.search_cache {
+                                sidebar::render_search_results(
+                                    ui,
+                                    hits,
+                                    &self.selected_image,
+                                    &mut self.scroll_target,
+                                    &mut new_selection,
+                                    None,
+                                    &mut delete_request,
+                                    &mut rename_request,
+                                );
+                            }
+                        } else if let Some(root_node) = &mut self.root_node {
+                            sidebar::render_tree(
+                                ui,
+                                root_node,
+                                true,
                                 &self.selected_image,
                                 &mut self.scroll_target,
                                 &mut new_selection,
-                                None,
                                 &mut delete_request,
                                 &mut rename_request,
                             );
                         }
-                    } else if let Some(root_node) = &mut self.root_node {
-                        sidebar::render_tree(
-                            ui,
-                            root_node,
-                            true,
-                            &self.selected_image,
-                            &mut self.scroll_target,
-                            &mut new_selection,
-                            &mut delete_request,
-                            &mut rename_request,
-                        );
+                    });
+                    if let Some(path) = new_selection {
+                        self.selected_image = Some(path);
                     }
-                });
-                if let Some(path) = new_selection {
-                    self.selected_image = Some(path);
                 }
-            }
-        });
+            });
         // A Download action was chosen: pick a local destination and spawn the
         // copy — a recursive walk into a picked folder for a directory, a save
         // dialog prefilled with the file's name for a single file. The picker
@@ -1294,7 +1336,12 @@ impl eframe::App for TwelfApp {
         if let Some((path, is_dir)) = delete_request {
             let is_remote =
                 matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
-            self.pending_delete = Some(PendingDelete { path, is_dir, is_remote, error: None });
+            self.pending_delete = Some(PendingDelete {
+                path,
+                is_dir,
+                is_remote,
+                error: None,
+            });
         }
         // A Rename action was chosen this frame: open the name-entry dialog.
         // Refused while one is still in flight — the second dialog could not be
@@ -1378,12 +1425,20 @@ mod tests {
         );
         // A selected descendant of a renamed folder follows by prefix.
         assert_eq!(
-            rebase_path(Path::new("/a/b/sub/x.jpg"), Path::new("/a/b"), Path::new("/a/c")),
+            rebase_path(
+                Path::new("/a/b/sub/x.jpg"),
+                Path::new("/a/b"),
+                Path::new("/a/c")
+            ),
             Some(PathBuf::from("/a/c/sub/x.jpg"))
         );
         // An unrelated selection is left alone.
         assert_eq!(
-            rebase_path(Path::new("/a/other.jpg"), Path::new("/a/b"), Path::new("/a/c")),
+            rebase_path(
+                Path::new("/a/other.jpg"),
+                Path::new("/a/b"),
+                Path::new("/a/c")
+            ),
             None
         );
     }
@@ -1443,8 +1498,14 @@ mod tests {
             Path::new("/srv/pics/new.jpg"),
             &ctx,
         );
-        assert_eq!(app.selected_remote.as_deref(), Some(Path::new("/srv/pics/new.jpg")));
-        assert_eq!(app.scroll_target.as_deref(), Some(Path::new("/srv/pics/new.jpg")));
+        assert_eq!(
+            app.selected_remote.as_deref(),
+            Some(Path::new("/srv/pics/new.jpg"))
+        );
+        assert_eq!(
+            app.scroll_target.as_deref(),
+            Some(Path::new("/srv/pics/new.jpg"))
+        );
     }
 
     #[test]
@@ -1453,7 +1514,10 @@ mod tests {
         let ctx = egui::Context::default();
         app.selected_image = Some(PathBuf::from("/r/keep.jpg"));
         app.apply_rename_side_effects(Path::new("/r/a.jpg"), Path::new("/r/b.jpg"), &ctx);
-        assert_eq!(app.selected_image.as_deref(), Some(Path::new("/r/keep.jpg")));
+        assert_eq!(
+            app.selected_image.as_deref(),
+            Some(Path::new("/r/keep.jpg"))
+        );
         // No scroll either — nothing moved, so the tree must not jump.
         assert_eq!(app.scroll_target, None);
     }
@@ -1467,7 +1531,10 @@ mod tests {
 
         // What a reconnect or Open Folder does to it.
         app.detach_remote_delete();
-        assert!(!worker.is_cancelled(), "the walk must not be stopped halfway");
+        assert!(
+            !worker.is_cancelled(),
+            "the walk must not be stopped halfway"
+        );
         // The new session can start a delete of its own meanwhile.
         assert!(app.remote_delete.is_none());
 

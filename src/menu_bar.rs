@@ -35,7 +35,10 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
             });
             ui.menu_button("Cache", |ui| {
                 if app.cache.is_initialized() {
-                    ui.label(format!("Size: {}", format_bytes(app.cache.total_size_bytes())));
+                    ui.label(format!(
+                        "Size: {}",
+                        format_bytes(app.cache.total_size_bytes())
+                    ));
                     ui.separator();
                     if ui.button("Clear Cache").clicked() {
                         // Every key's blobs go, which can be a lot of unlinking:

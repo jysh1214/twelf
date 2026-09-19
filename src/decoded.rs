@@ -1,8 +1,8 @@
-use eframe::egui;
-use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use crate::backoff::BackOff;
 use crate::lru::{ByteLru, ByteSized};
 use crate::sftp_loader::canonical_key;
+use eframe::egui;
+use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use egui::{ColorImage, Context};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -156,7 +156,12 @@ mod tests {
         let loader = DecodedImageLoader::new(rt.handle().clone());
         let image = Arc::new(ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]));
         // What a prefetch leaves behind: the decode, under the bare URI.
-        loader.state.lock().unwrap().cache.put("sftp://host/a.webp".to_string(), image);
+        loader
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .put("sftp://host/a.webp".to_string(), image);
         let ctx = Context::default();
         // Selecting the file asks for frame 0; that must not decode it again.
         assert!(matches!(
@@ -165,6 +170,14 @@ mod tests {
         ));
         // And forgetting either form drops the one entry.
         loader.forget("sftp://host/a.webp#0");
-        assert!(loader.state.lock().unwrap().cache.get("sftp://host/a.webp").is_none());
+        assert!(
+            loader
+                .state
+                .lock()
+                .unwrap()
+                .cache
+                .get("sftp://host/a.webp")
+                .is_none()
+        );
     }
 }

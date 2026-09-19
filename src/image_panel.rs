@@ -101,9 +101,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                                     }
                                 }
                             }
-                        } else if let Some(anim) =
-                            app.animation.as_mut().filter(|a| a.uri == uri)
-                        {
+                        } else if let Some(anim) = app.animation.as_mut().filter(|a| a.uri == uri) {
                             let (texture, remaining) = anim.frame(ui.ctx());
                             ui.ctx().request_repaint_after(remaining);
                             Some(egui::Image::new(texture))
@@ -152,7 +150,12 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
 }
 
 /// Draw a draggable progress bar filled to the player's position; seek on release.
-fn draw_seek_bar(ui: &mut egui::Ui, player: &mut crate::video::VideoPlayer, duration: f64, width: f32) {
+fn draw_seek_bar(
+    ui: &mut egui::Ui,
+    player: &mut crate::video::VideoPlayer,
+    duration: f64,
+    width: f32,
+) {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::click_and_drag());
     let played = (player.position() / duration).clamp(0.0, 1.0) as f32;
@@ -207,7 +210,9 @@ fn touch_displayed(displayed: &mut VecDeque<String>, uri: &str) -> Vec<String> {
     displayed.push_back(uri.to_string());
     let mut evicted = Vec::new();
     while displayed.len() > DISPLAYED_WINDOW {
-        let Some(old) = displayed.pop_front() else { break };
+        let Some(old) = displayed.pop_front() else {
+            break;
+        };
         evicted.push(old);
     }
     evicted

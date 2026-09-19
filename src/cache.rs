@@ -130,8 +130,7 @@ impl ImageCache {
     }
 
     fn open_at(dir: &Path, key_hex: &str) -> Result<Inner, String> {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
         let blobs_dir = dir.join("blobs");
         fs::create_dir_all(&blobs_dir)
             .map_err(|e| format!("failed to create {}: {e}", blobs_dir.display()))?;
@@ -163,7 +162,13 @@ impl ImageCache {
             // files alone and run without a disk cache this session.
             Err(OpenError::Other(e)) => return Err(e),
         };
-        Ok(Inner { conn, dir: dir.to_path_buf(), blobs_dir, max_bytes: MAX_CACHE_BYTES, root: None })
+        Ok(Inner {
+            conn,
+            dir: dir.to_path_buf(),
+            blobs_dir,
+            max_bytes: MAX_CACHE_BYTES,
+            root: None,
+        })
     }
 
     fn open_with_key(db_path: &Path, key_hex: &str) -> Result<Connection, OpenError> {
@@ -173,14 +178,16 @@ impl ImageCache {
         conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\""))
             .map_err(|e| other("failed to set key", e))?;
         // The key is only tested by the first read.
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok::<(), rusqlite::Error>(()))
-            .map_err(|e| {
-                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) {
-                    OpenError::NotADatabase(format!("decryption check failed: {e}"))
-                } else {
-                    other("decryption check failed", e)
-                }
-            })?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| {
+            Ok::<(), rusqlite::Error>(())
+        })
+        .map_err(|e| {
+            if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) {
+                OpenError::NotADatabase(format!("decryption check failed: {e}"))
+            } else {
+                other("decryption check failed", e)
+            }
+        })?;
         let entries_exists = conn.prepare("SELECT 1 FROM entries LIMIT 0").is_ok();
         let has_fingerprint = conn.prepare("SELECT mtime FROM entries LIMIT 0").is_ok();
         if entries_exists && !has_fingerprint {
@@ -333,7 +340,9 @@ impl ImageCache {
     /// it would sort last anyway — this only matters when it is the last row).
     /// Runs inside the caller's lock, keeping `get`'s rowid revalidation honest.
     fn evict_over_cap(inner: &Inner, keep: i64) {
-        let Some(mut total) = sum_bytes(&inner.conn) else { return };
+        let Some(mut total) = sum_bytes(&inner.conn) else {
+            return;
+        };
         while total > inner.max_bytes {
             let victim = inner
                 .conn
@@ -370,7 +379,11 @@ impl ImageCache {
             if let Err(e) = inner.conn.execute("DELETE FROM entries", []) {
                 crate::log!("failed to clear cache rows: {e}");
             }
-            (inner.dir.clone(), inner.blobs_dir.clone(), inner.root.clone())
+            (
+                inner.dir.clone(),
+                inner.blobs_dir.clone(),
+                inner.root.clone(),
+            )
         };
         if let Ok(iter) = fs::read_dir(&blobs_dir) {
             for entry in iter.flatten() {
@@ -391,8 +404,12 @@ impl ImageCache {
     }
 
     pub fn total_size_bytes(&self) -> u64 {
-        let Ok(guard) = self.inner.lock() else { return 0 };
-        let Some(inner) = guard.as_ref() else { return 0 };
+        let Ok(guard) = self.inner.lock() else {
+            return 0;
+        };
+        let Some(inner) = guard.as_ref() else {
+            return 0;
+        };
         sum_bytes(&inner.conn).map(|n| n.max(0) as u64).unwrap_or(0)
     }
 }
@@ -473,7 +490,10 @@ mod tests {
             Some(b"from b".to_vec())
         );
         // One key cannot read the other's index.
-        assert_eq!(under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(6)), None);
+        assert_eq!(
+            under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(6)),
+            None
+        );
     }
 
     #[test]
@@ -508,7 +528,10 @@ mod tests {
         drop(legacy);
 
         // Another key leaves it where it is…
-        assert_eq!(under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(5)), None);
+        assert_eq!(
+            under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(5)),
+            None
+        );
         assert!(root.path().join("cache.db").exists());
         // …and the key that wrote it takes it along, contents intact.
         assert_eq!(
@@ -534,7 +557,10 @@ mod tests {
 
         assert_eq!(current.total_size_bytes(), 0);
         assert_eq!(current.get("sftp://work/b.jpg", Some(1), Some(6)), None);
-        assert_eq!(under(root.path(), b"key-a").get("sftp://nas/a.jpg", Some(1), Some(6)), None);
+        assert_eq!(
+            under(root.path(), b"key-a").get("sftp://nas/a.jpg", Some(1), Some(6)),
+            None
+        );
         assert!(!root.path().join("cache.db").exists());
         assert!(!root.path().join("blobs").exists());
         // The open cache keeps working after the clear.

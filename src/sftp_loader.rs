@@ -300,8 +300,16 @@ mod tests {
         let b = loader.state.lock().unwrap().begin("sftp://host/b.jpg");
         loader.forget("sftp://host/a.jpg");
         let mut state = loader.state.lock().unwrap();
-        assert!(!state.settle("sftp://host/a.jpg".to_string(), a, Some(Bytes::from(vec![0u8]))));
-        assert!(state.settle("sftp://host/b.jpg".to_string(), b, Some(Bytes::from(vec![0u8]))));
+        assert!(!state.settle(
+            "sftp://host/a.jpg".to_string(),
+            a,
+            Some(Bytes::from(vec![0u8]))
+        ));
+        assert!(state.settle(
+            "sftp://host/b.jpg".to_string(),
+            b,
+            Some(Bytes::from(vec![0u8]))
+        ));
     }
 
     #[test]
@@ -316,12 +324,10 @@ mod tests {
     #[test]
     fn a_fragmented_uri_hits_the_entry_stored_bare() {
         let (loader, _rt) = make_loader();
-        loader
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .put("sftp://host/a.webp".to_string(), Bytes::from(vec![1u8, 2, 3]));
+        loader.state.lock().unwrap().cache.put(
+            "sftp://host/a.webp".to_string(),
+            Bytes::from(vec![1u8, 2, 3]),
+        );
         let ctx = egui::Context::default();
         // Without the shared key this would miss and fetch the file again.
         assert!(matches!(

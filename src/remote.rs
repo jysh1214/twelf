@@ -242,7 +242,10 @@ async fn list_remote_children(
             let name = entry.file_name();
             let is_dir = entry.metadata().is_dir();
             let Some(child_path) = child_path(path, &name) else {
-                crate::log!("skipping entry with unsafe name {name:?} in {}", path.display());
+                crate::log!(
+                    "skipping entry with unsafe name {name:?} in {}",
+                    path.display()
+                );
                 return None;
             };
             if is_dir
@@ -322,7 +325,12 @@ pub fn spawn_remote_search(
         let _ = tx.send(hits);
         ctx.request_repaint();
     });
-    RemoteSearchWalk { query, cancel, rx, hits: None }
+    RemoteSearchWalk {
+        query,
+        cancel,
+        rx,
+        hits: None,
+    }
 }
 
 /// Recursively walk `dir` over SFTP, keeping entries whose name contains
@@ -521,7 +529,13 @@ pub fn spawn_remote_download(
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
-    RemoteDownload { target, cancel, progress, rx, finished: false }
+    RemoteDownload {
+        target,
+        cancel,
+        progress,
+        rx,
+        finished: false,
+    }
 }
 
 /// Recursively copy `dir` (under `root`) to the local destination. Unfiltered —
@@ -550,7 +564,10 @@ async fn download_remote_dir(
     let entries = {
         // Hold a permit only for the round-trip, never across recursion — see
         // search_remote_dir for the permit-pool deadlock this avoids.
-        let _permit = sem.acquire().await.expect("download semaphore never closed");
+        let _permit = sem
+            .acquire()
+            .await
+            .expect("download semaphore never closed");
         match sftp.read_dir(dir.to_string_lossy().into_owned()).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -625,7 +642,10 @@ async fn download_file(
     }
     // The permit covers the whole transfer: the file is streamed, so it stays
     // in flight until its last chunk rather than for a single request.
-    let _permit = sem.acquire().await.expect("download semaphore never closed");
+    let _permit = sem
+        .acquire()
+        .await
+        .expect("download semaphore never closed");
     match stream_to_file(sftp, remote_file, local, overwrite, cancel, progress).await {
         Ok(FileOutcome::Written) => {
             progress.files.fetch_add(1, Ordering::Relaxed);
@@ -756,11 +776,26 @@ pub fn spawn_remote_file_download(
     runtime.spawn(async move {
         let sem = Semaphore::new(1);
         // The save dialog already asked about an existing file.
-        download_file(&sftp, &remote, &target_task, true, &cancel_task, &sem, &progress_task).await;
+        download_file(
+            &sftp,
+            &remote,
+            &target_task,
+            true,
+            &cancel_task,
+            &sem,
+            &progress_task,
+        )
+        .await;
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
-    RemoteDownload { target, cancel, progress, rx, finished: false }
+    RemoteDownload {
+        target,
+        cancel,
+        progress,
+        rx,
+        finished: false,
+    }
 }
 
 /// Local path a remote file lands at: `<dest>/<root name>/<path relative to root>`.
@@ -774,7 +809,6 @@ fn local_target(dest: &Path, root: &Path, remote_file: &Path) -> PathBuf {
     }
     out
 }
-
 
 /// Max concurrent in-flight SFTP ops while enumerating a delete target.
 const REMOTE_DELETE_CONCURRENCY: usize = 8;
@@ -845,8 +879,21 @@ impl RemoteDelete {
         let cancel = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
-        let probe = DeleteProbe { cancel: cancel.clone(), failed: failed.clone(), tx };
-        (Self { target: PathBuf::from(target), cancel, failed, rx, finished: false }, probe)
+        let probe = DeleteProbe {
+            cancel: cancel.clone(),
+            failed: failed.clone(),
+            tx,
+        };
+        (
+            Self {
+                target: PathBuf::from(target),
+                cancel,
+                failed,
+                rx,
+                finished: false,
+            },
+            probe,
+        )
     }
 }
 
@@ -897,7 +944,13 @@ pub fn spawn_remote_delete(
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
-    RemoteDelete { target, cancel, failed, rx, finished: false }
+    RemoteDelete {
+        target,
+        cancel,
+        failed,
+        rx,
+        finished: false,
+    }
 }
 
 /// Recursively list every path under `dir` (files and subdirectories, excluding
@@ -926,7 +979,10 @@ async fn collect_remote_paths(
         // Skipping leaves the entry in place, so the enclosing remove_dir fails
         // and the delete is reported as partial rather than reaching outside.
         let Some(child) = child_path(dir, &entry.file_name()) else {
-            crate::log!("refusing to delete entry with unsafe name {:?}", entry.file_name());
+            crate::log!(
+                "refusing to delete entry with unsafe name {:?}",
+                entry.file_name()
+            );
             return None;
         };
         Some(Box::pin(async move {
@@ -1005,11 +1061,19 @@ pub fn spawn_remote_rename(
     let old_str = old.to_string_lossy().into_owned();
     let new_str = new.to_string_lossy().into_owned();
     runtime.spawn(async move {
-        let res = sftp.rename(old_str, new_str).await.map_err(|e| e.to_string());
+        let res = sftp
+            .rename(old_str, new_str)
+            .await
+            .map_err(|e| e.to_string());
         let _ = tx.send(res);
         ctx_task.request_repaint();
     });
-    RemoteRename { target: old, renamed: new, rx, result: None }
+    RemoteRename {
+        target: old,
+        renamed: new,
+        rx,
+        result: None,
+    }
 }
 
 /// URIs the Load action prefetches: every image under the loaded children, as
@@ -1124,7 +1188,7 @@ pub fn render_remote_tree(
                 RemoteDirChildren::Error(msg) => {
                     ui.colored_label(egui::Color32::RED, msg.as_str());
                 }
-                });
+            });
             let children_ref: &RemoteDirChildren = &*children;
             collapsing.header_response.context_menu(|ui| {
                 // Saves this folder as the root of a future connection — deep
@@ -1180,12 +1244,24 @@ mod tests {
     fn child_path_rejects_names_that_escape_the_directory() {
         let dir = Path::new("/photos/trip");
         // Ordinary names — including ones with spaces and dots — join normally.
-        assert_eq!(child_path(dir, "a.jpg"), Some(PathBuf::from("/photos/trip/a.jpg")));
-        assert_eq!(child_path(dir, "my photo.jpg"), Some(PathBuf::from("/photos/trip/my photo.jpg")));
-        assert_eq!(child_path(dir, ".hidden"), Some(PathBuf::from("/photos/trip/.hidden")));
+        assert_eq!(
+            child_path(dir, "a.jpg"),
+            Some(PathBuf::from("/photos/trip/a.jpg"))
+        );
+        assert_eq!(
+            child_path(dir, "my photo.jpg"),
+            Some(PathBuf::from("/photos/trip/my photo.jpg"))
+        );
+        assert_eq!(
+            child_path(dir, ".hidden"),
+            Some(PathBuf::from("/photos/trip/.hidden"))
+        );
         // Traversal, absolute, and nested names would all escape `dir` via push.
         assert_eq!(child_path(dir, ".."), None);
-        assert_eq!(child_path(dir, "../../.config/autostart/evil.desktop"), None);
+        assert_eq!(
+            child_path(dir, "../../.config/autostart/evil.desktop"),
+            None
+        );
         assert_eq!(child_path(dir, "/etc/cron.d/evil"), None);
         assert_eq!(child_path(dir, "sub/a.jpg"), None);
         // Degenerate names contribute no component at all.
@@ -1260,7 +1336,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let cancel = AtomicBool::new(cancelled);
         let progress = DownloadProgress::default();
-        let outcome = rt.block_on(stage_into_place(remote, local, overwrite, &cancel, &progress));
+        let outcome = rt.block_on(stage_into_place(
+            remote, local, overwrite, &cancel, &progress,
+        ));
         (outcome, progress)
     }
 
@@ -1279,7 +1357,9 @@ mod tests {
     fn a_transfer_that_fails_midway_leaves_no_staging_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let local = dir.path().join("video.mkv");
-        let mut remote = DroppedConnection { head: Some(b"first chunk".to_vec()) };
+        let mut remote = DroppedConnection {
+            head: Some(b"first chunk".to_vec()),
+        };
         let (outcome, _) = stage(&mut remote, &local, false, false);
         assert!(outcome.is_err());
         // Neither a half-written target nor the `.part` it was staged in.
@@ -1430,7 +1510,10 @@ mod tests {
             (PathBuf::from("/trip/sub"), true),
             (PathBuf::from("/trip/sub/b.png"), false),
         ];
-        let order: Vec<PathBuf> = deletion_order(entries).into_iter().map(|(p, _)| p).collect();
+        let order: Vec<PathBuf> = deletion_order(entries)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         let pos = |s: &str| order.iter().position(|p| p == Path::new(s)).unwrap();
         // Every entry is removed before its parent directory…
         assert!(pos("/trip/sub/b.png") < pos("/trip/sub"));
@@ -1447,7 +1530,9 @@ mod tests {
         assert!(root.apply_listing(Path::new("/r/sub"), Ok(vec![rfile("/r/sub/a.jpg")])));
         // The listing lands one level down; the root keeps its own children.
         assert_eq!(loaded_child_paths(&root), vec!["/r/sub"]);
-        let RemoteNodeKind::Dir { children: RemoteDirChildren::Loaded(c) } = &root.kind
+        let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &root.kind
         else {
             unreachable!()
         };
@@ -1460,13 +1545,17 @@ mod tests {
         assert!(root.reload(Path::new("/r/sub")));
         // Only the named subfolder is dropped; the root keeps its listing.
         assert_eq!(loaded_child_paths(&root), vec!["/r/sub"]);
-        let RemoteNodeKind::Dir { children: RemoteDirChildren::Loaded(c) } = &root.kind
+        let RemoteNodeKind::Dir {
+            children: RemoteDirChildren::Loaded(c),
+        } = &root.kind
         else {
             unreachable!()
         };
         assert!(matches!(
             c[0].kind,
-            RemoteNodeKind::Dir { children: RemoteDirChildren::Unloaded }
+            RemoteNodeKind::Dir {
+                children: RemoteDirChildren::Unloaded
+            }
         ));
     }
 }

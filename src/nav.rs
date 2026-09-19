@@ -15,23 +15,38 @@ mod tests {
     use super::*;
 
     fn list() -> Vec<PathBuf> {
-        ["a.jpg", "b.jpg", "c.jpg"].iter().map(PathBuf::from).collect()
+        ["a.jpg", "b.jpg", "c.jpg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
     }
 
     #[test]
     fn steps_forward_and_backward() {
         let l = list();
-        assert_eq!(navigate(&l, Path::new("a.jpg"), 1), Some(PathBuf::from("b.jpg")));
-        assert_eq!(navigate(&l, Path::new("b.jpg"), -1), Some(PathBuf::from("a.jpg")));
+        assert_eq!(
+            navigate(&l, Path::new("a.jpg"), 1),
+            Some(PathBuf::from("b.jpg"))
+        );
+        assert_eq!(
+            navigate(&l, Path::new("b.jpg"), -1),
+            Some(PathBuf::from("a.jpg"))
+        );
     }
 
     #[test]
     fn wraps_around_both_ends() {
         let l = list();
         // Past the end wraps to the start…
-        assert_eq!(navigate(&l, Path::new("c.jpg"), 1), Some(PathBuf::from("a.jpg")));
+        assert_eq!(
+            navigate(&l, Path::new("c.jpg"), 1),
+            Some(PathBuf::from("a.jpg"))
+        );
         // …and before the start wraps to the end (negative rem_euclid, not `%`).
-        assert_eq!(navigate(&l, Path::new("a.jpg"), -1), Some(PathBuf::from("c.jpg")));
+        assert_eq!(
+            navigate(&l, Path::new("a.jpg"), -1),
+            Some(PathBuf::from("c.jpg"))
+        );
     }
 
     #[test]

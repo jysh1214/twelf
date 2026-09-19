@@ -94,25 +94,39 @@ pub struct Loaded {
 pub fn load() -> Loaded {
     match config_path() {
         Some(path) => load_from(&path),
-        None => Loaded { config: Config::default(), problem: None },
+        None => Loaded {
+            config: Config::default(),
+            problem: None,
+        },
     }
 }
 
 fn load_from(path: &Path) -> Loaded {
     let problem = match std::fs::read_to_string(path) {
         Ok(contents) => match toml::from_str(&contents) {
-            Ok(config) => return Loaded { config, problem: None },
+            Ok(config) => {
+                return Loaded {
+                    config,
+                    problem: None,
+                };
+            }
             // The message alone: the full Display adds a multi-line excerpt
             // that the one-line status bar cannot show.
             Err(e) => e.message().to_string(),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Loaded { config: Config::default(), problem: None };
+            return Loaded {
+                config: Config::default(),
+                problem: None,
+            };
         }
         Err(e) => e.to_string(),
     };
     crate::log!("not using {}: {problem}", path.display());
-    Loaded { config: Config::default(), problem: Some(problem) }
+    Loaded {
+        config: Config::default(),
+        problem: Some(problem),
+    }
 }
 
 /// Write the config. `set_aside_existing` is for a file `load` could not use:
@@ -132,8 +146,13 @@ fn save_to(path: &Path, config: &Config, set_aside_existing: bool) -> Result<(),
         toml::to_string(config).map_err(|e| format!("failed to serialize config: {e}"))?;
     if set_aside_existing && path.exists() {
         let bad = with_suffix(path, ".bad");
-        std::fs::rename(path, &bad)
-            .map_err(|e| format!("failed to keep {} as {}: {e}", path.display(), bad.display()))?;
+        std::fs::rename(path, &bad).map_err(|e| {
+            format!(
+                "failed to keep {} as {}: {e}",
+                path.display(),
+                bad.display()
+            )
+        })?;
     }
     // Written beside the target and renamed over it, so a crash or a full disk
     // mid-write leaves the old file rather than a truncated one — which the next
@@ -221,7 +240,10 @@ mod tests {
     }
 
     fn sample() -> Config {
-        Config { ssh: SshSettings::default(), favorites: vec![favorite("nas", "/photos")] }
+        Config {
+            ssh: SshSettings::default(),
+            favorites: vec![favorite("nas", "/photos")],
+        }
     }
 
     #[test]
@@ -246,7 +268,10 @@ mod tests {
 
         // Saving the defaults it fell back to must not cost the user the file.
         save_to(&path, &loaded.config, true).expect("save");
-        assert_eq!(std::fs::read_to_string(with_suffix(&path, ".bad")).unwrap(), hand_edited);
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&path, ".bad")).unwrap(),
+            hand_edited
+        );
         assert!(load_from(&path).problem.is_none());
     }
 

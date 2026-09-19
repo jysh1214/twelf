@@ -142,10 +142,7 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
     if !auth.success() {
         return Err("authentication failed".to_string());
     }
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(stringify)?;
+    let channel = session.channel_open_session().await.map_err(stringify)?;
     channel
         .request_subsystem(true, "sftp")
         .await
@@ -190,7 +187,9 @@ pub fn parse_port(text: &str) -> Result<u16, String> {
     }
     match text.parse::<u16>() {
         Ok(port) if port != 0 => Ok(port),
-        _ => Err(format!("Port must be a number from 1 to 65535, not {text:?}")),
+        _ => Err(format!(
+            "Port must be a number from 1 to 65535, not {text:?}"
+        )),
     }
 }
 
@@ -229,7 +228,10 @@ mod tests {
         assert_eq!(expand_home("~user/key"), PathBuf::from("~user/key"));
         // "~/" expands against $HOME.
         if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(expand_home("~/.ssh/id"), PathBuf::from(home).join(".ssh/id"));
+            assert_eq!(
+                expand_home("~/.ssh/id"),
+                PathBuf::from(home).join(".ssh/id")
+            );
         }
     }
 
@@ -250,7 +252,10 @@ mod tests {
     fn dialog_defaults_blank_port_to_22() {
         let blank = config::SshSettings::default();
         assert_eq!(ConnectDialog::from_settings(blank).port, "22");
-        let set = config::SshSettings { port: "2222".to_string(), ..Default::default() };
+        let set = config::SshSettings {
+            port: "2222".to_string(),
+            ..Default::default()
+        };
         assert_eq!(ConnectDialog::from_settings(set).port, "2222");
     }
 }

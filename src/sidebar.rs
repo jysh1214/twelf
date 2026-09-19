@@ -43,7 +43,11 @@ enum SearchKind {
 
 impl SearchHit {
     pub(crate) fn file(path: PathBuf, name: String) -> Self {
-        SearchHit { path, name, kind: SearchKind::File }
+        SearchHit {
+            path,
+            name,
+            kind: SearchKind::File,
+        }
     }
 
     /// Build a directory hit, applying the keep rule: a folder is kept if its
@@ -60,7 +64,11 @@ impl SearchHit {
         children: Vec<SearchHit>,
     ) -> Option<Self> {
         if matched || keep_all || !children.is_empty() {
-            Some(SearchHit { path, name, kind: SearchKind::Dir { children, matched } })
+            Some(SearchHit {
+                path,
+                name,
+                kind: SearchKind::Dir { children, matched },
+            })
         } else {
             None
         }
@@ -73,7 +81,9 @@ impl TreeNode {
         Self {
             path,
             name,
-            kind: NodeKind::Dir { children: DirChildren::Unloaded },
+            kind: NodeKind::Dir {
+                children: DirChildren::Unloaded,
+            },
         }
     }
 
@@ -93,7 +103,9 @@ impl TreeNode {
     fn collect_images_into(&self, out: &mut Vec<PathBuf>) {
         match &self.kind {
             NodeKind::File => out.push(self.path.clone()),
-            NodeKind::Dir { children: DirChildren::Loaded(children) } => {
+            NodeKind::Dir {
+                children: DirChildren::Loaded(children),
+            } => {
                 for child in children {
                     child.collect_images_into(out);
                 }
@@ -106,7 +118,10 @@ impl TreeNode {
     /// found. A folder whose children aren't loaded (or a path not present) is a
     /// no-op — it isn't on screen to remove.
     pub fn remove_path(&mut self, target: &Path) -> bool {
-        let NodeKind::Dir { children: DirChildren::Loaded(children) } = &mut self.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut self.kind
+        else {
             return false;
         };
         if let Some(pos) = children.iter().position(|c| c.path == target) {
@@ -135,7 +150,10 @@ impl TreeNode {
         if !target.starts_with(&self.path) {
             return false;
         }
-        let NodeKind::Dir { children: DirChildren::Loaded(children) } = &mut self.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut self.kind
+        else {
             return false;
         };
         for child in children {
@@ -152,7 +170,9 @@ impl TreeNode {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let kind = if path.is_dir() {
-            NodeKind::Dir { children: DirChildren::Unloaded }
+            NodeKind::Dir {
+                children: DirChildren::Unloaded,
+            }
         } else {
             NodeKind::File
         };
@@ -665,16 +685,16 @@ mod tests {
     fn dir_constructor_stores_the_matched_flag() {
         let matched = SearchHit::dir(PathBuf::from("/x"), "x".to_string(), true, false, vec![])
             .expect("matched folder is kept");
-        assert!(matches!(matched.kind, SearchKind::Dir { matched: true, .. }));
-        let scaffolding = SearchHit::dir(
-            PathBuf::from("/x"),
-            "x".to_string(),
-            false,
-            true,
-            vec![],
-        )
-        .expect("keep_all folder is kept");
-        assert!(matches!(scaffolding.kind, SearchKind::Dir { matched: false, .. }));
+        assert!(matches!(
+            matched.kind,
+            SearchKind::Dir { matched: true, .. }
+        ));
+        let scaffolding = SearchHit::dir(PathBuf::from("/x"), "x".to_string(), false, true, vec![])
+            .expect("keep_all folder is kept");
+        assert!(matches!(
+            scaffolding.kind,
+            SearchKind::Dir { matched: false, .. }
+        ));
     }
 
     #[test]
@@ -684,22 +704,28 @@ mod tests {
     }
 
     fn file_node(path: &str) -> TreeNode {
-        TreeNode { path: PathBuf::from(path), name: path.to_string(), kind: NodeKind::File }
+        TreeNode {
+            path: PathBuf::from(path),
+            name: path.to_string(),
+            kind: NodeKind::File,
+        }
     }
 
     fn dir_node(path: &str, children: Vec<TreeNode>) -> TreeNode {
         TreeNode {
             path: PathBuf::from(path),
             name: path.to_string(),
-            kind: NodeKind::Dir { children: DirChildren::Loaded(children) },
+            kind: NodeKind::Dir {
+                children: DirChildren::Loaded(children),
+            },
         }
     }
 
     fn child_paths(node: &TreeNode) -> Vec<String> {
         match &node.kind {
-            NodeKind::Dir { children: DirChildren::Loaded(c) } => {
-                c.iter().map(|n| n.path.display().to_string()).collect()
-            }
+            NodeKind::Dir {
+                children: DirChildren::Loaded(c),
+            } => c.iter().map(|n| n.path.display().to_string()).collect(),
             _ => Vec::new(),
         }
     }
@@ -728,7 +754,10 @@ mod tests {
             )],
         );
         assert!(root.remove_path(Path::new("/r/sub/b.png")));
-        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(c),
+        } = &root.kind
+        else {
             unreachable!()
         };
         assert_eq!(child_paths(&c[0]), vec!["/r/sub/c.png"]);
@@ -747,13 +776,24 @@ mod tests {
 
     #[test]
     fn reload_resets_loaded_dir_and_noops_otherwise() {
-        let mut root = dir_node("/r", vec![dir_node("/r/sub", vec![file_node("/r/sub/a.jpg")])]);
+        let mut root = dir_node(
+            "/r",
+            vec![dir_node("/r/sub", vec![file_node("/r/sub/a.jpg")])],
+        );
         // Re-list a loaded subdir: it drops to Unloaded (re-read next render).
         assert!(root.reload(Path::new("/r/sub")));
-        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(c),
+        } = &root.kind
+        else {
             unreachable!()
         };
-        assert!(matches!(c[0].kind, NodeKind::Dir { children: DirChildren::Unloaded }));
+        assert!(matches!(
+            c[0].kind,
+            NodeKind::Dir {
+                children: DirChildren::Unloaded
+            }
+        ));
 
         // Absent path and not-yet-loaded folder are no-ops.
         assert!(!root.reload(Path::new("/r/zzz")));
@@ -781,16 +821,29 @@ mod tests {
     #[test]
     fn reload_retries_a_folder_whose_listing_failed() {
         let mut root = dir_node("/r", vec![dir_node("/r/sub", Vec::new())]);
-        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &mut root.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(c),
+        } = &mut root.kind
+        else {
             unreachable!()
         };
-        c[0].kind = NodeKind::Dir { children: DirChildren::Error("denied".to_string()) };
+        c[0].kind = NodeKind::Dir {
+            children: DirChildren::Error("denied".to_string()),
+        };
         // A watcher event for the folder gives the listing another go.
         assert!(root.reload(Path::new("/r/sub")));
-        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(c),
+        } = &root.kind
+        else {
             unreachable!()
         };
-        assert!(matches!(c[0].kind, NodeKind::Dir { children: DirChildren::Unloaded }));
+        assert!(matches!(
+            c[0].kind,
+            NodeKind::Dir {
+                children: DirChildren::Unloaded
+            }
+        ));
     }
 
     #[test]
@@ -838,8 +891,14 @@ mod tests {
                 });
             });
         }
-        assert!(offset.x.abs() < 0.5, "tree shifted horizontally: {offset:?}");
-        assert!(offset.y > 0.0, "row 40 is off-screen, so it must scroll vertically");
+        assert!(
+            offset.x.abs() < 0.5,
+            "tree shifted horizontally: {offset:?}"
+        );
+        assert!(
+            offset.y > 0.0,
+            "row 40 is off-screen, so it must scroll vertically"
+        );
     }
 
     #[test]

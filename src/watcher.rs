@@ -19,32 +19,37 @@ impl FsWatcher {
     pub fn spawn(root: &std::path::Path, ctx: &egui::Context) -> Option<Self> {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let _ = tx.send(res);
                 // The app may be idle; without this the change sits unseen
                 // until the next input-driven repaint.
                 ctx.request_repaint();
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                crate::log!("failed to create fs watcher: {e}");
-                return None;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    crate::log!("failed to create fs watcher: {e}");
+                    return None;
+                }
+            };
         if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
             crate::log!("failed to watch {}: {e}", root.display());
             return None;
         }
-        Some(Self { _watcher: watcher, rx })
+        Some(Self {
+            _watcher: watcher,
+            rx,
+        })
     }
 
     /// Drain pending events into the (deduplicated) directories whose listing
     /// changed, plus the old→new pair of every paired rename among them.
     /// Non-blocking; empty when nothing happened.
     pub fn drain_changes(&self) -> Changes {
-        let mut changes = Changes { dirs: Vec::new(), renames: Vec::new() };
+        let mut changes = Changes {
+            dirs: Vec::new(),
+            renames: Vec::new(),
+        };
         for res in self.rx.try_iter() {
             match res {
                 Ok(event) => {
@@ -217,8 +222,8 @@ mod tests {
 
     #[test]
     fn rootless_path_contributes_nothing() {
-        let event = notify::Event::new(EventKind::Create(CreateKind::File))
-            .add_path(PathBuf::from("/"));
+        let event =
+            notify::Event::new(EventKind::Create(CreateKind::File)).add_path(PathBuf::from("/"));
         assert_eq!(dirs_for(&[event]), Vec::<PathBuf>::new());
         assert_eq!(Path::new("/").parent(), None);
     }

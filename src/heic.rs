@@ -51,7 +51,10 @@ impl ImageLoader for HeicLoader {
             }
         };
         let arc = Arc::new(image);
-        self.cache.lock().unwrap().insert(uri.to_owned(), arc.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(uri.to_owned(), arc.clone());
         Ok(ImagePoll::Ready { image: arc })
     }
 
@@ -107,10 +110,7 @@ fn heif_to_image(ctx: &HeifContext) -> Result<ColorImage, libheif_rs::HeifError>
         let start = y * stride;
         pixels.extend_from_slice(&plane.data[start..start + row_bytes]);
     }
-    Ok(ColorImage::from_rgba_unmultiplied(
-        [width, height],
-        &pixels,
-    ))
+    Ok(ColorImage::from_rgba_unmultiplied([width, height], &pixels))
 }
 
 #[cfg(test)]
