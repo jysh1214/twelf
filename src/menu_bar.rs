@@ -55,7 +55,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                 }
             });
             if let Some(attempt) = &app.connecting {
-                ui.label(format!("Connecting to {}…", attempt.target));
+                ui.label(format!("Connecting to {}…", attempt.request.target()));
                 if ui.small_button("Cancel").clicked() {
                     cancel_connect = true;
                 }

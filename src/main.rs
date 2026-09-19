@@ -85,6 +85,16 @@ struct PendingDelete {
     error: Option<String>,
 }
 
+/// A connection held up on the user: the server's key is in no known_hosts
+/// file, so they are shown its fingerprint and asked. `request` is what to
+/// retry once the key is trusted.
+struct PendingHostKey {
+    request: ssh::ConnectRequest,
+    key: russh::keys::PublicKey,
+    /// Why recording the key failed, if it did.
+    error: Option<String>,
+}
+
 /// A rename in progress: the target, the backend, the editable new-name buffer,
 /// a one-shot focus flag, and any error to show in the dialog.
 struct PendingRename {
@@ -130,6 +140,7 @@ struct TwelfApp {
     detached_deletes: Vec<remote::RemoteDelete>,
     pending_delete: Option<PendingDelete>,
     pending_rename: Option<PendingRename>,
+    pending_host_key: Option<PendingHostKey>,
     remote_rename: Option<remote::RemoteRename>,
     remote_listings_tx: tokio::sync::mpsc::Sender<remote::ListingResult>,
     remote_listings_rx: tokio::sync::mpsc::Receiver<remote::ListingResult>,
@@ -201,6 +212,7 @@ impl TwelfApp {
             detached_deletes: Vec::new(),
             pending_delete: None,
             pending_rename: None,
+            pending_host_key: None,
             remote_rename: None,
             remote_listings_tx,
             remote_listings_rx,
@@ -393,7 +405,12 @@ impl TwelfApp {
     /// worth keeping: a working connection used to be torn down the moment
     /// Connect was clicked, so a typo in the host lost its expanded tree, and
     /// the failed attempt then cleared what was left.
-    fn finish_connect(&mut self, target: &str, result: ssh::ConnectResult, ctx: &egui::Context) {
+    fn finish_connect(
+        &mut self,
+        request: ssh::ConnectRequest,
+        result: ssh::ConnectResult,
+        ctx: &egui::Context,
+    ) {
         match result {
             Ok((session, info)) => {
                 self.leave_remote_session(ctx);
@@ -408,12 +425,80 @@ impl TwelfApp {
                     .spawn_blocking(move || cache.initialize(&key_path));
                 self.ssh = ssh::SshState::Connected { session, info };
             }
-            Err(error) if matches!(self.ssh, ssh::SshState::Connected { .. }) => {
+            // Not a failure yet: ask, and retry if the key is trusted.
+            Err(ssh::ConnectError::UnknownHostKey { key }) => {
+                self.pending_host_key = Some(PendingHostKey {
+                    request,
+                    key,
+                    error: None,
+                });
+            }
+            Err(ssh::ConnectError::Other(error))
+                if matches!(self.ssh, ssh::SshState::Connected { .. }) =>
+            {
                 self.status_message = Some(status_bar::Message::error(format!(
-                    "Could not connect to {target}: {error}"
+                    "Could not connect to {}: {error}",
+                    request.target()
                 )));
             }
-            Err(error) => self.ssh = ssh::SshState::Failed { error },
+            Err(ssh::ConnectError::Other(error)) => self.ssh = ssh::SshState::Failed { error },
+        }
+    }
+
+    /// Ask about a server key no known_hosts file has. Trusting it records it in
+    /// the app's own list and connects again; anything else drops the attempt.
+    fn host_key_prompt(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_host_key else {
+            return;
+        };
+        let mut open = true;
+        let mut trust = false;
+        let mut cancel = false;
+        egui::Window::new("Unknown host key")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{}:{} is not in ~/.ssh/known_hosts, and has not been trusted here before.",
+                    pending.request.host, pending.request.port
+                ));
+                ui.label("Its key is:");
+                ui.monospace(ssh::fingerprint(&pending.key));
+                ui.label(
+                    "Trust it only if this is the fingerprint the server itself reports \
+                     (ssh-keygen -lf on its host key). Anyone able to answer on that \
+                     address could be presenting this one.",
+                );
+                if let Some(err) = &pending.error {
+                    ui.colored_label(egui::Color32::RED, err.as_str());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Trust and connect").clicked() {
+                        trust = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if trust && let Some(mut pending) = self.pending_host_key.take() {
+            let request = &pending.request;
+            match ssh::trust_host_key(&request.host, request.port, &pending.key) {
+                Ok(()) => {
+                    self.connecting = Some(ssh::ConnectAttempt::spawn(
+                        pending.request,
+                        &self.runtime,
+                        ctx,
+                    ));
+                }
+                Err(e) => {
+                    pending.error = Some(e);
+                    self.pending_host_key = Some(pending);
+                }
+            }
+        } else if cancel || !open {
+            self.pending_host_key = None;
         }
     }
 
@@ -778,7 +863,7 @@ impl eframe::App for TwelfApp {
         if let Some(result) = self.connecting.as_mut().and_then(|attempt| attempt.poll())
             && let Some(attempt) = self.connecting.take()
         {
-            self.finish_connect(&attempt.target, result, ctx);
+            self.finish_connect(attempt.request.clone(), result, ctx);
         }
 
         // Periodic remote refresh: merge finished poll listings into the tree
@@ -1002,8 +1087,10 @@ impl eframe::App for TwelfApp {
             };
             // Replacing an attempt still in flight drops it, which abandons it.
             self.connecting = Some(ssh::ConnectAttempt::spawn(req, &self.runtime, ctx));
+            self.pending_host_key = None;
             self.ssh_dialog.open = false;
         }
+        self.host_key_prompt(ctx);
         // Delete confirmation. A right-click Delete in either tree parks its
         // target in `pending_delete`; nothing is removed until Confirm here.
         let mut confirm_delete = false;
@@ -1669,6 +1756,39 @@ mod tests {
         assert!(app.remote_rename.is_none());
     }
 
+    fn request() -> ssh::ConnectRequest {
+        ssh::ConnectRequest {
+            host: "nas".to_string(),
+            port: 22,
+            user: "alex".to_string(),
+            key_path: "~/.ssh/id".to_string(),
+            root: "/photos".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_host_key_is_a_question_not_a_failure() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        app.status_message = None;
+        let key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDas5exaMxO62/EkqANCSvgMPxGV3gACEVvq2yzyf7p+",
+        )
+        .expect("test key");
+        app.finish_connect(
+            request(),
+            Err(ssh::ConnectError::UnknownHostKey { key: key.clone() }),
+            &ctx,
+        );
+        // Held for the prompt, with what is needed to try again…
+        let pending = app.pending_host_key.as_ref().expect("prompt pending");
+        assert_eq!(pending.request.target(), "alex@nas:22");
+        assert_eq!(pending.key, key);
+        // …and nothing is reported as having gone wrong.
+        assert!(matches!(app.ssh, ssh::SshState::Disconnected));
+        assert_eq!(app.status_message, None);
+    }
+
     #[test]
     fn a_failed_connect_with_no_session_to_keep_reports_in_the_menu_bar() {
         let ctx = egui::Context::default();
@@ -1678,8 +1798,10 @@ mod tests {
         app.search_active = true;
         app.search_query = "trip".to_string();
         app.finish_connect(
-            "alex@nas:22",
-            Err("no connection after 20 s".to_string()),
+            request(),
+            Err(ssh::ConnectError::Other(
+                "no connection after 20 s".to_string(),
+            )),
             &ctx,
         );
         assert!(matches!(

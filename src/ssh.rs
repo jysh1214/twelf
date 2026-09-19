@@ -1,10 +1,11 @@
 use crate::config;
 use eframe::egui;
 use russh::client::{self, Handler};
-use russh::keys::{PrivateKeyWithHashAlg, PublicKey, load_secret_key};
+use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 use russh_sftp::client::SftpSession;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub enum SshState {
@@ -28,6 +29,7 @@ pub struct ConnInfo {
     pub key_path: String,
 }
 
+#[derive(Clone)]
 pub struct ConnectRequest {
     pub host: String,
     pub port: u16,
@@ -36,7 +38,29 @@ pub struct ConnectRequest {
     pub root: String,
 }
 
-pub type ConnectResult = Result<(Arc<SftpSession>, ConnInfo), String>;
+impl ConnectRequest {
+    /// `user@host:port`, for the menu bar and a failure message.
+    pub fn target(&self) -> String {
+        format!("{}@{}:{}", self.user, self.host, self.port)
+    }
+}
+
+pub enum ConnectError {
+    /// The server's key is in no known_hosts file. Not a failure to report but
+    /// a question to put to the user, who may trust the key and try again.
+    UnknownHostKey {
+        key: PublicKey,
+    },
+    Other(String),
+}
+
+impl From<String> for ConnectError {
+    fn from(message: String) -> Self {
+        ConnectError::Other(message)
+    }
+}
+
+pub type ConnectResult = Result<(Arc<SftpSession>, ConnInfo), ConnectError>;
 
 /// How long a connection attempt may take. russh sets no deadline of its own: a
 /// black-holed address held "Connecting…" for the OS's SYN timeout of about two
@@ -49,8 +73,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// should cost nothing but the wait. Dropping the attempt abandons it, which is
 /// both the Cancel button and what a second Connect click does to the first.
 pub struct ConnectAttempt {
-    /// `user@host:port`, for the menu bar and a failure message.
-    pub target: String,
+    /// What is being attempted: named in the menu bar, and needed again if the
+    /// user has to be asked about the host key first.
+    pub request: ConnectRequest,
     rx: tokio::sync::mpsc::Receiver<ConnectResult>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -61,15 +86,15 @@ impl ConnectAttempt {
         runtime: &tokio::runtime::Runtime,
         ctx: &egui::Context,
     ) -> Self {
-        let target = format!("{}@{}:{}", req.user, req.host, req.port);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let ctx = ctx.clone();
+        let request = req.clone();
         let task = runtime.spawn(async move {
             let result = connect(req).await;
             let _ = tx.send(result).await;
             ctx.request_repaint();
         });
-        Self { target, rx, task }
+        Self { request, rx, task }
     }
 
     /// The outcome, once it is in (non-blocking).
@@ -149,27 +174,115 @@ impl ConnectDialog {
     }
 }
 
-// MVP shortcut: accept any server key. Tightening to TOFU / known-hosts is deferred.
-struct AcceptAnyHostKey;
+/// What the known_hosts files say about a server's key.
+#[derive(Debug, PartialEq)]
+enum HostKeyVerdict {
+    Trusted,
+    /// No file has a key of this type for the host.
+    Unknown,
+    /// A file has a different key of the same type: the server was reinstalled,
+    /// or something is answering in its place.
+    Changed {
+        file: PathBuf,
+        line: usize,
+    },
+}
 
-impl Handler for AcceptAnyHostKey {
+/// The files a server key is looked up in: the user's own OpenSSH list, so a
+/// host they have already ssh'd into needs no asking, then the keys accepted
+/// from inside the app. Only the second is ever written to.
+fn known_hosts_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        files.push(PathBuf::from(home).join(".ssh").join("known_hosts"));
+    }
+    files.extend(app_known_hosts());
+    files
+}
+
+fn app_known_hosts() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("twelf").join("known_hosts"))
+}
+
+/// Judge `key` against every file as one list, the way OpenSSH reads its
+/// `UserKnownHostsFile`s: a match anywhere is trust. russh's own
+/// `check_known_hosts_path` gives up at the first line that differs, so a host
+/// with its old and its new key both recorded would be refused.
+fn judge_host_key(host: &str, port: u16, key: &PublicKey, files: &[PathBuf]) -> HostKeyVerdict {
+    let mut verdict = HostKeyVerdict::Unknown;
+    for file in files {
+        // An unreadable file, or one whose line for this host does not parse,
+        // vouches for nothing.
+        let Ok(recorded) = known_host_keys_path(host, port, file) else {
+            crate::log!("could not read host keys from {}", file.display());
+            continue;
+        };
+        if recorded.iter().any(|(_, k)| k == key) {
+            return HostKeyVerdict::Trusted;
+        }
+        if verdict == HostKeyVerdict::Unknown
+            && let Some((line, _)) = recorded
+                .iter()
+                .find(|(_, k)| k.algorithm() == key.algorithm())
+        {
+            verdict = HostKeyVerdict::Changed {
+                file: file.clone(),
+                line: *line,
+            };
+        }
+    }
+    verdict
+}
+
+/// How a key is shown to the user: its type and SHA-256 fingerprint, the form
+/// `ssh-keygen -lf` prints for comparison.
+pub fn fingerprint(key: &PublicKey) -> String {
+    format!("{} {}", key.algorithm(), key.fingerprint(HashAlg::Sha256))
+}
+
+/// Record `key` as the one to expect from `host`, in the app's own list.
+pub fn trust_host_key(host: &str, port: u16, key: &PublicKey) -> Result<(), String> {
+    let file = app_known_hosts().ok_or_else(|| "no config directory available".to_string())?;
+    learn_known_hosts_path(host, port, key, &file)
+        .map_err(|e| format!("failed to write {}: {e}", file.display()))
+}
+
+/// Accepts the server only when its key is already trusted. Anything else is
+/// turned down and the reason left in `rejected`, since russh reports every
+/// refusal as the same "unknown key".
+///
+/// Until now every key was accepted: whoever answered on the port was taken for
+/// the server, and could feed the image and video decoders whatever it liked.
+struct VerifyHostKey {
+    host: String,
+    port: u16,
+    files: Vec<PathBuf>,
+    rejected: Arc<Mutex<Option<(HostKeyVerdict, PublicKey)>>>,
+}
+
+impl Handler for VerifyHostKey {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let verdict = judge_host_key(&self.host, self.port, server_public_key, &self.files);
+        if verdict == HostKeyVerdict::Trusted {
+            return Ok(true);
+        }
+        *self.rejected.lock().unwrap() = Some((verdict, server_public_key.clone()));
+        Ok(false)
     }
 }
 
 pub async fn connect(req: ConnectRequest) -> ConnectResult {
     match tokio::time::timeout(CONNECT_TIMEOUT, establish(req)).await {
         Ok(result) => result,
-        Err(_) => Err(format!(
+        Err(_) => Err(ConnectError::Other(format!(
             "no connection after {} s",
             CONNECT_TIMEOUT.as_secs()
-        )),
+        ))),
     }
 }
 
@@ -177,9 +290,34 @@ async fn establish(req: ConnectRequest) -> ConnectResult {
     let key_path = expand_home(&req.key_path);
     let private_key = load_secret_key(&key_path, None).map_err(stringify)?;
     let config = Arc::new(client::Config::default());
-    let mut session = client::connect(config, (req.host.as_str(), req.port), AcceptAnyHostKey)
-        .await
-        .map_err(stringify)?;
+    let rejected = Arc::new(Mutex::new(None));
+    let handler = VerifyHostKey {
+        host: req.host.clone(),
+        port: req.port,
+        files: known_hosts_files(),
+        rejected: rejected.clone(),
+    };
+    let connected = client::connect(config, (req.host.as_str(), req.port), handler).await;
+    let mut session = match connected {
+        Ok(session) => session,
+        Err(e) => {
+            return Err(match rejected.lock().unwrap().take() {
+                Some((HostKeyVerdict::Changed { file, line }, key)) => {
+                    ConnectError::Other(format!(
+                        "the host key of {}:{} ({}) does not match line {line} of {}. \
+                         Refusing to connect; if the server's key really changed, \
+                         remove that line",
+                        req.host,
+                        req.port,
+                        fingerprint(&key),
+                        file.display()
+                    ))
+                }
+                Some((_, key)) => ConnectError::UnknownHostKey { key },
+                None => ConnectError::Other(stringify(e)),
+            });
+        }
+    };
     // An RSA key has to be told which hash to sign with, and `None` means the
     // legacy SHA-1 `ssh-rsa` that OpenSSH 8.8+ refuses — so ask the server what
     // it takes. Only RSA pays for the question: it can wait up to a second for
@@ -199,7 +337,7 @@ async fn establish(req: ConnectRequest) -> ConnectResult {
         .await
         .map_err(stringify)?;
     if !auth.success() {
-        return Err("authentication failed".to_string());
+        return Err("authentication failed".to_string().into());
     }
     let channel = session.channel_open_session().await.map_err(stringify)?;
     channel
@@ -307,6 +445,87 @@ mod tests {
         }
     }
 
+    // Throwaway keys generated for these tests; the private halves are gone.
+    const ED25519_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDas5exaMxO62/EkqANCSvgMPxGV3gACEVvq2yzyf7p+";
+    const ED25519_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICZpAzz8DgzrQtWCSXpCQ1L+SInUTFOdyH9OPYDRTIAD";
+    const ECDSA_C: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJFHSBh9Pslp36fIcP/hzmBYCk4IBgFtXrw5qDvkDCIHwhVRB5NPH7pU4sVGNoe4EbehUoRLOogtk/umCBDixss=";
+
+    fn key(openssh: &str) -> PublicKey {
+        PublicKey::from_openssh(openssh).expect("test key")
+    }
+
+    #[test]
+    fn a_host_is_trusted_only_once_its_key_is_on_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = vec![dir.path().join("known_hosts")];
+        // No file at all yet: nothing vouches for anyone.
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ED25519_A), &files),
+            HostKeyVerdict::Unknown
+        );
+        learn_known_hosts_path("nas", 22, &key(ED25519_A), &files[0]).expect("learn");
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ED25519_A), &files),
+            HostKeyVerdict::Trusted
+        );
+        // The record is for that host and that port only.
+        assert_eq!(
+            judge_host_key("backup", 22, &key(ED25519_A), &files),
+            HostKeyVerdict::Unknown
+        );
+        assert_eq!(
+            judge_host_key("nas", 2222, &key(ED25519_A), &files),
+            HostKeyVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn a_different_key_of_the_same_type_is_a_changed_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = vec![dir.path().join("known_hosts")];
+        learn_known_hosts_path("nas", 22, &key(ED25519_A), &files[0]).expect("learn");
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ED25519_B), &files),
+            // Line 2: russh starts a new file with a blank line.
+            HostKeyVerdict::Changed {
+                file: files[0].clone(),
+                line: 2
+            }
+        );
+        // A key type the file has never seen for this host is merely unknown.
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ECDSA_C), &files),
+            HostKeyVerdict::Unknown
+        );
+        // Old and new key both on record, as after a rotation: still trusted.
+        learn_known_hosts_path("nas", 22, &key(ED25519_B), &files[0]).expect("learn");
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ED25519_B), &files),
+            HostKeyVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn the_files_are_read_as_one_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = vec![dir.path().join("openssh"), dir.path().join("twelf")];
+        // The user's own file has an old key; the app's has the current one.
+        learn_known_hosts_path("nas", 22, &key(ED25519_A), &files[0]).expect("learn");
+        learn_known_hosts_path("nas", 22, &key(ED25519_B), &files[1]).expect("learn");
+        assert_eq!(
+            judge_host_key("nas", 22, &key(ED25519_B), &files),
+            HostKeyVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_reads_like_ssh_keygen_prints_it() {
+        let shown = fingerprint(&key(ED25519_A));
+        assert!(shown.starts_with("ssh-ed25519 SHA256:"), "{shown}");
+    }
+
     #[test]
     fn an_attempt_names_its_target_and_hands_back_its_outcome() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -320,7 +539,7 @@ mod tests {
             root: "/photos".to_string(),
         };
         let mut attempt = ConnectAttempt::spawn(req, &rt, &ctx);
-        assert_eq!(attempt.target, "alex@nas:2222");
+        assert_eq!(attempt.request.target(), "alex@nas:2222");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let outcome = loop {
             if let Some(outcome) = attempt.poll() {
