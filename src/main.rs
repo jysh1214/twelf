@@ -150,6 +150,10 @@ struct TwelfApp {
     marked_local: selection::Marked,
     marked_remote: selection::Marked,
     remote_download: Option<remote::RemoteDownload>,
+    /// An upload of picked local files into a remote folder. Like a download it
+    /// owns its session, so it outlives a reconnect; the status bar shows it and
+    /// can cancel it.
+    remote_upload: Option<remote::RemoteUpload>,
     remote_delete: Option<remote::RemoteDelete>,
     /// Deletes started on a session the app has since left (a reconnect, Open
     /// Folder). They run to completion and report here: dropping the handle
@@ -270,6 +274,7 @@ impl TwelfApp {
             marked_local: selection::Marked::default(),
             marked_remote: selection::Marked::default(),
             remote_download: None,
+            remote_upload: None,
             remote_delete: None,
             detached_deletes: Vec::new(),
             pending_delete: None,
@@ -406,6 +411,56 @@ impl TwelfApp {
                 self.local_scroll_target = Some(new.clone());
                 self.selected_image = Some(new);
             }
+        }
+    }
+
+    /// An Upload was chosen on the remote folder `dir`: ask which local files,
+    /// and start copying them there. One upload at a time — a second handle
+    /// would replace the first, and dropping a transfer cancels it.
+    fn start_upload(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let busy = self
+            .remote_upload
+            .as_ref()
+            .is_some_and(|upload| !upload.is_finished());
+        if busy {
+            self.status_message = Some(status_bar::Message::error(
+                "An upload is already running — wait for it or cancel it",
+            ));
+            return;
+        }
+        let ssh::SshState::Connected { session, .. } = &self.ssh else {
+            self.status_message = Some(status_bar::Message::error("Not connected"));
+            return;
+        };
+        let session = session.clone();
+        let title = format!("Upload to {}", dir.display());
+        let Some(files) = rfd::FileDialog::new().set_title(title).pick_files() else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+        self.remote_upload = Some(remote::spawn_remote_upload(
+            session,
+            &self.runtime,
+            files,
+            dir,
+            ctx,
+        ));
+    }
+
+    /// When an upload ends, re-list the folder it went into, so what arrived
+    /// shows up without waiting for the next poll. Only if that folder is still
+    /// part of the tree on screen: the upload may have outlived its session.
+    fn resolve_remote_upload(&mut self) {
+        let Some(upload) = self.remote_upload.as_mut() else {
+            return;
+        };
+        upload.poll();
+        if upload.take_just_finished()
+            && let Some(root) = self.remote_root.as_mut()
+        {
+            root.reload(upload.target());
         }
     }
 
@@ -1623,6 +1678,7 @@ impl eframe::App for TwelfApp {
         }
 
         self.resolve_remote_deletes();
+        self.resolve_remote_upload();
         self.drop_dead_scroll_targets();
 
         let sftp = match &self.ssh {
@@ -1654,6 +1710,9 @@ impl eframe::App for TwelfApp {
         // Set by the remote tree's Add to Favorites action; consumed after the
         // panel into the saved-connection list.
         let mut favorite_request: Option<PathBuf> = None;
+        // Set by the remote tree's Upload action (the folder to upload into);
+        // consumed after the panel, where the file dialog can block just once.
+        let mut upload_request: Option<PathBuf> = None;
         let screen_w = ctx.content_rect().width();
         egui::SidePanel::left("entries")
             .min_width(screen_w * 0.10)
@@ -1739,6 +1798,7 @@ impl eframe::App for TwelfApp {
                                 &mut rename_request,
                                 &mut refresh_request,
                                 &mut favorite_request,
+                                &mut upload_request,
                                 &sftp,
                                 &self.remote_listings_tx,
                                 &self.runtime,
@@ -1869,6 +1929,9 @@ impl eframe::App for TwelfApp {
         }
         if let Some(click) = clicked_remote {
             self.apply_row_click(&click, true);
+        }
+        if let Some(dir) = upload_request {
+            self.start_upload(dir, ctx);
         }
         // A Download action was chosen: pick a local destination and spawn the
         // copy — a recursive walk into a picked folder for a directory, a save

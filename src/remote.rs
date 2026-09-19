@@ -452,33 +452,64 @@ pub fn spawn_remote_poll(
     });
 }
 
-/// Live counters for an in-flight download, shared with the walk task.
+/// Live counters for an in-flight download or upload, shared with its task.
 #[derive(Default)]
 struct DownloadProgress {
     files: AtomicUsize,
     bytes: AtomicU64,
     errors: AtomicUsize,
-    /// Files left untouched because a local copy already existed.
+    /// Files left untouched because a copy already existed at the destination.
     skipped: AtomicUsize,
 }
 
-/// An in-flight recursive folder download. Like `RemoteSearchWalk`, the walk
+/// An in-flight transfer: a download (one file, or a folder walked
+/// recursively) or an upload of picked files. Like `RemoteSearchWalk`, the work
 /// runs off-thread and dropping the handle flips `cancel` to stop it. The
-/// counters are read live each frame; `rx` fires once when the walk finishes.
-pub struct RemoteDownload {
+/// counters are read live each frame; `rx` fires once when it finishes.
+pub struct RemoteTransfer {
+    /// Where the files are going: a local path for a download, the remote
+    /// folder for an upload.
     target: PathBuf,
     cancel: Arc<AtomicBool>,
     progress: Arc<DownloadProgress>,
     rx: std::sync::mpsc::Receiver<()>,
     finished: bool,
+    /// Set when `poll` first sees the end, for `take_just_finished`.
+    just_finished: bool,
 }
 
-impl RemoteDownload {
-    /// Note completion once the walk signals it (non-blocking).
+pub type RemoteDownload = RemoteTransfer;
+pub type RemoteUpload = RemoteTransfer;
+
+impl RemoteTransfer {
+    fn started(
+        target: PathBuf,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<DownloadProgress>,
+        rx: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            target,
+            cancel,
+            progress,
+            rx,
+            finished: false,
+            just_finished: false,
+        }
+    }
+
+    /// Note completion once the task signals it (non-blocking).
     pub fn poll(&mut self) {
         if !self.finished && self.rx.try_recv().is_ok() {
             self.finished = true;
+            self.just_finished = true;
         }
+    }
+
+    /// True once, on the first call after the transfer ended: the moment to do
+    /// whatever its end calls for, such as re-listing the folder uploaded to.
+    pub fn take_just_finished(&mut self) -> bool {
+        std::mem::take(&mut self.just_finished)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -507,7 +538,7 @@ impl RemoteDownload {
     }
 }
 
-impl Drop for RemoteDownload {
+impl Drop for RemoteTransfer {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -550,13 +581,7 @@ pub fn spawn_remote_download(
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
-    RemoteDownload {
-        target,
-        cancel,
-        progress,
-        rx,
-        finished: false,
-    }
+    RemoteTransfer::started(target, cancel, progress, rx)
 }
 
 /// Recursively copy `dir` (under `root`) to the local destination. Unfiltered —
@@ -810,12 +835,176 @@ pub fn spawn_remote_file_download(
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
-    RemoteDownload {
-        target,
-        cancel,
-        progress,
-        rx,
-        finished: false,
+    RemoteTransfer::started(target, cancel, progress, rx)
+}
+
+/// How many uploads run at once. Fewer than downloads: each holds a local file
+/// open and streams it up the one SSH channel, where more of them only take
+/// turns.
+const REMOTE_UPLOAD_CONCURRENCY: usize = 4;
+
+/// Spawn an upload of the local `files` into the remote folder `dir`. A file
+/// whose name is already taken there is left alone and counted as skipped —
+/// picking files to upload is no consent to replace what is on the server, the
+/// same rule the folder download follows on this side. Cancel by dropping the
+/// returned handle.
+pub fn spawn_remote_upload(
+    sftp: Arc<SftpSession>,
+    runtime: &tokio::runtime::Runtime,
+    files: Vec<PathBuf>,
+    dir: PathBuf,
+    ctx: &egui::Context,
+) -> RemoteUpload {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(DownloadProgress::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_task = cancel.clone();
+    let progress_task = progress.clone();
+    let ctx_task = ctx.clone();
+    let dir_task = dir.clone();
+    runtime.spawn(async move {
+        let sem = Semaphore::new(REMOTE_UPLOAD_CONCURRENCY);
+        let uploads = files.iter().map(|local| {
+            upload_file(
+                &sftp,
+                local,
+                &dir_task,
+                &cancel_task,
+                &sem,
+                &progress_task,
+                &ctx_task,
+            )
+        });
+        join_all(uploads).await;
+        let _ = tx.send(());
+        ctx_task.request_repaint();
+    });
+    RemoteTransfer::started(dir, cancel, progress, rx)
+}
+
+/// Upload one local file into `dir`, counting how it went. A failure is counted
+/// and does not stop the others.
+async fn upload_file(
+    sftp: &SftpSession,
+    local: &Path,
+    dir: &Path,
+    cancel: &AtomicBool,
+    sem: &Semaphore,
+    progress: &DownloadProgress,
+    ctx: &egui::Context,
+) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let name = local.file_name().map(|n| n.to_string_lossy().into_owned());
+    let Some(dest) = name.as_deref().and_then(|name| child_path(dir, name)) else {
+        progress.errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let _permit = sem.acquire().await.expect("upload semaphore never closed");
+    match stream_from_file(sftp, local, &dest, cancel, progress).await {
+        Ok(FileOutcome::Written) => {
+            progress.files.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(FileOutcome::Skipped) => {
+            progress.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(FileOutcome::Cancelled) => {}
+        Err(e) => {
+            crate::log!("failed to upload {}: {e}", local.display());
+            progress.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    ctx.request_repaint();
+}
+
+/// Staging path an upload writes to before being renamed into place. The name
+/// is the app's own rather than a bare `.part`, so creating it cannot truncate
+/// somebody's unrelated partial file on the server; one left over from an
+/// interrupted upload is this app's, and is simply written over.
+fn upload_part_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".twelf-part");
+    PathBuf::from(name)
+}
+
+/// Copy `local` to the remote `dest` a chunk at a time through a staging file,
+/// renamed into place only once all of it has arrived — so a cancelled or
+/// failed upload leaves nothing under the real name that a later listing could
+/// take for the whole file. The staging file is removed whenever the rename
+/// did not happen.
+async fn stream_from_file(
+    sftp: &SftpSession,
+    local: &Path,
+    dest: &Path,
+    cancel: &AtomicBool,
+    progress: &DownloadProgress,
+) -> std::io::Result<FileOutcome> {
+    let dest_str = dest.to_string_lossy().into_owned();
+    if remote_exists(sftp, &dest_str).await? {
+        return Ok(FileOutcome::Skipped);
+    }
+    let mut source = tokio::fs::File::open(local).await?;
+    let part = upload_part_path(dest).to_string_lossy().into_owned();
+    let mut out = sftp
+        .create(part.clone())
+        .await
+        .map_err(std::io::Error::other)?;
+    let copied = copy_until_cancelled(&mut source, &mut out, cancel, progress).await;
+    // Flushed and closed before the rename, or the server may still be writing.
+    let closed = out.shutdown().await;
+    drop(out);
+    let outcome = match (copied, closed) {
+        (Ok(true), Ok(())) => {
+            // SFTP's rename refuses an existing target, which is the point: a
+            // file that appeared under the name meanwhile is not replaced.
+            match sftp.rename(part.clone(), dest_str.clone()).await {
+                Ok(()) => Ok(FileOutcome::Written),
+                Err(e) => match remote_exists(sftp, &dest_str).await {
+                    Ok(true) => Ok(FileOutcome::Skipped),
+                    _ => Err(std::io::Error::other(e)),
+                },
+            }
+        }
+        (Ok(true), Err(e)) | (Err(e), _) => Err(e),
+        (Ok(false), _) => Ok(FileOutcome::Cancelled),
+    };
+    if !matches!(outcome, Ok(FileOutcome::Written)) {
+        let _ = sftp.remove_file(part).await;
+    }
+    outcome
+}
+
+async fn remote_exists(sftp: &SftpSession, path: &str) -> std::io::Result<bool> {
+    sftp.try_exists(path.to_string())
+        .await
+        .map_err(std::io::Error::other)
+}
+
+/// Copy `source` into `out` in chunks, adding to `progress.bytes`. `Ok(false)`
+/// when `cancel` cut it short. Generic so it can be tested without a server.
+async fn copy_until_cancelled<R, W>(
+    source: &mut R,
+    out: &mut W,
+    cancel: &AtomicBool,
+    progress: &DownloadProgress,
+) -> std::io::Result<bool>
+where
+    R: AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let read = source.read(&mut buf).await?;
+        if read == 0 {
+            out.flush().await?;
+            return Ok(true);
+        }
+        out.write_all(&buf[..read]).await?;
+        progress.bytes.fetch_add(read as u64, Ordering::Relaxed);
     }
 }
 
@@ -1175,6 +1364,7 @@ pub fn render_remote_tree(
     rename_request: &mut Option<(PathBuf, bool)>,
     refresh_request: &mut Option<PathBuf>,
     favorite_request: &mut Option<PathBuf>,
+    upload_request: &mut Option<PathBuf>,
     sftp: &Arc<SftpSession>,
     tx: &Sender<ListingResult>,
     runtime: &tokio::runtime::Runtime,
@@ -1258,6 +1448,7 @@ pub fn render_remote_tree(
                             rename_request,
                             refresh_request,
                             favorite_request,
+                            upload_request,
                             sftp,
                             tx,
                             runtime,
@@ -1275,6 +1466,11 @@ pub fn render_remote_tree(
                 // paths are usually found by browsing, not remembered.
                 if ui.button("Add to Favorites").clicked() {
                     *favorite_request = Some(path.clone());
+                    ui.close();
+                }
+                // Local files, picked in a dialog, copied into this folder.
+                if ui.button("Upload").clicked() {
+                    *upload_request = Some(path.clone());
                     ui.close();
                 }
                 // SFTP has no change notifications, so a re-list is on demand.
@@ -1580,6 +1776,154 @@ mod tests {
         // An absent target under a loaded root.
         let mut root = rloaded("/r", vec![]);
         assert!(!root.merge_listing(Path::new("/r/gone"), vec![]));
+    }
+
+    /// The upload against a real SFTP server — opt-in, since it needs one. Set
+    /// `TWELF_TEST_SFTP=user@host:port`, `TWELF_TEST_KEY` to a private key the
+    /// server accepts, and `TWELF_TEST_DIR` to a scratch folder on it that this
+    /// machine can also read (a local sshd does nicely). The server's host key
+    /// must already be trusted. Without the variables the test does nothing.
+    #[test]
+    fn an_upload_lands_whole_and_replaces_nothing_on_a_real_server() {
+        let (Ok(target), Ok(key), Ok(dir)) = (
+            std::env::var("TWELF_TEST_SFTP"),
+            std::env::var("TWELF_TEST_KEY"),
+            std::env::var("TWELF_TEST_DIR"),
+        ) else {
+            return;
+        };
+        let (user, rest) = target.split_once('@').expect("user@host:port");
+        let (host, port) = rest.rsplit_once(':').expect("user@host:port");
+        let remote_dir = PathBuf::from(&dir);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let ctx = egui::Context::default();
+        let request = crate::ssh::ConnectRequest {
+            host: host.to_string(),
+            port: port.parse().expect("port"),
+            user: user.to_string(),
+            key_path: key,
+            root: dir.clone(),
+        };
+        let (sftp, _info, _ended) = rt
+            .block_on(crate::ssh::connect(request, ctx.clone()))
+            .unwrap_or_else(|_| panic!("could not connect to {target}"));
+
+        // Three local files; the server already has one by the third's name.
+        let local = tempfile::tempdir().expect("tempdir");
+        let big = vec![0xABu8; DOWNLOAD_CHUNK * 3 + 17];
+        std::fs::write(local.path().join("up-small.jpg"), b"small").unwrap();
+        std::fs::write(local.path().join("up-big.jpg"), &big).unwrap();
+        std::fs::write(local.path().join("up-taken.jpg"), b"from this machine").unwrap();
+        for stale in ["up-small.jpg", "up-big.jpg"] {
+            let _ = std::fs::remove_file(remote_dir.join(stale));
+        }
+        std::fs::write(remote_dir.join("up-taken.jpg"), b"already on the server").unwrap();
+
+        let files = ["up-small.jpg", "up-big.jpg", "up-taken.jpg"]
+            .iter()
+            .map(|name| local.path().join(name))
+            .collect();
+        let mut upload = spawn_remote_upload(sftp, &rt, files, remote_dir.clone(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !upload.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upload did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            upload.poll();
+        }
+
+        assert_eq!(
+            (upload.files(), upload.skipped(), upload.errors()),
+            (2, 1, 0)
+        );
+        assert_eq!(upload.bytes(), (5 + big.len()) as u64);
+        assert_eq!(
+            std::fs::read(remote_dir.join("up-small.jpg")).unwrap(),
+            b"small"
+        );
+        assert_eq!(std::fs::read(remote_dir.join("up-big.jpg")).unwrap(), big);
+        // The file that was there is as it was.
+        assert_eq!(
+            std::fs::read(remote_dir.join("up-taken.jpg")).unwrap(),
+            b"already on the server"
+        );
+        // And nothing half-finished is left lying about.
+        let leftovers: Vec<_> = std::fs::read_dir(&remote_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".twelf-part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+        for done in ["up-small.jpg", "up-big.jpg", "up-taken.jpg"] {
+            let _ = std::fs::remove_file(remote_dir.join(done));
+        }
+    }
+
+    #[test]
+    fn an_upload_is_staged_under_the_apps_own_name() {
+        assert_eq!(
+            upload_part_path(Path::new("/photos/trip/a b.jpg")),
+            PathBuf::from("/photos/trip/a b.jpg.twelf-part")
+        );
+    }
+
+    #[test]
+    fn a_copy_streams_everything_and_counts_it_unless_cancelled() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let payload = vec![7u8; DOWNLOAD_CHUNK * 2 + 123];
+
+        let progress = DownloadProgress::default();
+        let mut out = Vec::new();
+        let live = AtomicBool::new(false);
+        let done = rt
+            .block_on(copy_until_cancelled(
+                &mut &payload[..],
+                &mut out,
+                &live,
+                &progress,
+            ))
+            .expect("copy");
+        assert!(done);
+        assert_eq!(out, payload);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), payload.len() as u64);
+
+        // Cancelled: reported as cut short, not as an error, and nothing sent.
+        let progress = DownloadProgress::default();
+        let mut out = Vec::new();
+        let cancelled = AtomicBool::new(true);
+        let done = rt
+            .block_on(copy_until_cancelled(
+                &mut &payload[..],
+                &mut out,
+                &cancelled,
+                &progress,
+            ))
+            .expect("copy");
+        assert!(!done);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_transfer_reports_its_end_exactly_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut transfer = RemoteTransfer::started(
+            PathBuf::from("/photos/trip"),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(DownloadProgress::default()),
+            rx,
+        );
+        transfer.poll();
+        assert!(!transfer.is_finished() && !transfer.take_just_finished());
+        tx.send(()).unwrap();
+        transfer.poll();
+        assert!(transfer.is_finished());
+        assert!(transfer.take_just_finished());
+        // Still finished on later frames, but the moment has passed.
+        transfer.poll();
+        assert!(transfer.is_finished() && !transfer.take_just_finished());
     }
 
     #[test]

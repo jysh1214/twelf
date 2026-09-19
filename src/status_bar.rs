@@ -49,6 +49,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         app.selected_image.as_deref(),
     );
     let mut cancel_download = false;
+    let mut cancel_upload = false;
     let mut dismiss_message = false;
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -68,6 +69,24 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         dl.errors(),
                         dl.skipped(),
                         dl.target(),
+                    ));
+                    if !finished {
+                        ctx.request_repaint();
+                    }
+                }
+                if let Some(up) = app.remote_upload.as_mut() {
+                    up.poll();
+                    let finished = up.is_finished();
+                    if !finished && ui.button("Cancel upload").clicked() {
+                        cancel_upload = true;
+                    }
+                    ui.label(upload_status_text(
+                        finished,
+                        up.files(),
+                        up.bytes(),
+                        up.errors(),
+                        up.skipped(),
+                        up.target(),
                     ));
                     if !finished {
                         ctx.request_repaint();
@@ -97,6 +116,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     if cancel_download {
         app.remote_download = None;
     }
+    if cancel_upload {
+        app.remote_upload = None;
+    }
     if dismiss_message {
         app.status_message = None;
     }
@@ -123,6 +145,42 @@ fn selected_path_text(
 /// The one-line progress text for a download: live counters while running, the
 /// local target once finished, and a parenthetical for anything that did not
 /// land — failures, and files left alone because a local copy already existed.
+/// The upload's line: where the files are going, how far it has got, and —
+/// what matters most once it is over — how many did not make it and why.
+fn upload_status_text(
+    finished: bool,
+    files: usize,
+    bytes: u64,
+    errors: usize,
+    skipped: usize,
+    target: &Path,
+) -> String {
+    let folder = target.file_name().unwrap_or(target.as_os_str());
+    let folder = folder.to_string_lossy();
+    let mut text = if finished {
+        format!(
+            "Uploaded {files} file(s), {} → {folder}",
+            menu_bar::format_bytes(bytes)
+        )
+    } else {
+        format!(
+            "Uploading to {folder}: {files} file(s), {}…",
+            menu_bar::format_bytes(bytes)
+        )
+    };
+    let mut notes = Vec::new();
+    if errors > 0 {
+        notes.push(format!("{errors} failed"));
+    }
+    if skipped > 0 {
+        notes.push(format!("{skipped} already there"));
+    }
+    if !notes.is_empty() {
+        text.push_str(&format!(" ({})", notes.join(", ")));
+    }
+    text
+}
+
 fn download_status_text(
     finished: bool,
     files: usize,
@@ -160,6 +218,24 @@ fn download_status_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_status_names_the_folder_and_what_did_not_make_it() {
+        let folder = Path::new("/photos/trip");
+        assert_eq!(
+            upload_status_text(false, 2, 2048, 0, 0, folder),
+            "Uploading to trip: 2 file(s), 2.0 KB…"
+        );
+        assert_eq!(
+            upload_status_text(true, 3, 1024, 1, 2, folder),
+            "Uploaded 3 file(s), 1.0 KB → trip (1 failed, 2 already there)"
+        );
+        // The server's root has no name of its own to show.
+        assert_eq!(
+            upload_status_text(true, 1, 0, 0, 0, Path::new("/")),
+            "Uploaded 1 file(s), 0 B → /"
+        );
+    }
 
     #[test]
     fn only_an_error_is_painted_in_the_error_colour() {
