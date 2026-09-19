@@ -111,7 +111,13 @@ struct TwelfApp {
     root_node: Option<sidebar::TreeNode>,
     fs_watcher: Option<watcher::FsWatcher>,
     selected_image: Option<PathBuf>,
-    scroll_target: Option<PathBuf>,
+    /// A row the local tree should open its folders down to and scroll into
+    /// view, consumed by the row when it renders. One per tree: a single shared
+    /// target could be set for the tree that is not on screen, where it
+    /// force-opened folders toward a row that was never there.
+    local_scroll_target: Option<PathBuf>,
+    /// The same for the remote tree.
+    remote_scroll_target: Option<PathBuf>,
     search_active: bool,
     search_query: String,
     search_cache: Option<(String, Vec<sidebar::SearchHit>)>,
@@ -192,7 +198,8 @@ impl TwelfApp {
             root_node: None,
             fs_watcher: None,
             selected_image: None,
-            scroll_target: None,
+            local_scroll_target: None,
+            remote_scroll_target: None,
             search_active: false,
             search_query: String::new(),
             search_cache: None,
@@ -289,10 +296,11 @@ impl TwelfApp {
             (current, root.collect_images())
         };
         if let Some(new) = nav::navigate(&list, &current, delta) {
-            self.scroll_target = Some(new.clone());
             if remote_mode {
+                self.remote_scroll_target = Some(new.clone());
                 self.selected_remote = Some(new);
             } else {
+                self.local_scroll_target = Some(new.clone());
                 self.selected_image = Some(new);
             }
         }
@@ -369,7 +377,7 @@ impl TwelfApp {
     fn leave_remote_session(&mut self, ctx: &egui::Context) {
         self.remote_root = None;
         self.selected_remote = None;
-        self.scroll_target = None;
+        self.remote_scroll_target = None;
         self.search_active = false;
         self.search_query.clear();
         self.search_cache = None;
@@ -763,10 +771,10 @@ impl TwelfApp {
         is_remote: bool,
         ctx: &egui::Context,
     ) {
-        let selection = if is_remote {
-            &mut self.selected_remote
+        let (selection, scroll_target) = if is_remote {
+            (&mut self.selected_remote, &mut self.remote_scroll_target)
         } else {
-            &mut self.selected_image
+            (&mut self.selected_image, &mut self.local_scroll_target)
         };
         // Following the path alone still loses the row from view: the new name
         // may sort somewhere off-screen, a renamed folder gets a fresh
@@ -776,7 +784,7 @@ impl TwelfApp {
         // the row, so the selection visibly survives the rename.
         if let Some(p) = selection.as_deref().and_then(|s| rebase_path(s, old, new)) {
             *selection = Some(p.clone());
-            self.scroll_target = Some(p);
+            *scroll_target = Some(p);
             self.forget_all_images(ctx);
         }
         self.search_active = false;
@@ -848,14 +856,11 @@ impl eframe::App for TwelfApp {
                 self.search_dirty = true;
             }
             // A rename outside the app moved the selected file (or a folder
-            // above it): follow it, like an in-app rename does. The scroll is
-            // set only while the local tree is the one on screen — with the
-            // remote tree or search results showing, the target would dangle
-            // unconsumed and force-open folders toward a row that isn't there.
+            // above it): follow it, like an in-app rename does. The target is
+            // the local tree's own, so it simply waits if the remote tree or
+            // search results are what is on screen right now.
             if let Some(p) = follow_renames(self.selected_image.as_deref(), &changes.renames) {
-                if !self.remote_shown() && !self.search_active {
-                    self.scroll_target = Some(p.clone());
-                }
+                self.local_scroll_target = Some(p.clone());
                 self.selected_image = Some(p);
                 self.forget_all_images(ctx);
             }
@@ -954,7 +959,8 @@ impl eframe::App for TwelfApp {
         let reset_scroll = !ctx.wants_keyboard_input()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         if reset_scroll {
-            self.scroll_target = None;
+            self.local_scroll_target = None;
+            self.remote_scroll_target = None;
         }
 
         // Ctrl+F opens the sidebar search and focuses its field. Ungated: the Ctrl
@@ -1306,7 +1312,7 @@ impl eframe::App for TwelfApp {
                                 true,
                                 &remote_host,
                                 &mut self.selected_remote,
-                                &mut self.scroll_target,
+                                &mut self.remote_scroll_target,
                                 &mut self.image_prefetch,
                                 &mut download_request,
                                 &mut delete_request,
@@ -1334,7 +1340,7 @@ impl eframe::App for TwelfApp {
                                     ui,
                                     hits,
                                     &self.selected_remote,
-                                    &mut self.scroll_target,
+                                    &mut self.remote_scroll_target,
                                     &mut new_remote_selection,
                                     Some(&mut download_request),
                                     &mut delete_request,
@@ -1390,7 +1396,7 @@ impl eframe::App for TwelfApp {
                                     ui,
                                     hits,
                                     &self.selected_image,
-                                    &mut self.scroll_target,
+                                    &mut self.local_scroll_target,
                                     &mut new_selection,
                                     None,
                                     &mut delete_request,
@@ -1403,7 +1409,7 @@ impl eframe::App for TwelfApp {
                                 root_node,
                                 true,
                                 &self.selected_image,
-                                &mut self.scroll_target,
+                                &mut self.local_scroll_target,
                                 &mut new_selection,
                                 &mut delete_request,
                                 &mut rename_request,
@@ -1619,7 +1625,12 @@ mod tests {
         // The tree must also walk open and scroll to the followed selection —
         // the new name may sort off-screen, and a rename from search results
         // closes into a tree whose ancestors were never expanded.
-        assert_eq!(app.scroll_target.as_deref(), Some(Path::new("/r/new.jpg")));
+        assert_eq!(
+            app.local_scroll_target.as_deref(),
+            Some(Path::new("/r/new.jpg"))
+        );
+        // The other tree had nothing renamed and is left where it was.
+        assert_eq!(app.remote_scroll_target, None);
         assert!(!app.search_active);
     }
 
@@ -1639,9 +1650,10 @@ mod tests {
             Some(Path::new("/srv/pics/new.jpg"))
         );
         assert_eq!(
-            app.scroll_target.as_deref(),
+            app.remote_scroll_target.as_deref(),
             Some(Path::new("/srv/pics/new.jpg"))
         );
+        assert_eq!(app.local_scroll_target, None);
     }
 
     #[test]
@@ -1690,7 +1702,7 @@ mod tests {
             Some(Path::new("/r/keep.jpg"))
         );
         // No scroll either — nothing moved, so the tree must not jump.
-        assert_eq!(app.scroll_target, None);
+        assert_eq!(app.local_scroll_target, None);
     }
 
     fn remote_rename_dialog(path: &str, name: &str) -> PendingRename {
@@ -1819,7 +1831,8 @@ mod tests {
         let mut app = TwelfApp::new();
         app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
         app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
-        app.scroll_target = Some(PathBuf::from("/photos/a.jpg"));
+        app.remote_scroll_target = Some(PathBuf::from("/photos/a.jpg"));
+        app.local_scroll_target = Some(PathBuf::from("/home/alex/pics/b.jpg"));
         app.search_active = true;
         app.search_query = "trip".to_string();
         app.image_prefetch
@@ -1835,7 +1848,12 @@ mod tests {
         assert!(app.remote_root.is_none());
         // Left set, this would shadow every local selection in the image panel.
         assert_eq!(app.selected_remote, None);
-        assert_eq!(app.scroll_target, None);
+        assert_eq!(app.remote_scroll_target, None);
+        // The local tree's own pending scroll is none of the session's business.
+        assert_eq!(
+            app.local_scroll_target.as_deref(),
+            Some(Path::new("/home/alex/pics/b.jpg"))
+        );
         assert!(!app.search_active && app.search_query.is_empty());
         assert!(app.image_prefetch.is_empty());
         assert!(app.session_holder.lock().unwrap().is_none());
