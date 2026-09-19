@@ -25,17 +25,40 @@ const BYTES_CACHE_CAP: usize = 256 * 1024 * 1024;
 /// memory ran out. Nothing larger than the byte cache could be kept anyway.
 const MAX_IMAGE_BYTES: u64 = BYTES_CACHE_CAP as u64;
 
+/// How much is read between checks that the file is still wanted. A request
+/// the server answers in one go; small enough that an abandoned read of a big
+/// file stops almost at once.
+const READ_CHUNK: usize = 256 * 1024;
+
 /// Read `reader` to its end, refusing to hold more than `max` bytes. Enforced
 /// on the stream itself rather than on the size `stat` reported, which is the
 /// server's word and may be missing.
-async fn read_capped<R: AsyncRead + Unpin>(reader: R, max: u64) -> std::io::Result<Vec<u8>> {
+///
+/// `wanted` is asked before every chunk, and `Ok(None)` is what comes back once
+/// it says no. Without it every read ran to completion: holding an arrow key
+/// over a remote folder started a whole-file read per row passed, none was ever
+/// dropped, and the image finally stopped on shared the one SSH channel with
+/// all of them.
+async fn read_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    max: u64,
+    wanted: impl Fn() -> bool,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
-    // One byte past the limit is enough to tell "exactly max" from "more".
-    reader.take(max + 1).read_to_end(&mut bytes).await?;
-    if bytes.len() as u64 > max {
-        return Err(std::io::Error::other(format!("larger than {max} bytes")));
+    let mut chunk = vec![0u8; READ_CHUNK];
+    loop {
+        if !wanted() {
+            return Ok(None);
+        }
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(Some(bytes));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() as u64 > max {
+            return Err(std::io::Error::other(format!("larger than {max} bytes")));
+        }
     }
-    Ok(bytes)
 }
 
 impl ByteSized for Bytes {
@@ -65,10 +88,17 @@ impl LoaderState {
         fetch
     }
 
+    /// Whether `fetch` is still the one its key is waiting on. It stops being
+    /// so when the key is forgotten: the image left the displayed window (the
+    /// user moved on), or everything was dropped with the session.
+    fn owns(&self, key: &str, fetch: u64) -> bool {
+        self.pending.get(key) == Some(&fetch)
+    }
+
     /// Record how `fetch` ended — `None` is a failure, which backs the key off.
     /// Returns false, changing nothing, when the fetch no longer owns its key.
     fn settle(&mut self, key: String, fetch: u64, bytes: Option<Bytes>) -> bool {
-        if self.pending.get(&key) != Some(&fetch) {
+        if !self.owns(&key, fetch) {
             return false;
         }
         self.pending.remove(&key);
@@ -147,10 +177,23 @@ impl BytesLoader for SftpBytesLoader {
         let key_owned = key;
         let ctx_clone = ctx.clone();
         self.handle.spawn(async move {
+            // Asked again before each step that costs a round trip or a read: a
+            // fetch overtaken before it started should cost nothing at all.
+            let wanted = {
+                let state = state_clone.clone();
+                let key = key_owned.clone();
+                move || state.lock().unwrap().owns(&key, fetch)
+            };
+            if !wanted() {
+                return;
+            }
             // Fingerprint the remote file so a cached blob is reused only when its
             // size+mtime still match. A failed stat yields None/None, which degrades
             // to serving the cached blob (if any) and otherwise reading fresh.
             let meta = session.metadata(path.clone()).await.ok();
+            if !wanted() {
+                return;
+            }
             let mtime = meta.as_ref().and_then(|m| m.mtime).map(|t| t as i64);
             let size = meta.as_ref().and_then(|m| m.size).map(|s| s as i64);
             // The disk cache is synchronous sqlite plus a whole-blob file read
@@ -172,8 +215,11 @@ impl BytesLoader for SftpBytesLoader {
                     crate::log!("not loading {key_owned}: over {MAX_IMAGE_BYTES} bytes");
                     None
                 }
-                None => match read_remote(&session, path).await {
-                    Ok(vec) => {
+                None => match read_remote(&session, path, &wanted).await {
+                    // Abandoned part-way: nothing to keep, and no failure to
+                    // hold against the file either.
+                    Ok(None) => return,
+                    Ok(Some(vec)) => {
                         let disk = disk_clone.clone();
                         let key = key_owned.clone();
                         // `vec` is moved in and handed back, so storing it does
@@ -224,9 +270,13 @@ impl BytesLoader for SftpBytesLoader {
     }
 }
 
-async fn read_remote(session: &SftpSession, path: String) -> std::io::Result<Vec<u8>> {
+async fn read_remote(
+    session: &SftpSession,
+    path: String,
+    wanted: &impl Fn() -> bool,
+) -> std::io::Result<Option<Vec<u8>>> {
     let file = session.open(path).await.map_err(std::io::Error::other)?;
-    read_capped(file, MAX_IMAGE_BYTES).await
+    read_capped(file, MAX_IMAGE_BYTES, wanted).await
 }
 
 /// The single key one remote file is cached under, in memory and on disk.
@@ -302,12 +352,45 @@ mod tests {
     fn a_read_stops_at_the_limit_instead_of_filling_memory() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         // At the limit is fine, to the byte.
-        let exact = rt.block_on(read_capped(&[7u8; 16][..], 16)).expect("fits");
-        assert_eq!(exact.len(), 16);
-        // Past it is an error, and what was buffered stays within a byte of it
-        // however long the stream would have gone on.
+        let exact = rt
+            .block_on(read_capped(&[7u8; 16][..], 16, || true))
+            .expect("fits");
+        assert_eq!(exact.map(|bytes| bytes.len()), Some(16));
+        // Past it is an error, however long the stream would have gone on.
         let endless = tokio::io::repeat(0);
-        assert!(rt.block_on(read_capped(endless, 16)).is_err());
+        assert!(rt.block_on(read_capped(endless, 16, || true)).is_err());
+    }
+
+    #[test]
+    fn a_read_nobody_wants_any_more_stops_at_the_next_chunk() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        // Wanted for the first two chunks, then the user has moved on. The
+        // stream is endless and the limit far away: only `wanted` can end this.
+        let asked = std::cell::Cell::new(0);
+        let wanted = || {
+            asked.set(asked.get() + 1);
+            asked.get() <= 2
+        };
+        let outcome = rt
+            .block_on(read_capped(tokio::io::repeat(0), u64::MAX, wanted))
+            .expect("abandoning is not an error");
+        assert_eq!(outcome, None);
+        assert_eq!(asked.get(), 3);
+    }
+
+    #[test]
+    fn a_fetch_owns_its_key_only_until_it_is_forgotten() {
+        let (loader, _rt) = make_loader();
+        let key = "sftp://host/a.jpg";
+        let fetch = loader.state.lock().unwrap().begin(key);
+        assert!(loader.state.lock().unwrap().owns(key, fetch));
+        // The image left the displayed window: egui forgets it.
+        loader.forget(key);
+        assert!(!loader.state.lock().unwrap().owns(key, fetch));
+        // Asked for again later, it is a new fetch's, not the old one's.
+        let again = loader.state.lock().unwrap().begin(key);
+        assert!(!loader.state.lock().unwrap().owns(key, fetch));
+        assert!(loader.state.lock().unwrap().owns(key, again));
     }
 
     #[test]
