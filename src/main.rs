@@ -366,12 +366,17 @@ impl TwelfApp {
         self.pending_rename = None;
         self.detach_remote_delete();
         self.remote_rename = None;
-        // Poll state restarts with the next session: drain the old cycle's
-        // listings so they can't merge into a new tree, and give the (possibly
-        // still-running) old cycle its own flag to finish with.
+        // Listings and poll results are matched to the tree by path alone, so a
+        // request still in flight on the old session must have nowhere to land:
+        // a slow listing from host A would populate /photos on host B, and a
+        // timeout from a dead link would overwrite a folder the new session had
+        // just loaded. Draining once was not enough — the old tasks keep their
+        // sender and go on sending. New channels leave them a closed one; the
+        // old poll cycle likewise keeps its own `running` flag to finish with.
         self.last_remote_poll = None;
         self.remote_poll_running = Arc::new(AtomicBool::new(false));
-        while self.remote_poll_rx.try_recv().is_ok() {}
+        (self.remote_listings_tx, self.remote_listings_rx) = tokio::sync::mpsc::channel(64);
+        (self.remote_poll_tx, self.remote_poll_rx) = tokio::sync::mpsc::channel(64);
         *self.session_holder.lock().unwrap() = None;
         self.clear_image_prefetch();
         self.forget_all_images(ctx);
@@ -1634,6 +1639,9 @@ mod tests {
             .push_back("sftp://nas/photos/b.jpg".to_string());
         let (delete, worker) = remote::RemoteDelete::running("/photos/old");
         app.remote_delete = Some(delete);
+        // What a listing and a poll cycle started on this session hold on to.
+        let old_listings = app.remote_listings_tx.clone();
+        let old_poll = app.remote_poll_tx.clone();
 
         app.leave_remote_session(&ctx);
 
@@ -1644,6 +1652,9 @@ mod tests {
         assert!(!app.search_active && app.search_query.is_empty());
         assert!(app.image_prefetch.is_empty());
         assert!(app.session_holder.lock().unwrap().is_none());
+        // Requests still in flight on the old session have nowhere to land.
+        assert!(old_listings.is_closed() && old_poll.is_closed());
+        assert!(!app.remote_listings_tx.is_closed() && !app.remote_poll_tx.is_closed());
         // The delete carries on, detached.
         assert_eq!(app.detached_deletes.len(), 1);
         assert!(!worker.is_cancelled());
