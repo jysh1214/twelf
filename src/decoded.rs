@@ -23,12 +23,15 @@ struct LoaderState {
     failed: BackOff,
 }
 
-/// Decodes images off the UI thread into a bounded cache: every remote
-/// (`sftp://`) one, and every local (`file://`) one but HEIC, which `HeicLoader`
-/// reads straight from disk. Registered last so egui (which tries image loaders
-/// most-recently-added-first) consults it before the `egui_extras` decoder —
-/// which ignores EXIF orientation, so local portrait photos came out sideways
-/// while the same files over SFTP would not have.
+/// Decodes every image, remote (`sftp://`) or local (`file://`), off the UI
+/// thread into a bounded cache. Registered last so egui (which tries image
+/// loaders most-recently-added-first) consults it before the `egui_extras`
+/// decoder — which ignores EXIF orientation, so local portrait photos came out
+/// sideways while the same files over SFTP would not have.
+///
+/// Local HEIC used to be the exception, decoded by a loader of its own inside
+/// `load`, on the UI thread: selecting a 12 MP phone photo froze the window for
+/// the length of a libheif decode, every time one was stepped onto.
 pub struct DecodedImageLoader {
     handle: tokio::runtime::Handle,
     state: Arc<Mutex<LoaderState>>,
@@ -137,7 +140,7 @@ pub(crate) fn catching_panics<T>(decode: impl FnOnce() -> Result<T, String>) -> 
 
 /// Whether this loader decodes `uri`; see `DecodedImageLoader`.
 fn handles(uri: &str) -> bool {
-    uri.starts_with("sftp://") || (uri.starts_with("file://") && !crate::heic::is_heic(uri))
+    uri.starts_with("sftp://") || uri.starts_with("file://")
 }
 
 fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
@@ -243,14 +246,14 @@ mod tests {
     }
 
     #[test]
-    fn local_images_are_decoded_here_except_heic() {
+    fn every_local_and_remote_image_is_decoded_here() {
         assert!(handles("sftp://nas/photos/a.jpg"));
         assert!(handles("sftp://nas/photos/a.heic"));
         assert!(handles("file:///photos/a.jpg"));
         // Egui asks for an animated format by frame; still ours.
         assert!(handles("file:///photos/a.webp#0"));
-        // `HeicLoader` reads these from disk itself.
-        assert!(!handles("file:///photos/a.HEIC"));
+        // HEIC included: it has no loader of its own any more.
+        assert!(handles("file:///photos/a.HEIC"));
         assert!(!handles("https://example.com/a.jpg"));
     }
 

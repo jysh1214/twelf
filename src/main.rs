@@ -32,8 +32,6 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // Must run before any `egui::Image` is rendered.
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            cc.egui_ctx
-                .add_image_loader(Arc::new(heic::HeicLoader::new()));
             fonts::apply_fonts(&cc.egui_ctx);
             let app = TwelfApp::new();
             cc.egui_ctx
@@ -43,8 +41,8 @@ fn main() -> eframe::Result {
                     app.cache.clone(),
                 )));
             // Registered after the others so egui's reverse-order lookup tries it
-            // first: it decodes every image but local HEIC, off-thread and with
-            // the EXIF orientation applied, and defers the rest.
+            // first: it decodes every image off-thread, with the EXIF orientation
+            // applied, and defers whatever is not a local or remote file.
             cc.egui_ctx
                 .add_image_loader(Arc::new(decoded::DecodedImageLoader::new(
                     app.runtime.handle().clone(),
