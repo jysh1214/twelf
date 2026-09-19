@@ -29,6 +29,48 @@ pub fn is_video(uri: &str) -> bool {
     )
 }
 
+/// `is_video` for a file on this machine, where the one ambiguous extension can
+/// be settled by looking: `.ts` is an MPEG transport stream to a recorder and
+/// TypeScript to everyone else, and with a source tree under the root every
+/// `.ts` file in it was listed as a video that then failed to play. Remote
+/// listings stay with the extension — a look would cost round trips per file.
+pub fn is_local_video(path: &Path) -> bool {
+    let name = path.to_string_lossy();
+    if !is_video(&name) {
+        return false;
+    }
+    if !name.to_ascii_lowercase().ends_with(".ts") {
+        return true;
+    }
+    let mut head = Vec::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read as _;
+    if file.take(TS_PROBE_BYTES).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    looks_like_mpeg_ts(&head)
+}
+
+/// An MPEG transport stream is a run of 188-byte packets, each opening with the
+/// sync byte 0x47.
+const TS_PACKET: usize = 188;
+const TS_SYNC: u8 = 0x47;
+/// Enough for three packets wherever in the first one the file happens to start.
+const TS_PROBE_BYTES: u64 = (TS_PACKET * 4) as u64;
+
+/// Whether `head` — the start of a file — is a transport stream: three sync
+/// bytes a packet apart, from some offset within the first packet (a capture
+/// need not begin on a packet boundary). Text can hold a `G` in three such
+/// places by chance, so it must also hold a NUL, which a stream's tables always
+/// do and source code never does.
+fn looks_like_mpeg_ts(head: &[u8]) -> bool {
+    let synced = (0..TS_PACKET)
+        .any(|start| (0..3).all(|packet| head.get(start + packet * TS_PACKET) == Some(&TS_SYNC)));
+    synced && head.contains(&0)
+}
+
 /// One decoded video frame as RGBA, with its presentation time in seconds.
 pub struct Frame {
     pub image: ColorImage,
@@ -950,6 +992,57 @@ mod tests {
         let mut player = VideoPlayer::open("file:///tmp/film.mp4".to_string(), path);
         let error = wait_for_error(&mut player, &ctx);
         assert!(error.contains("not UTF-8"), "unexpected error: {error}");
+    }
+
+    /// `packets` transport-stream packets: sync byte, then a PAT-like body.
+    fn transport_stream(packets: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..packets {
+            let mut packet = vec![0xFFu8; TS_PACKET];
+            packet[..8].copy_from_slice(&[TS_SYNC, 0x40, 0x00, 0x10, 0x00, 0x00, 0xB0, 0x0D]);
+            out.extend(packet);
+        }
+        out
+    }
+
+    #[test]
+    fn a_transport_stream_is_told_from_typescript_by_its_contents() {
+        assert!(looks_like_mpeg_ts(&transport_stream(4)));
+        // A capture that starts part-way through a packet.
+        let mut offset = vec![0x11u8; 57];
+        offset.extend(transport_stream(4));
+        assert!(looks_like_mpeg_ts(&offset));
+
+        let source = "import { Gallery } from './gallery';\n".repeat(40);
+        assert!(!looks_like_mpeg_ts(source.as_bytes()));
+        // `G`s a packet apart by accident, but it is still only text.
+        let mut text = vec![b' '; TS_PACKET * 4];
+        for packet in 0..3 {
+            text[packet * TS_PACKET] = b'G';
+        }
+        assert!(!looks_like_mpeg_ts(&text));
+        // Too short to tell is not a video.
+        assert!(!looks_like_mpeg_ts(&transport_stream(2)));
+        assert!(!looks_like_mpeg_ts(&[]));
+    }
+
+    #[test]
+    fn a_local_ts_file_is_a_video_only_if_it_holds_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let code = dir.path().join("gallery.ts");
+        std::fs::write(&code, "export const columns: number = 4;\n".repeat(30)).unwrap();
+        let recording = dir.path().join("news.TS");
+        std::fs::write(&recording, transport_stream(8)).unwrap();
+        let clip = dir.path().join("clip.mp4");
+        std::fs::write(&clip, b"not looked at").unwrap();
+
+        assert!(!is_local_video(&code));
+        assert!(is_local_video(&recording));
+        // Every other extension is taken at its word, without opening the file.
+        assert!(is_local_video(&clip));
+        assert!(!is_local_video(&dir.path().join("notes.txt")));
+        // A `.ts` that cannot be read is not listed as a video either.
+        assert!(!is_local_video(&dir.path().join("missing.ts")));
     }
 
     #[test]

@@ -308,7 +308,7 @@ fn merge_children(old: Vec<TreeNode>, new: Vec<TreeNode>) -> Vec<TreeNode> {
 }
 
 fn is_visible(path: &Path) -> bool {
-    path.is_dir() || is_image(path) || crate::video::is_video(&path.to_string_lossy())
+    path.is_dir() || is_image(path) || crate::video::is_local_video(path)
 }
 
 fn list_children(root: &Path) -> DirChildren {
