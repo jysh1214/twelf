@@ -1295,11 +1295,13 @@ impl eframe::App for TwelfApp {
                     .num_columns(2)
                     .show(ui, |ui| {
                         ui.label("HostName:");
-                        ui.text_edit_singleline(&mut self.ssh_dialog.host);
+                        if ui.text_edit_singleline(&mut self.ssh_dialog.host).changed() {
+                            self.ssh_dialog.error = None;
+                        }
                         ui.end_row();
                         ui.label("Port:");
                         if ui.text_edit_singleline(&mut self.ssh_dialog.port).changed() {
-                            self.ssh_dialog.port_error = None;
+                            self.ssh_dialog.error = None;
                         }
                         ui.end_row();
                         ui.label("User:");
@@ -1312,7 +1314,7 @@ impl eframe::App for TwelfApp {
                         ui.text_edit_singleline(&mut self.ssh_dialog.root);
                         ui.end_row();
                     });
-                if let Some(err) = &self.ssh_dialog.port_error {
+                if let Some(err) = &self.ssh_dialog.error {
                     ui.colored_label(egui::Color32::RED, err.as_str());
                 }
                 if ui.button("Connect").clicked() {
@@ -1375,7 +1377,13 @@ impl eframe::App for TwelfApp {
             self.ssh_dialog.load_favorite(&favorite);
         }
         if save_favorite {
-            self.add_favorite(self.ssh_dialog.to_favorite());
+            match self.ssh_dialog.to_favorite() {
+                Ok(favorite) => {
+                    self.ssh_dialog.error = None;
+                    self.add_favorite(favorite);
+                }
+                Err(error) => self.ssh_dialog.error = Some(error),
+            }
         }
         // A port that does not parse keeps the dialog open with the reason in
         // it, and is not written to the config either.
@@ -1383,11 +1391,11 @@ impl eframe::App for TwelfApp {
         if connect_clicked {
             match ssh::parse_port(&self.ssh_dialog.port) {
                 Ok(parsed) => port = Some(parsed),
-                Err(error) => self.ssh_dialog.port_error = Some(error),
+                Err(error) => self.ssh_dialog.error = Some(error),
             }
         }
         if let Some(port) = port {
-            self.ssh_dialog.port_error = None;
+            self.ssh_dialog.error = None;
             self.save_config();
             let req = ssh::ConnectRequest {
                 host: self.ssh_dialog.host.clone(),

@@ -146,9 +146,9 @@ pub struct ConnectDialog {
     pub open: bool,
     pub host: String,
     pub port: String,
-    /// Why the last Connect click was refused, shown under the fields until
-    /// the port is edited.
-    pub port_error: Option<String>,
+    /// Why the last Connect or Save current click was refused, shown under the
+    /// fields until the host or the port is edited.
+    pub error: Option<String>,
     pub user: String,
     pub key_path: String,
     pub root: String,
@@ -165,7 +165,7 @@ impl ConnectDialog {
             open: false,
             host: s.host,
             port,
-            port_error: None,
+            error: None,
             user: s.user,
             key_path: s.key_path,
             root: s.root,
@@ -183,22 +183,33 @@ impl ConnectDialog {
     }
 
     /// Snapshot the dialog as a saveable favorite, labelled from its own fields.
-    pub fn to_favorite(&self) -> config::Favorite {
-        config::Favorite {
-            label: config::Favorite::derive_label(&self.user, &self.host, &self.root),
-            host: self.host.clone(),
-            port: self.port.clone(),
-            user: self.user.clone(),
+    /// Refused when it names nowhere to connect to: with the fields blank, Save
+    /// current used to store a favorite labelled ":", and one with a port that
+    /// does not parse could be saved but never used. Host, user and port are
+    /// stored tidied, so the same place typed with a stray space is recognised
+    /// as already saved.
+    pub fn to_favorite(&self) -> Result<config::Favorite, String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("Enter a HostName before saving a favorite".to_string());
+        }
+        let port = parse_port(&self.port)?;
+        let user = self.user.trim();
+        Ok(config::Favorite {
+            label: config::Favorite::derive_label(user, host, &self.root),
+            host: host.to_string(),
+            port: port.to_string(),
+            user: user.to_string(),
             key_path: self.key_path.clone(),
             root: self.root.clone(),
-        }
+        })
     }
 
     /// Fill the dialog from a saved favorite, ready to connect.
     pub fn load_favorite(&mut self, favorite: &config::Favorite) {
         self.host = favorite.host.clone();
         self.port = favorite.port.clone();
-        self.port_error = None;
+        self.error = None;
         self.user = favorite.user.clone();
         self.key_path = favorite.key_path.clone();
         self.root = favorite.root.clone();
@@ -627,6 +638,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn a_favorite_needs_somewhere_to_connect_to() {
+        let mut dialog = ConnectDialog::from_settings(config::SshSettings::default());
+        // Every field blank, as on first start.
+        assert!(dialog.to_favorite().is_err());
+        dialog.host = "   ".to_string();
+        assert!(dialog.to_favorite().is_err());
+
+        dialog.host = " nas ".to_string();
+        dialog.user = "alex ".to_string();
+        dialog.port = String::new();
+        dialog.root = "/photos".to_string();
+        let favorite = dialog.to_favorite().expect("a host is enough");
+        // Tidied, with the blank port spelled out.
+        assert_eq!(favorite.host, "nas");
+        assert_eq!(favorite.user, "alex");
+        assert_eq!(favorite.port, "22");
+        assert_eq!(favorite.label, "alex@nas:/photos");
+
+        // A port that could never connect is not worth saving either.
+        dialog.port = "99999".to_string();
+        assert!(dialog.to_favorite().is_err());
     }
 
     #[test]
