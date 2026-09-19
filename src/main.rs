@@ -139,6 +139,9 @@ struct TwelfApp {
     /// bar until the user dismisses it — `log!` is a no-op in release builds, so
     /// this is the only channel these failures have.
     status_message: Option<String>,
+    /// The config file exists but could not be loaded. The next save renames it
+    /// to `config.toml.bad` instead of writing the defaults over it.
+    config_unusable: bool,
     image_prefetch: VecDeque<String>,
     /// Prefetch URIs whose fetch has been started and is still resolving,
     /// capped at `PREFETCH_IN_FLIGHT`.
@@ -157,7 +160,13 @@ impl TwelfApp {
         let (remote_poll_tx, remote_poll_rx) = tokio::sync::mpsc::channel(64);
         // Read once: loading it per field would drop whatever the other fields
         // hold, which is how a save could lose the favorites.
-        let config = config::load();
+        let config::Loaded { config, problem } = config::load();
+        let status_message = problem.as_ref().map(|problem| {
+            format!(
+                "config.toml was not loaded ({problem}); using defaults. \
+                 It will be kept as config.toml.bad"
+            )
+        });
         Self {
             root_node: None,
             fs_watcher: None,
@@ -195,7 +204,8 @@ impl TwelfApp {
                 .build()
                 .expect("failed to build tokio runtime"),
             cache: Arc::new(cache::ImageCache::new()),
-            status_message: None,
+            status_message,
+            config_unusable: problem.is_some(),
             image_prefetch: VecDeque::new(),
             prefetch_in_flight: Vec::new(),
             displayed_uris: VecDeque::new(),
@@ -312,23 +322,33 @@ impl TwelfApp {
     }
 
     /// Persist the whole config. Always writes both halves — writing only the
-    /// one that changed would blank the other.
-    fn save_config(&self) {
-        config::save(&config::Config {
+    /// one that changed would blank the other. Returns whether it was written;
+    /// a failure goes to the status bar, since release builds log nothing.
+    fn save_config(&mut self) -> bool {
+        let config = config::Config {
             ssh: self.ssh_dialog.to_settings(),
             favorites: self.favorites.clone(),
-        });
+        };
+        match config::save(&config, self.config_unusable) {
+            Ok(()) => {
+                self.config_unusable = false;
+                true
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Settings not saved: {e}"));
+                false
+            }
+        }
     }
 
     /// Save `favorite`, reporting in the status bar either way — silently doing
     /// nothing on a duplicate would read as the action having failed.
     fn add_favorite(&mut self, favorite: config::Favorite) {
         let label = favorite.label.clone();
-        if config::add_favorite(&mut self.favorites, favorite) {
-            self.save_config();
-            self.status_message = Some(format!("Saved favorite {label}"));
-        } else {
+        if !config::add_favorite(&mut self.favorites, favorite) {
             self.status_message = Some(format!("Already saved: {label}"));
+        } else if self.save_config() {
+            self.status_message = Some(format!("Saved favorite {label}"));
         }
     }
 
