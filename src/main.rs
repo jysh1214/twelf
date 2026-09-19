@@ -1385,25 +1385,18 @@ impl eframe::App for TwelfApp {
                 Err(error) => self.ssh_dialog.error = Some(error),
             }
         }
-        // A port that does not parse keeps the dialog open with the reason in
-        // it, and is not written to the config either.
-        let mut port = None;
+        // A blank host or a port that does not parse keeps the dialog open with
+        // the reason in it, and is not written to the config either.
+        let mut request = None;
         if connect_clicked {
-            match ssh::parse_port(&self.ssh_dialog.port) {
-                Ok(parsed) => port = Some(parsed),
+            match self.ssh_dialog.to_request() {
+                Ok(valid) => request = Some(valid),
                 Err(error) => self.ssh_dialog.error = Some(error),
             }
         }
-        if let Some(port) = port {
+        if let Some(req) = request {
             self.ssh_dialog.error = None;
             self.save_config();
-            let req = ssh::ConnectRequest {
-                host: self.ssh_dialog.host.clone(),
-                port,
-                user: self.ssh_dialog.user.clone(),
-                key_path: self.ssh_dialog.key_path.clone(),
-                root: self.ssh_dialog.root.clone(),
-            };
             // Replacing an attempt still in flight drops it, which abandons it.
             self.connecting = Some(ssh::ConnectAttempt::spawn(req, &self.runtime, ctx));
             self.pending_host_key = None;

@@ -182,6 +182,31 @@ impl ConnectDialog {
         }
     }
 
+    /// The host and port typed, tidied and checked: what both Connect and Save
+    /// current need before they do anything.
+    fn target(&self) -> Result<(&str, u16), String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("Enter a HostName first".to_string());
+        }
+        Ok((host, parse_port(&self.port)?))
+    }
+
+    /// What Connect should attempt. Refused, with the reason for the dialog to
+    /// show, when there is no host or the port does not parse: a blank host went
+    /// all the way to a connection attempt and came back as a resolver error in
+    /// the menu bar, with the dialog already closed.
+    pub fn to_request(&self) -> Result<ConnectRequest, String> {
+        let (host, port) = self.target()?;
+        Ok(ConnectRequest {
+            host: host.to_string(),
+            port,
+            user: self.user.trim().to_string(),
+            key_path: self.key_path.clone(),
+            root: self.root.clone(),
+        })
+    }
+
     /// Snapshot the dialog as a saveable favorite, labelled from its own fields.
     /// Refused when it names nowhere to connect to: with the fields blank, Save
     /// current used to store a favorite labelled ":", and one with a port that
@@ -189,11 +214,7 @@ impl ConnectDialog {
     /// stored tidied, so the same place typed with a stray space is recognised
     /// as already saved.
     pub fn to_favorite(&self) -> Result<config::Favorite, String> {
-        let host = self.host.trim();
-        if host.is_empty() {
-            return Err("Enter a HostName before saving a favorite".to_string());
-        }
-        let port = parse_port(&self.port)?;
+        let (host, port) = self.target()?;
         let user = self.user.trim();
         Ok(config::Favorite {
             label: config::Favorite::derive_label(user, host, &self.root),
@@ -638,6 +659,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn connect_needs_a_host_and_a_port_that_parses() {
+        let mut dialog = ConnectDialog::from_settings(config::SshSettings::default());
+        // Blank host: nothing to attempt, and the dialog should say so.
+        assert!(dialog.to_request().is_err());
+        dialog.host = " nas ".to_string();
+        dialog.user = " alex".to_string();
+        dialog.port = "2222 ".to_string();
+        let request = dialog.to_request().expect("valid");
+        assert_eq!(request.target(), "alex@nas:2222");
+        dialog.port = "ssh".to_string();
+        assert!(dialog.to_request().is_err());
     }
 
     #[test]
