@@ -883,6 +883,33 @@ impl TwelfApp {
         }
     }
 
+    /// Point an open Rename or Delete dialog at where its target is now. Each
+    /// holds the path it was opened on; when that file — or a folder above it —
+    /// was renamed meanwhile, confirming failed with a bare "No such file or
+    /// directory" for something the user could see sitting in the tree.
+    /// `moved_to` answers for one path: its new location, or `None` if it has not
+    /// moved. Only dialogs on the side that was renamed are touched.
+    fn rebase_pending_dialogs(
+        &mut self,
+        is_remote: bool,
+        moved_to: impl Fn(&Path) -> Option<PathBuf>,
+    ) {
+        if let Some(pending) = self.pending_delete.as_mut()
+            && pending.is_remote == is_remote
+            && let Some(now) = moved_to(&pending.path)
+        {
+            pending.path = now;
+            pending.error = None;
+        }
+        if let Some(pending) = self.pending_rename.as_mut()
+            && pending.is_remote == is_remote
+            && let Some(now) = moved_to(&pending.path)
+        {
+            pending.path = now;
+            pending.error = None;
+        }
+    }
+
     /// After a successful rename `old`→`new` on the local tree, or on the remote
     /// one when `is_remote`: follow that tree's selection to the new path
     /// (including a selected descendant of a renamed folder), scroll the tree to
@@ -899,6 +926,7 @@ impl TwelfApp {
         is_remote: bool,
         ctx: &egui::Context,
     ) {
+        self.rebase_pending_dialogs(is_remote, |path| rebase_path(path, old, new));
         let (selection, scroll_target) = if is_remote {
             (&mut self.selected_remote, &mut self.remote_scroll_target)
         } else {
@@ -1030,6 +1058,13 @@ impl eframe::App for TwelfApp {
             // Only the affected file's cache entries are dropped. Forgetting every
             // image also threw away whatever the remote tree had loaded, when
             // that was the one on screen.
+            self.rebase_pending_dialogs(false, |path| {
+                match follow_renames(Some(path), &changes.renames) {
+                    Some(Followed::Moved(now)) => Some(now),
+                    // Renamed onto: the name the dialog is about is still there.
+                    Some(Followed::Replaced) | None => None,
+                }
+            });
             let followed = follow_renames(self.selected_image.as_deref(), &changes.renames);
             if followed.is_some()
                 && let Some(path) = &self.selected_image
@@ -1954,6 +1989,66 @@ mod tests {
         app.local_scroll_target = Some(dir.path().join("a.jpg"));
         app.drop_dead_scroll_targets();
         assert!(app.local_scroll_target.is_some());
+    }
+
+    #[test]
+    fn open_dialogs_follow_their_target_when_it_is_renamed() {
+        let mut app = TwelfApp::for_test();
+        app.pending_delete = Some(PendingDelete {
+            path: PathBuf::from("/r/d/a.jpg"),
+            is_dir: false,
+            is_remote: false,
+            error: Some("No such file or directory".to_string()),
+        });
+        app.pending_rename = Some(PendingRename {
+            path: PathBuf::from("/r/d/b.jpg"),
+            is_dir: false,
+            is_remote: false,
+            name: "typed-so-far.jpg".to_string(),
+            needs_focus: false,
+            error: None,
+        });
+
+        // The folder above both is renamed from outside the app.
+        let renames = [(PathBuf::from("/r/d"), PathBuf::from("/r/e"))];
+        app.rebase_pending_dialogs(false, |path| match follow_renames(Some(path), &renames) {
+            Some(Followed::Moved(now)) => Some(now),
+            _ => None,
+        });
+        let delete = app.pending_delete.as_ref().unwrap();
+        assert_eq!(delete.path, PathBuf::from("/r/e/a.jpg"));
+        // The earlier failure was about the old path; it no longer applies.
+        assert_eq!(delete.error, None);
+        let rename = app.pending_rename.as_ref().unwrap();
+        assert_eq!(rename.path, PathBuf::from("/r/e/b.jpg"));
+        // What the user has typed is theirs.
+        assert_eq!(rename.name, "typed-so-far.jpg");
+
+        // A rename on the other side is about other files, same path or not.
+        app.rebase_pending_dialogs(true, |path| {
+            rebase_path(path, Path::new("/r/e"), Path::new("/r/zzz"))
+        });
+        assert_eq!(
+            app.pending_delete.as_ref().unwrap().path,
+            PathBuf::from("/r/e/a.jpg")
+        );
+    }
+
+    #[test]
+    fn an_in_app_rename_carries_an_open_delete_dialog_along() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::for_test();
+        app.pending_delete = Some(PendingDelete {
+            path: PathBuf::from("/r/d/a.jpg"),
+            is_dir: false,
+            is_remote: false,
+            error: None,
+        });
+        app.apply_rename_side_effects(Path::new("/r/d"), Path::new("/r/e"), false, &ctx);
+        assert_eq!(
+            app.pending_delete.as_ref().unwrap().path,
+            PathBuf::from("/r/e/a.jpg")
+        );
     }
 
     #[test]
