@@ -608,6 +608,33 @@ impl VideoPlayer {
     }
 }
 
+/// One run of the decoder from wherever it was last positioned to the end of
+/// the stream, tracked so `decode_loop` can tell a video worth looping from one
+/// that will never show anything.
+struct Pass {
+    began_at_start: bool,
+    produced: bool,
+}
+
+impl Pass {
+    fn from_start() -> Self {
+        Self { began_at_start: true, produced: false }
+    }
+
+    /// A seek may land past the last frame, so an empty pass after one proves
+    /// nothing; the loop-back that follows starts the pass that does.
+    fn seeked(&mut self) {
+        self.began_at_start = false;
+    }
+
+    /// At end of stream: a pass from the start that yielded no frame will never
+    /// do better, and looping it would spin the worker at full speed — re-reading
+    /// a remote file each time — behind a panel that stays blank.
+    fn is_hopeless(&self) -> bool {
+        self.began_at_start && !self.produced
+    }
+}
+
 /// Decode frames forever — looping at EOF and honoring seek requests — pushing
 /// each onto the channel with its position and seek generation. Returns when the
 /// player is dropped (send fails) or decoding errors.
@@ -619,6 +646,7 @@ fn decode_loop(
 ) {
     shared.lock().unwrap().duration = decoder.duration();
     let mut generation = 0;
+    let mut pass = Pass::from_start();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return; // player dropped
@@ -628,16 +656,18 @@ fn decode_loop(
             let mut s = shared.lock().unwrap();
             s.seek_request.take().inspect(|_| generation = s.generation)
         };
-        if let Some(target) = target
-            && let Err(e) = decoder.seek_to(target)
-        {
-            if !cancel.load(Ordering::Relaxed) {
-                report_error(shared, format!("video seek failed: {e}"));
+        if let Some(target) = target {
+            if let Err(e) = decoder.seek_to(target) {
+                if !cancel.load(Ordering::Relaxed) {
+                    report_error(shared, format!("video seek failed: {e}"));
+                }
+                return;
             }
-            return;
+            pass.seeked();
         }
         match decoder.next_frame() {
             Ok(Some(frame)) => {
+                pass.produced = true;
                 let mut item = TimedFrame {
                     image: frame.image,
                     position: frame.pts,
@@ -659,6 +689,12 @@ fn decode_loop(
                 }
             }
             Ok(None) => {
+                if pass.is_hopeless() {
+                    if !cancel.load(Ordering::Relaxed) {
+                        report_error(shared, "video has no decodable frames".to_string());
+                    }
+                    return;
+                }
                 // Loop back to the start.
                 if let Err(e) = decoder.seek_to(0.0) {
                     if !cancel.load(Ordering::Relaxed) {
@@ -666,6 +702,7 @@ fn decode_loop(
                     }
                     return;
                 }
+                pass = Pass::from_start();
             }
             Err(e) => {
                 if !cancel.load(Ordering::Relaxed) {
@@ -798,6 +835,20 @@ mod tests {
             assert!(Instant::now() < deadline, "no error surfaced within 2s");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn only_an_empty_pass_from_the_start_is_hopeless() {
+        // Nothing decoded from the very beginning: looping cannot help.
+        assert!(Pass::from_start().is_hopeless());
+        // An ordinary video reaches its end having shown frames.
+        let mut played = Pass::from_start();
+        played.produced = true;
+        assert!(!played.is_hopeless());
+        // A seek past the last frame ends empty too, but the video is fine.
+        let mut seeked = Pass::from_start();
+        seeked.seeked();
+        assert!(!seeked.is_hopeless());
     }
 
     #[test]
