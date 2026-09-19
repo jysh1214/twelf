@@ -525,8 +525,10 @@ pub fn spawn_remote_download(
 }
 
 /// Recursively copy `dir` (under `root`) to the local destination. Unfiltered —
-/// every file is fetched, unlike the media-only tree listing. Silent-skips a
-/// read_dir error and stops on cancel or past the depth cap, like the search walk.
+/// every file is fetched, unlike the media-only tree listing. Stops on cancel.
+/// A folder that cannot be listed, or that sits past the depth cap, is counted
+/// as a failure: unlike the search walk, skipping it silently would report a
+/// partial copy as a complete one.
 async fn download_remote_dir(
     sftp: &SftpSession,
     root: &Path,
@@ -537,7 +539,12 @@ async fn download_remote_dir(
     progress: &DownloadProgress,
     depth: usize,
 ) {
-    if depth > REMOTE_SEARCH_MAX_DEPTH || cancel.load(Ordering::Relaxed) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    if depth > REMOTE_SEARCH_MAX_DEPTH {
+        crate::log!("not descending past the depth cap into {}", dir.display());
+        progress.errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let entries = {
@@ -546,7 +553,11 @@ async fn download_remote_dir(
         let _permit = sem.acquire().await.expect("download semaphore never closed");
         match sftp.read_dir(dir.to_string_lossy().into_owned()).await {
             Ok(entries) => entries,
-            Err(_) => return,
+            Err(e) => {
+                crate::log!("failed to list {}: {e}", dir.display());
+                progress.errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
     };
     if cancel.load(Ordering::Relaxed) {
