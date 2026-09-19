@@ -116,7 +116,20 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
     let mut session = client::connect(config, (req.host.as_str(), req.port), AcceptAnyHostKey)
         .await
         .map_err(stringify)?;
-    let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
+    // An RSA key has to be told which hash to sign with, and `None` means the
+    // legacy SHA-1 `ssh-rsa` that OpenSSH 8.8+ refuses — so ask the server what
+    // it takes. Only RSA pays for the question: it can wait up to a second for
+    // the server's extension info, and every other key type ignores the answer.
+    let hash_alg = if private_key.algorithm().is_rsa() {
+        session
+            .best_supported_rsa_hash()
+            .await
+            .map_err(stringify)?
+            .flatten()
+    } else {
+        None
+    };
+    let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_alg);
     let auth = session
         .authenticate_publickey(req.user.as_str(), key_with_alg)
         .await
