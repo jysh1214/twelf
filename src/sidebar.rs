@@ -2,6 +2,8 @@ use eframe::egui;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct TreeNode {
     path: PathBuf,
@@ -313,10 +315,66 @@ fn list_children(root: &Path) -> DirChildren {
 /// match. A folder whose own name matches keeps its full contents, so it can be
 /// browsed from the results. Unlike the live `TreeNode`, the result is fully
 /// materialized, so it can never lazy-load an unfiltered directory when rendered.
+#[cfg(test)]
 pub fn search_tree(root: &Path, query: &str) -> Vec<SearchHit> {
+    search_tree_until(root, query, &AtomicBool::new(false)).unwrap_or_default()
+}
+
+/// `search_tree`, given up — as `None` — once `cancel` is set. Looked at on
+/// entering each directory, so an abandoned walk of a big tree ends promptly.
+fn search_tree_until(root: &Path, query: &str, cancel: &AtomicBool) -> Option<Vec<SearchHit>> {
     let query_lc = query.to_lowercase();
     let mut visited = HashSet::new();
-    search_dir(root, &query_lc, &mut visited, false)
+    let hits = search_dir(root, &query_lc, &mut visited, false, cancel);
+    (!cancel.load(Ordering::Relaxed)).then_some(hits)
+}
+
+/// A search of the local tree running on the blocking pool. The walk used to
+/// run inside the UI's frame on every change to the query: with the root on a
+/// large library, a spinning disk or a network mount, typing "holiday" froze
+/// the window seven times over, each for a whole-tree walk. Dropping the handle
+/// — which replacing it with the next query's walk does — abandons the walk.
+pub struct LocalSearchWalk {
+    query: String,
+    cancel: Arc<AtomicBool>,
+    rx: std::sync::mpsc::Receiver<Vec<SearchHit>>,
+}
+
+impl LocalSearchWalk {
+    pub fn spawn(
+        root: PathBuf,
+        query: String,
+        runtime: &tokio::runtime::Runtime,
+        ctx: &egui::Context,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_task = cancel.clone();
+        let query_task = query.clone();
+        let ctx = ctx.clone();
+        runtime.spawn_blocking(move || {
+            if let Some(hits) = search_tree_until(&root, &query_task, &cancel_task) {
+                let _ = tx.send(hits);
+                ctx.request_repaint();
+            }
+        });
+        Self { query, cancel, rx }
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// The results, once the walk is done (non-blocking).
+    pub fn poll(&self) -> Option<Vec<SearchHit>> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for LocalSearchWalk {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 fn search_dir(
@@ -324,7 +382,11 @@ fn search_dir(
     query_lc: &str,
     visited: &mut HashSet<PathBuf>,
     keep_all: bool,
+    cancel: &AtomicBool,
 ) -> Vec<SearchHit> {
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     // Skip a directory already entered, so a symlink pointing back at an ancestor
     // can't make the walk loop forever (`is_dir()` follows symlinks).
     if let Ok(canonical) = dir.canonicalize() {
@@ -349,7 +411,7 @@ fn search_dir(
             .unwrap_or_default();
         let matches = name.to_lowercase().contains(query_lc);
         if path.is_dir() {
-            let children = search_dir(&path, query_lc, visited, keep_all || matches);
+            let children = search_dir(&path, query_lc, visited, keep_all || matches, cancel);
             if let Some(hit) = SearchHit::dir(path, name, matches, keep_all, children) {
                 hits.push(hit);
             }
@@ -996,6 +1058,46 @@ mod tests {
         let mut tree = listed_tree(root);
         fs::remove_dir_all(root.join("sub")).unwrap();
         assert!(tree.relist(&root.join("sub")));
+    }
+
+    #[test]
+    fn a_search_walk_delivers_its_results_off_the_calling_thread() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        touch(&root.join("sub").join("trip.jpg"));
+        touch(&root.join("other.jpg"));
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let walk = LocalSearchWalk::spawn(
+            root.to_path_buf(),
+            "trip".to_string(),
+            &rt,
+            &egui::Context::default(),
+        );
+        assert_eq!(walk.query(), "trip");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let hits = loop {
+            if let Some(hits) = walk.poll() {
+                break hits;
+            }
+            assert!(std::time::Instant::now() < deadline, "no results within 5s");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(hit_files(&hits), vec![root.join("sub").join("trip.jpg")]);
+    }
+
+    #[test]
+    fn an_abandoned_search_walk_yields_nothing() {
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("trip.jpg"));
+        let cancelled = AtomicBool::new(true);
+        assert!(search_tree_until(dir.path(), "trip", &cancelled).is_none());
+        // Left alone, the same walk finds the file.
+        let live = AtomicBool::new(false);
+        assert_eq!(
+            search_tree_until(dir.path(), "trip", &live).map(|hits| hits.len()),
+            Some(1)
+        );
     }
 
     #[test]

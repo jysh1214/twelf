@@ -63,8 +63,8 @@ const REMOTE_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_mi
 const REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minimum gap between watcher-driven re-walks of an open local search. The walk
-/// is synchronous over the whole tree, so honouring every filesystem event would
-/// hit the disk on every frame for as long as a folder is being written into.
+/// covers the whole tree, so honouring every filesystem event would keep one
+/// running back to back for as long as a folder is being written into.
 const LOCAL_SEARCH_REWALK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many prefetch fetches may be in flight at once. `SftpBytesLoader` spawns
@@ -119,6 +119,9 @@ struct TwelfApp {
     search_active: bool,
     search_query: String,
     search_cache: Option<(String, Vec<sidebar::SearchHit>)>,
+    /// The walk, off this thread, that will fill `search_cache` for the query
+    /// now typed (or refresh it after the disk changed).
+    local_search: Option<sidebar::LocalSearchWalk>,
     /// A watcher batch changed the local tree, so an open search's results are
     /// stale. Re-walking is debounced by `LOCAL_SEARCH_REWALK`.
     search_dirty: bool,
@@ -240,6 +243,7 @@ impl TwelfApp {
             search_active: false,
             search_query: String::new(),
             search_cache: None,
+            local_search: None,
             search_dirty: false,
             last_search_walk: None,
             remote_search: None,
@@ -330,8 +334,13 @@ impl TwelfApp {
                 root.map(|r| r.collect_images()).unwrap_or_default()
             }
         } else if searching {
-            let hits = self.search_cache.as_ref().map(|(_, hits)| hits.as_slice());
-            hits.map(sidebar::hit_files).unwrap_or_default()
+            // Only results for the query on screen: while a new walk is out, the
+            // cache still holds the previous query's.
+            let query = self.search_query.trim();
+            let hits = self.search_cache.as_ref();
+            hits.filter(|(shown, _)| shown == query)
+                .map(|(_, hits)| sidebar::hit_files(hits))
+                .unwrap_or_default()
         } else {
             let root = self.root_node.as_ref();
             root.map(|r| r.collect_images()).unwrap_or_default()
@@ -442,6 +451,7 @@ impl TwelfApp {
         self.search_active = false;
         self.search_query.clear();
         self.search_cache = None;
+        self.local_search = None;
         self.remote_search = None;
         self.remote_search_changed = None;
         self.pending_delete = None;
@@ -763,6 +773,7 @@ impl TwelfApp {
         self.search_active = false;
         self.search_query.clear();
         self.search_cache = None;
+        self.local_search = None;
         self.remote_search = None;
         self.remote_search_changed = None;
     }
@@ -907,6 +918,7 @@ impl TwelfApp {
         self.search_active = false;
         self.search_query.clear();
         self.search_cache = None;
+        self.local_search = None;
         self.remote_search = None;
         self.remote_search_changed = None;
     }
@@ -1148,6 +1160,8 @@ impl eframe::App for TwelfApp {
             self.search_active = false;
             self.search_query.clear();
             self.search_cache = None;
+            self.local_search = None;
+            self.local_search = None;
             self.remote_search = None;
             self.remote_search_changed = None;
         }
@@ -1543,36 +1557,58 @@ impl eframe::App for TwelfApp {
                     if self.search_active {
                         sidebar::search_bar(ui, &mut self.search_query, open_search);
                     }
-                    // Refresh the cached walk outside the scroll closure (it needs the root
-                    // path and query). Re-walk only when the trimmed query changes — egui
-                    // repaints ~60x/s, so an ungated walk would hit the disk every frame.
+                    // Keep `search_cache` answering the query on screen, by way of a
+                    // walk on the blocking pool: never here, where a whole-tree walk
+                    // per keystroke froze the window for each one.
                     let searching = self.search_active && !self.search_query.trim().is_empty();
                     if searching && let Some(root) = self.root_node.as_ref() {
                         let query = self.search_query.trim();
-                        let query_changed =
-                            self.search_cache.as_ref().map(|(k, _)| k.as_str()) != Some(query);
-                        // A watcher batch makes the results stale, but the walk is
-                        // synchronous and whole-tree, so it waits out the debounce.
+                        if let Some(hits) = self.local_search.as_ref().and_then(|w| w.poll())
+                            && let Some(walk) = self.local_search.take()
+                            && walk.query() == query
+                        {
+                            self.search_cache = Some((query.to_string(), hits));
+                        }
+                        let shown =
+                            self.search_cache.as_ref().map(|(k, _)| k.as_str()) == Some(query);
+                        let walking = self.local_search.as_ref().map(|w| w.query()) == Some(query);
+                        // A watcher batch makes the results stale. The re-walk is
+                        // throttled, or a folder being written into would keep one
+                        // running back to back for as long as the copy lasts.
                         let refresh_due = self.search_dirty
                             && self
                                 .last_search_walk
                                 .is_none_or(|t| t.elapsed() >= LOCAL_SEARCH_REWALK);
-                        if query_changed || refresh_due {
-                            let hits = sidebar::search_tree(root.path(), query);
-                            self.search_cache = Some((query.to_string(), hits));
+                        if !walking && (!shown || refresh_due) {
+                            // Replacing a walk for an older query abandons it.
+                            self.local_search = Some(sidebar::LocalSearchWalk::spawn(
+                                root.path().to_path_buf(),
+                                query.to_string(),
+                                &self.runtime,
+                                ctx,
+                            ));
                             self.search_dirty = false;
                             self.last_search_walk = Some(std::time::Instant::now());
-                        } else if self.search_dirty {
+                        } else if self.search_dirty && !walking {
                             let wait = self
                                 .last_search_walk
                                 .map(|t| LOCAL_SEARCH_REWALK.saturating_sub(t.elapsed()))
                                 .unwrap_or_default();
                             ctx.request_repaint_after(wait);
                         }
+                    } else {
+                        self.local_search = None;
                     }
                     scroll().show(ui, |ui| {
                         if searching {
-                            if let Some((_, hits)) = &self.search_cache {
+                            // Results for an earlier query would be misleading
+                            // under the one now typed; say the walk is out.
+                            let query = self.search_query.trim();
+                            let current = self.search_cache.as_ref().filter(|(k, _)| k == query);
+                            if current.is_none() {
+                                ui.label(egui::RichText::new("Searching…").italics().weak());
+                            }
+                            if let Some((_, hits)) = current {
                                 sidebar::render_search_results(
                                     ui,
                                     hits,
@@ -2126,6 +2162,13 @@ mod tests {
         app.navigate_image(1);
         assert_eq!(app.selected_image, Some(root.join("c-trip.jpg")));
         assert_eq!(app.local_scroll_target, Some(root.join("c-trip.jpg")));
+        app.navigate_image(1);
+        assert_eq!(app.selected_image, Some(root.join("a-trip.jpg")));
+
+        // A letter deleted: the walk for "tri" is still out, and the results on
+        // hand answer a different question. The arrows wait rather than step
+        // through those.
+        app.search_query = "tri".to_string();
         app.navigate_image(1);
         assert_eq!(app.selected_image, Some(root.join("a-trip.jpg")));
 
