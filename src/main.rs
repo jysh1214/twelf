@@ -43,7 +43,8 @@ fn main() -> eframe::Result {
                     app.cache.clone(),
                 )));
             // Registered after the others so egui's reverse-order lookup tries it
-            // first for sftp:// images (decoded off-thread); it defers everything else.
+            // first: it decodes every image but local HEIC, off-thread and with
+            // the EXIF orientation applied, and defers the rest.
             cc.egui_ctx
                 .add_image_loader(Arc::new(decoded::DecodedImageLoader::new(
                     app.runtime.handle().clone(),

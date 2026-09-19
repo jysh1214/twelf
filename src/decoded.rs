@@ -23,9 +23,12 @@ struct LoaderState {
     failed: BackOff,
 }
 
-/// Decodes remote (`sftp://`) images off the UI thread into a bounded cache.
-/// Registered last so egui (which tries image loaders most-recently-added-first)
-/// consults it before the synchronous `egui_extras` decoder.
+/// Decodes images off the UI thread into a bounded cache: every remote
+/// (`sftp://`) one, and every local (`file://`) one but HEIC, which `HeicLoader`
+/// reads straight from disk. Registered last so egui (which tries image loaders
+/// most-recently-added-first) consults it before the `egui_extras` decoder —
+/// which ignores EXIF orientation, so local portrait photos came out sideways
+/// while the same files over SFTP would not have.
 pub struct DecodedImageLoader {
     handle: tokio::runtime::Handle,
     state: Arc<Mutex<LoaderState>>,
@@ -50,7 +53,7 @@ impl ImageLoader for DecodedImageLoader {
     }
 
     fn load(&self, ctx: &Context, uri: &str, _size_hint: SizeHint) -> ImageLoadResult {
-        if !uri.starts_with("sftp://") {
+        if !handles(uri) {
             return Err(LoadError::NotSupported);
         }
         // One key per file, shared with the bytes loader. egui asks for a webp or
@@ -121,11 +124,30 @@ impl ImageLoader for DecodedImageLoader {
     }
 }
 
+/// Whether this loader decodes `uri`; see `DecodedImageLoader`.
+fn handles(uri: &str) -> bool {
+    uri.starts_with("sftp://") || (uri.starts_with("file://") && !crate::heic::is_heic(uri))
+}
+
 fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
     if crate::heic::is_heic(uri) {
         crate::heic::decode_bytes(bytes).map_err(|e| e.to_string())
     } else {
-        let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+        use image::ImageDecoder as _;
+        // `image::load_from_memory` never looks at the EXIF orientation, so a
+        // phone's portrait JPEG rendered on its side. libheif applies its own
+        // transforms, which is why the HEIC of the same shot was upright.
+        let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .into_decoder()
+            .map_err(|e| e.to_string())?;
+        // Unreadable orientation metadata is no reason to refuse the picture.
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+        img.apply_orientation(orientation);
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         Ok(ColorImage::from_rgba_unmultiplied(
@@ -148,6 +170,65 @@ mod tests {
             &vec![255u8; 10 * 4 * 4],
         ));
         assert_eq!(image.byte_size(), 10 * 4 * 4);
+    }
+
+    /// A 16x8 JPEG, left half red and right half blue, tagged with EXIF
+    /// `orientation` (spliced in as an APP1 segment after the JFIF header).
+    fn jpeg_with_orientation(orientation: u8) -> Vec<u8> {
+        let mut pixels = image::RgbImage::new(16, 8);
+        for (x, _, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = if x < 8 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&pixels)
+            .expect("encode");
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0MM\0*\0\0\0\x08");
+        // One IFD entry: tag 0x0112 (Orientation), SHORT, count 1, the value.
+        app1.extend_from_slice(&[0x00, 0x01, 0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        app1.extend_from_slice(&[0x00, orientation, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &jpeg[2..4],
+            &[0xFF, 0xE0],
+            "encoder writes a JFIF header first"
+        );
+        let after_jfif = 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize;
+        jpeg.splice(after_jfif..after_jfif, app1);
+        jpeg
+    }
+
+    #[test]
+    fn exif_orientation_is_applied() {
+        let is_red = |c: egui::Color32| c.r() > 150 && c.b() < 100;
+        let is_blue = |c: egui::Color32| c.b() > 150 && c.r() < 100;
+
+        // Untagged (1 = upright): as stored, red on the left.
+        let upright = decode_image("file:///a.jpg", &jpeg_with_orientation(1)).expect("decode");
+        assert_eq!(upright.size, [16, 8]);
+        assert!(is_red(upright[(2, 4)]) && is_blue(upright[(13, 4)]));
+
+        // 6 = the camera was held rotated; showing it needs a quarter turn
+        // clockwise, which puts the stored left edge on top.
+        let portrait = decode_image("file:///a.jpg", &jpeg_with_orientation(6)).expect("decode");
+        assert_eq!(portrait.size, [8, 16]);
+        assert!(is_red(portrait[(4, 2)]) && is_blue(portrait[(4, 13)]));
+    }
+
+    #[test]
+    fn local_images_are_decoded_here_except_heic() {
+        assert!(handles("sftp://nas/photos/a.jpg"));
+        assert!(handles("sftp://nas/photos/a.heic"));
+        assert!(handles("file:///photos/a.jpg"));
+        // Egui asks for an animated format by frame; still ours.
+        assert!(handles("file:///photos/a.webp#0"));
+        // `HeicLoader` reads these from disk itself.
+        assert!(!handles("file:///photos/a.HEIC"));
+        assert!(!handles("https://example.com/a.jpg"));
     }
 
     #[test]
