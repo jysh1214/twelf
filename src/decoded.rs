@@ -2,6 +2,7 @@ use eframe::egui;
 use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
 use crate::backoff::BackOff;
 use crate::lru::{ByteLru, ByteSized};
+use crate::sftp_loader::canonical_key;
 use egui::{ColorImage, Context};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -52,6 +53,12 @@ impl ImageLoader for DecodedImageLoader {
         if !uri.starts_with("sftp://") {
             return Err(LoadError::NotSupported);
         }
+        // One key per file, shared with the bytes loader. egui asks for a webp or
+        // gif as `uri#0` while the prefetcher asks for the bare `uri`; keyed on
+        // the raw string, a prefetched file was decoded again on selection and
+        // held twice in the cache.
+        let key = canonical_key(uri);
+        let uri = key.as_str();
         {
             let mut state = self.state.lock().unwrap();
             if let Some(image) = state.cache.get(uri) {
@@ -95,10 +102,11 @@ impl ImageLoader for DecodedImageLoader {
     }
 
     fn forget(&self, uri: &str) {
+        let key = canonical_key(uri);
         let mut state = self.state.lock().unwrap();
-        state.cache.forget(uri);
-        state.pending.remove(uri);
-        state.failed.clear(uri);
+        state.cache.forget(&key);
+        state.pending.remove(&key);
+        state.failed.clear(&key);
     }
 
     fn forget_all(&self) {
@@ -140,5 +148,23 @@ mod tests {
             &vec![255u8; 10 * 4 * 4],
         ));
         assert_eq!(image.byte_size(), 10 * 4 * 4);
+    }
+
+    #[test]
+    fn a_fragmented_uri_shares_the_entry_stored_bare() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let loader = DecodedImageLoader::new(rt.handle().clone());
+        let image = Arc::new(ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 255]));
+        // What a prefetch leaves behind: the decode, under the bare URI.
+        loader.state.lock().unwrap().cache.put("sftp://host/a.webp".to_string(), image);
+        let ctx = Context::default();
+        // Selecting the file asks for frame 0; that must not decode it again.
+        assert!(matches!(
+            loader.load(&ctx, "sftp://host/a.webp#0", SizeHint::default()),
+            Ok(ImagePoll::Ready { .. })
+        ));
+        // And forgetting either form drops the one entry.
+        loader.forget("sftp://host/a.webp#0");
+        assert!(loader.state.lock().unwrap().cache.get("sftp://host/a.webp").is_none());
     }
 }

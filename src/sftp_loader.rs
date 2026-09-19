@@ -206,7 +206,7 @@ impl BytesLoader for SftpBytesLoader {
 /// file arrives here as both `…/a.webp` and `…/a.webp#0`. Keying on the raw URI
 /// fetched, transferred and stored it twice; the network read already strips the
 /// fragment, so the cache has to agree with it.
-fn canonical_key(uri: &str) -> String {
+pub(crate) fn canonical_key(uri: &str) -> String {
     egui::decode_animated_image_uri(uri)
         .map_or(uri, |(base, _)| base)
         .to_string()
