@@ -257,8 +257,7 @@ impl TwelfApp {
     }
 
     fn navigate_image(&mut self, delta: i32) {
-        let remote_mode =
-            matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
+        let remote_mode = self.remote_shown();
         let (current, list) = if remote_mode {
             let Some(current) = self.selected_remote.clone() else {
                 return;
@@ -381,6 +380,12 @@ impl TwelfApp {
         *self.session_holder.lock().unwrap() = None;
         self.clear_image_prefetch();
         self.forget_all_images(ctx);
+    }
+
+    /// Whether the sidebar is showing the remote tree rather than the local one:
+    /// connected, with a remote root to browse.
+    fn remote_shown(&self) -> bool {
+        matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some()
     }
 
     /// Apply the outcome of a connection attempt to `target`. Success replaces
@@ -762,9 +767,7 @@ impl eframe::App for TwelfApp {
             // remote tree or search results showing, the target would dangle
             // unconsumed and force-open folders toward a row that isn't there.
             if let Some(p) = follow_renames(self.selected_image.as_deref(), &changes.renames) {
-                let remote_shown = matches!(self.ssh, ssh::SshState::Connected { .. })
-                    && self.remote_root.is_some();
-                if !remote_shown && !self.search_active {
+                if !self.remote_shown() && !self.search_active {
                     self.scroll_target = Some(p.clone());
                 }
                 self.selected_image = Some(p);
@@ -1394,9 +1397,7 @@ impl eframe::App for TwelfApp {
         // next render re-lists it (expanded subfolders re-list lazily). Only one
         // tree renders per frame, so the request came from the one on screen.
         if let Some(path) = refresh_request {
-            let remote_shown =
-                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
-            if remote_shown {
+            if self.remote_shown() {
                 if let Some(root) = self.remote_root.as_mut() {
                     root.reload(&path);
                 }
@@ -1407,8 +1408,7 @@ impl eframe::App for TwelfApp {
         }
         // A Delete action was chosen this frame: park it for the confirm modal.
         if let Some((path, is_dir)) = delete_request {
-            let is_remote =
-                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
+            let is_remote = self.remote_shown();
             self.pending_delete = Some(PendingDelete {
                 path,
                 is_dir,
@@ -1425,8 +1425,7 @@ impl eframe::App for TwelfApp {
                 self.status_message =
                     Some(status_bar::Message::error("A rename is already running"));
             } else {
-                let is_remote = matches!(self.ssh, ssh::SshState::Connected { .. })
-                    && self.remote_root.is_some();
+                let is_remote = self.remote_shown();
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
