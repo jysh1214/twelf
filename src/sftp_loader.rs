@@ -8,6 +8,7 @@ use russh_sftp::client::SftpSession;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -17,6 +18,25 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// bytes are far smaller than the decoded images they feed, so this sits well
 /// under the decoded cache's own cap.
 const BYTES_CACHE_CAP: usize = 256 * 1024 * 1024;
+
+/// Largest remote file the image pipeline will read. The whole file goes into
+/// one `Vec` before it is decoded, and nothing bounded that: a multi-GB file
+/// with an image extension, or a server streaming without end, was read until
+/// memory ran out. Nothing larger than the byte cache could be kept anyway.
+const MAX_IMAGE_BYTES: u64 = BYTES_CACHE_CAP as u64;
+
+/// Read `reader` to its end, refusing to hold more than `max` bytes. Enforced
+/// on the stream itself rather than on the size `stat` reported, which is the
+/// server's word and may be missing.
+async fn read_capped<R: AsyncRead + Unpin>(reader: R, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    // One byte past the limit is enough to tell "exactly max" from "more".
+    reader.take(max + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::other(format!("larger than {max} bytes")));
+    }
+    Ok(bytes)
+}
 
 impl ByteSized for Bytes {
     fn byte_size(&self) -> usize {
@@ -147,7 +167,12 @@ impl BytesLoader for SftpBytesLoader {
             };
             let bytes = match hit {
                 Some(vec) => Some(vec),
-                None => match session.read(path).await {
+                // A size over the limit is not worth opening the file for.
+                None if size.is_some_and(|s| s as u64 > MAX_IMAGE_BYTES) => {
+                    crate::log!("not loading {key_owned}: over {MAX_IMAGE_BYTES} bytes");
+                    None
+                }
+                None => match read_remote(&session, path).await {
                     Ok(vec) => {
                         let disk = disk_clone.clone();
                         let key = key_owned.clone();
@@ -197,6 +222,11 @@ impl BytesLoader for SftpBytesLoader {
     fn has_pending(&self) -> bool {
         !self.state.lock().unwrap().pending.is_empty()
     }
+}
+
+async fn read_remote(session: &SftpSession, path: String) -> std::io::Result<Vec<u8>> {
+    let file = session.open(path).await.map_err(std::io::Error::other)?;
+    read_capped(file, MAX_IMAGE_BYTES).await
 }
 
 /// The single key one remote file is cached under, in memory and on disk.
@@ -266,6 +296,18 @@ mod tests {
         loader.state.lock().unwrap().failed.record(uri.to_string());
         loader.forget_all();
         assert!(!loader.state.lock().unwrap().failed.is_backed_off(uri));
+    }
+
+    #[test]
+    fn a_read_stops_at_the_limit_instead_of_filling_memory() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        // At the limit is fine, to the byte.
+        let exact = rt.block_on(read_capped(&[7u8; 16][..], 16)).expect("fits");
+        assert_eq!(exact.len(), 16);
+        // Past it is an error, and what was buffered stays within a byte of it
+        // however long the stream would have gone on.
+        let endless = tokio::io::repeat(0);
+        assert!(rt.block_on(read_capped(endless, 16)).is_err());
     }
 
     #[test]
