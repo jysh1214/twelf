@@ -11,9 +11,18 @@ pub struct TreeNode {
 
 enum NodeKind {
     File,
-    Dir {
-        children: Option<Vec<TreeNode>>,
-    },
+    Dir { children: DirChildren },
+}
+
+enum DirChildren {
+    /// Not listed yet; rendering the open folder lists it.
+    Unloaded,
+    Loaded(Vec<TreeNode>),
+    /// The listing failed. Shown in place of the rows, because an unreadable
+    /// folder — no permission, a NAS mount that dropped — must not pass for an
+    /// empty one. Retried when the folder is reopened or the watcher reports a
+    /// change in it.
+    Error(String),
 }
 
 pub struct SearchHit {
@@ -64,7 +73,7 @@ impl TreeNode {
         Self {
             path,
             name,
-            kind: NodeKind::Dir { children: None },
+            kind: NodeKind::Dir { children: DirChildren::Unloaded },
         }
     }
 
@@ -73,8 +82,8 @@ impl TreeNode {
     }
 
     /// Walk the loaded subtree depth-first and collect every media file's full
-    /// path (image or video). Folders whose children are `None` (not yet
-    /// expanded) contribute nothing.
+    /// path (image or video). Folders that are not loaded (not yet expanded, or
+    /// unreadable) contribute nothing.
     pub fn collect_images(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
         self.collect_images_into(&mut out);
@@ -84,12 +93,12 @@ impl TreeNode {
     fn collect_images_into(&self, out: &mut Vec<PathBuf>) {
         match &self.kind {
             NodeKind::File => out.push(self.path.clone()),
-            NodeKind::Dir { children: Some(children) } => {
+            NodeKind::Dir { children: DirChildren::Loaded(children) } => {
                 for child in children {
                     child.collect_images_into(out);
                 }
             }
-            NodeKind::Dir { children: None } => {}
+            NodeKind::Dir { .. } => {}
         }
     }
 
@@ -97,7 +106,7 @@ impl TreeNode {
     /// found. A folder whose children aren't loaded (or a path not present) is a
     /// no-op — it isn't on screen to remove.
     pub fn remove_path(&mut self, target: &Path) -> bool {
-        let NodeKind::Dir { children: Some(children) } = &mut self.kind else {
+        let NodeKind::Dir { children: DirChildren::Loaded(children) } = &mut self.kind else {
             return false;
         };
         if let Some(pos) = children.iter().position(|c| c.path == target) {
@@ -118,7 +127,7 @@ impl TreeNode {
     pub fn reload(&mut self, target: &Path) -> bool {
         if self.path == target {
             if let NodeKind::Dir { children } = &mut self.kind {
-                *children = None;
+                *children = DirChildren::Unloaded;
                 return true;
             }
             return false;
@@ -126,7 +135,7 @@ impl TreeNode {
         if !target.starts_with(&self.path) {
             return false;
         }
-        let NodeKind::Dir { children: Some(children) } = &mut self.kind else {
+        let NodeKind::Dir { children: DirChildren::Loaded(children) } = &mut self.kind else {
             return false;
         };
         for child in children {
@@ -143,7 +152,7 @@ impl TreeNode {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let kind = if path.is_dir() {
-            NodeKind::Dir { children: None }
+            NodeKind::Dir { children: DirChildren::Unloaded }
         } else {
             NodeKind::File
         };
@@ -155,9 +164,10 @@ fn is_visible(path: &Path) -> bool {
     path.is_dir() || is_image(path) || crate::video::is_video(&path.to_string_lossy())
 }
 
-fn list_children(root: &Path) -> Vec<TreeNode> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
+fn list_children(root: &Path) -> DirChildren {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => return DirChildren::Error(e.to_string()),
     };
     let mut nodes: Vec<TreeNode> = entries
         .filter_map(Result::ok)
@@ -166,7 +176,7 @@ fn list_children(root: &Path) -> Vec<TreeNode> {
         .map(TreeNode::child)
         .collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
-    nodes
+    DirChildren::Loaded(nodes)
 }
 
 /// Recursively walk the filesystem under `root`, keeping entries whose name
@@ -271,24 +281,36 @@ pub fn render_tree(
                 header = header.open(Some(true));
             }
             let resp = header.show(ui, |ui| {
-                if children.is_none() {
-                    *children = Some(list_children(&path));
+                if matches!(children, DirChildren::Unloaded) {
+                    *children = list_children(&path);
                 }
-                if let Some(children) = children {
-                    for child in children {
-                        render_tree(
-                            ui,
-                            child,
-                            false,
-                            selected_image,
-                            scroll_target,
-                            new_selection,
-                            delete_request,
-                            rename_request,
-                        );
+                match &mut *children {
+                    DirChildren::Loaded(children) => {
+                        for child in children {
+                            render_tree(
+                                ui,
+                                child,
+                                false,
+                                selected_image,
+                                scroll_target,
+                                new_selection,
+                                delete_request,
+                                rename_request,
+                            );
+                        }
                     }
+                    DirChildren::Error(msg) => {
+                        ui.colored_label(egui::Color32::RED, msg.as_str());
+                    }
+                    DirChildren::Unloaded => {}
                 }
             });
+            // Closing the folder forgets a failed listing, so reopening it is
+            // the retry. The error is not re-read every frame it stays open: a
+            // dead network mount can block each read_dir for seconds.
+            if resp.fully_closed() && matches!(children, DirChildren::Error(_)) {
+                *children = DirChildren::Unloaded;
+            }
             // No Rename/Delete on the root row — it's the browse entry point.
             if !is_root {
                 resp.header_response.context_menu(|ui| {
@@ -669,13 +691,13 @@ mod tests {
         TreeNode {
             path: PathBuf::from(path),
             name: path.to_string(),
-            kind: NodeKind::Dir { children: Some(children) },
+            kind: NodeKind::Dir { children: DirChildren::Loaded(children) },
         }
     }
 
     fn child_paths(node: &TreeNode) -> Vec<String> {
         match &node.kind {
-            NodeKind::Dir { children: Some(c) } => {
+            NodeKind::Dir { children: DirChildren::Loaded(c) } => {
                 c.iter().map(|n| n.path.display().to_string()).collect()
             }
             _ => Vec::new(),
@@ -706,7 +728,9 @@ mod tests {
             )],
         );
         assert!(root.remove_path(Path::new("/r/sub/b.png")));
-        let NodeKind::Dir { children: Some(c) } = &root.kind else { unreachable!() };
+        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+            unreachable!()
+        };
         assert_eq!(child_paths(&c[0]), vec!["/r/sub/c.png"]);
     }
 
@@ -716,7 +740,7 @@ mod tests {
         assert!(!root.remove_path(Path::new("/r/zzz.jpg")));
         assert_eq!(child_paths(&root), vec!["/r/a.jpg"]);
 
-        // A folder whose children haven't been loaded yet (children: None).
+        // A folder whose children haven't been loaded yet.
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.remove_path(Path::new("/r/a.jpg")));
     }
@@ -724,15 +748,49 @@ mod tests {
     #[test]
     fn reload_resets_loaded_dir_and_noops_otherwise() {
         let mut root = dir_node("/r", vec![dir_node("/r/sub", vec![file_node("/r/sub/a.jpg")])]);
-        // Re-list a loaded subdir: its children drop to None (re-read next render).
+        // Re-list a loaded subdir: it drops to Unloaded (re-read next render).
         assert!(root.reload(Path::new("/r/sub")));
-        let NodeKind::Dir { children: Some(c) } = &root.kind else { unreachable!() };
-        assert!(matches!(c[0].kind, NodeKind::Dir { children: None }));
+        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+            unreachable!()
+        };
+        assert!(matches!(c[0].kind, NodeKind::Dir { children: DirChildren::Unloaded }));
 
         // Absent path and not-yet-loaded folder are no-ops.
         assert!(!root.reload(Path::new("/r/zzz")));
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.reload(Path::new("/r/sub")));
+    }
+
+    #[test]
+    fn an_unreadable_folder_is_an_error_not_an_empty_listing() {
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("b.jpg"));
+        touch(&dir.path().join("a.jpg"));
+        touch(&dir.path().join("notes.txt"));
+        let DirChildren::Loaded(nodes) = list_children(dir.path()) else {
+            panic!("a readable folder lists");
+        };
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["a.jpg", "b.jpg"]);
+
+        // Gone (or unreadable, or on a dropped mount): say so.
+        let missing = dir.path().join("missing");
+        assert!(matches!(list_children(&missing), DirChildren::Error(_)));
+    }
+
+    #[test]
+    fn reload_retries_a_folder_whose_listing_failed() {
+        let mut root = dir_node("/r", vec![dir_node("/r/sub", Vec::new())]);
+        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &mut root.kind else {
+            unreachable!()
+        };
+        c[0].kind = NodeKind::Dir { children: DirChildren::Error("denied".to_string()) };
+        // A watcher event for the folder gives the listing another go.
+        assert!(root.reload(Path::new("/r/sub")));
+        let NodeKind::Dir { children: DirChildren::Loaded(c) } = &root.kind else {
+            unreachable!()
+        };
+        assert!(matches!(c[0].kind, NodeKind::Dir { children: DirChildren::Unloaded }));
     }
 
     #[test]
