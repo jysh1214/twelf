@@ -54,6 +54,7 @@ fn collect_changes(results: impl Iterator<Item = notify::Result<notify::Event>>)
             Ok(event) => {
                 collect_reload_dirs(&event, &mut changes.dirs);
                 collect_rename_pair(&event, &mut changes.renames);
+                collect_rewritten(&event, &mut changes.rewritten);
             }
             Err(e) => changes.error = Some(e.to_string()),
         }
@@ -69,6 +70,10 @@ fn collect_changes(results: impl Iterator<Item = notify::Result<notify::Event>>)
 pub struct Changes {
     pub dirs: Vec<PathBuf>,
     pub renames: Vec<(PathBuf, PathBuf)>,
+    /// Files whose contents were replaced under an unchanged name. No listing
+    /// changes, so nothing above notices — but whatever is cached for them is
+    /// now a picture of the old contents.
+    pub rewritten: Vec<PathBuf>,
     /// The latest error the watcher reported, such as running out of inotify
     /// watches for a directory created after the watch began. Whatever it
     /// concerned is no longer being watched, so it is the caller's to show.
@@ -93,6 +98,29 @@ fn collect_reload_dirs(event: &notify::Event, out: &mut Vec<PathBuf>) {
             if !out.iter().any(|d| d == parent) {
                 out.push(parent.to_path_buf());
             }
+        }
+    }
+}
+
+/// Push every file an event says was written to: `cp new.png plot.png`, an
+/// editor that truncates and rewrites. On Linux that is the close of a file that
+/// was open for writing — once per save, when the contents are complete — and
+/// not the data-change events, which arrive throughout a large copy and would
+/// have a half-written file reloaded over and over. Other backends report no
+/// close, so there a data change is all there is to go on.
+fn collect_rewritten(event: &notify::Event, out: &mut Vec<PathBuf>) {
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+    let written = match event.kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Modify(ModifyKind::Data(_)) => cfg!(not(target_os = "linux")),
+        _ => false,
+    };
+    if !written {
+        return;
+    }
+    for path in &event.paths {
+        if !out.contains(path) {
+            out.push(path.clone());
         }
     }
 }
@@ -129,6 +157,68 @@ mod tests {
             collect_reload_dirs(event, &mut out);
         }
         out
+    }
+
+    #[test]
+    fn a_file_closed_after_writing_counts_as_rewritten() {
+        use notify::event::AccessMode;
+        let saved = |path: &str| {
+            Ok(
+                notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+                    .add_path(PathBuf::from(path)),
+            )
+        };
+        let results = vec![
+            saved("/r/plot.png"),
+            // A second save of the same file in one batch is still one file.
+            saved("/r/plot.png"),
+            // Merely being read is not a change.
+            Ok(
+                notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+                    .add_path(PathBuf::from("/r/other.png")),
+            ),
+        ];
+        let changes = collect_changes(results.into_iter());
+        assert_eq!(changes.rewritten, vec![PathBuf::from("/r/plot.png")]);
+        // Nothing was added or removed, so no listing needs re-reading.
+        assert!(changes.dirs.is_empty());
+    }
+
+    /// The real watcher, not a hand-built event: overwriting a file in place is
+    /// reported, which is what the hand-built tests above take on trust.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn overwriting_a_file_in_place_is_seen_by_the_real_watcher() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("plot.png");
+        std::fs::write(&file, b"old").unwrap();
+        let watcher = FsWatcher::spawn(dir.path(), &egui::Context::default()).expect("watch");
+        std::fs::write(&file, b"new contents").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut rewritten = Vec::new();
+        while !rewritten.contains(&file) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no rewrite reported within 5s (saw {rewritten:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            rewritten.extend(watcher.drain_changes().rewritten);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn data_changes_mid_write_are_left_to_the_close_event_on_linux() {
+        let writing = Ok(notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            DataChange::Content,
+        )))
+        .add_path(PathBuf::from("/r/big.mkv")));
+        assert!(
+            collect_changes(vec![writing].into_iter())
+                .rewritten
+                .is_empty()
+        );
     }
 
     #[test]

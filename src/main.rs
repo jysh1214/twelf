@@ -448,6 +448,20 @@ impl TwelfApp {
         }
     }
 
+    /// Local files were rewritten under their own names: drop what is cached for
+    /// them, or the old picture stays — on screen, and again on every return to
+    /// it until eight other images have pushed it out of the displayed window.
+    /// If one of them is what the panel is showing, have it rebuild what it made
+    /// from the old contents too (a video player, an animation).
+    fn local_files_rewritten(&mut self, paths: &[PathBuf], ctx: &egui::Context) {
+        for path in paths {
+            image_panel::forget_local_image(ctx, path);
+            if self.selected_remote.is_none() && self.selected_image.as_ref() == Some(path) {
+                self.last_displayed = None;
+            }
+        }
+    }
+
     /// Whether the sidebar is showing the remote tree rather than the local one:
     /// connected, with a remote root to browse.
     fn remote_shown(&self) -> bool {
@@ -946,6 +960,7 @@ impl eframe::App for TwelfApp {
                 // whole-tree walk once per frame while the folder churns.
                 self.search_dirty = true;
             }
+            self.local_files_rewritten(&changes.rewritten, ctx);
             // A rename outside the app moved the selected file (or a folder
             // above it): follow it, like an in-app rename does. The target is
             // the local tree's own, so it simply waits if the remote tree or
@@ -2021,6 +2036,30 @@ mod tests {
         ));
         assert!(app.search_active);
         assert_eq!(app.status_message, None);
+    }
+
+    #[test]
+    fn rewriting_the_displayed_file_makes_the_panel_start_over() {
+        let ctx = egui::Context::default();
+        let shown = PathBuf::from("/r/plot.png");
+        let mut app = TwelfApp::new();
+        app.selected_image = Some(shown.clone());
+        app.last_displayed = Some(shown.clone());
+
+        // Some other file being saved is none of the panel's business.
+        app.local_files_rewritten(&[PathBuf::from("/r/other.png")], &ctx);
+        assert_eq!(app.last_displayed, Some(shown.clone()));
+
+        app.local_files_rewritten(std::slice::from_ref(&shown), &ctx);
+        assert_eq!(app.last_displayed, None);
+
+        // With a remote image on screen the panel is not showing the local
+        // file, and must not be reset on its account.
+        let remote = PathBuf::from("/photos/a.jpg");
+        app.selected_remote = Some(remote.clone());
+        app.last_displayed = Some(remote.clone());
+        app.local_files_rewritten(std::slice::from_ref(&shown), &ctx);
+        assert_eq!(app.last_displayed, Some(remote));
     }
 
     #[test]
