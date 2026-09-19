@@ -129,7 +129,9 @@ struct TwelfApp {
     remote_search: Option<remote::RemoteSearchWalk>,
     remote_search_changed: Option<(String, std::time::Instant)>,
     zoom: f32,
-    last_displayed: Option<PathBuf>,
+    /// URI of what the image panel last set itself up for; a different one means
+    /// a new zoom, player and animation. Reset to `None` to force that.
+    last_displayed: Option<String>,
     ssh: ssh::SshState,
     /// A Connect click still being resolved. `ssh` is left as it was meanwhile.
     connecting: Option<ssh::ConnectAttempt>,
@@ -2224,24 +2226,25 @@ mod tests {
     fn rewriting_the_displayed_file_makes_the_panel_start_over() {
         let ctx = egui::Context::default();
         let shown = PathBuf::from("/r/plot.png");
+        let shown_uri = Some("file:///r/plot.png".to_string());
         let mut app = TwelfApp::for_test();
         app.selected_image = Some(shown.clone());
-        app.last_displayed = Some(shown.clone());
+        app.last_displayed = shown_uri.clone();
 
         // Some other file being saved is none of the panel's business.
         app.local_files_rewritten(&[PathBuf::from("/r/other.png")], &ctx);
-        assert_eq!(app.last_displayed, Some(shown.clone()));
+        assert_eq!(app.last_displayed, shown_uri);
 
         app.local_files_rewritten(std::slice::from_ref(&shown), &ctx);
         assert_eq!(app.last_displayed, None);
 
         // With a remote image on screen the panel is not showing the local
         // file, and must not be reset on its account.
-        let remote = PathBuf::from("/photos/a.jpg");
-        app.selected_remote = Some(remote.clone());
-        app.last_displayed = Some(remote.clone());
+        let remote_uri = Some("sftp://nas/photos/a.jpg".to_string());
+        app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
+        app.last_displayed = remote_uri.clone();
         app.local_files_rewritten(std::slice::from_ref(&shown), &ctx);
-        assert_eq!(app.last_displayed, Some(remote));
+        assert_eq!(app.last_displayed, remote_uri);
     }
 
     #[test]

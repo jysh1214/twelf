@@ -18,14 +18,14 @@ const DISPLAYED_WINDOW: usize = 8;
 pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     let prev_zoom = app.zoom;
     let prev_displayed = app.last_displayed.clone();
-    let current_displayed = app
-        .selected_remote
-        .clone()
-        .or_else(|| app.selected_image.clone());
     let uri = selected_uri(app);
-    if current_displayed != app.last_displayed {
+    // Compared as URIs, which say which machine a path is on. Compared as bare
+    // paths, going from a local /home/alex/pics/a.mp4 to the same path on the
+    // server was no change at all: the local file's player was kept, did not
+    // match the new URI, and the panel stayed blank.
+    if uri != app.last_displayed {
         app.zoom = 1.0;
-        app.last_displayed = current_displayed;
+        app.last_displayed = uri.clone();
         app.animation = None;
         // Dropping a decode still in flight abandons it.
         app.anim_decode = None;
@@ -336,6 +336,36 @@ fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_path_on_the_other_machine_is_a_different_thing_to_show() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::for_test();
+        let path = std::path::PathBuf::from("/home/alex/pics/a.jpg");
+        let frame = |app: &mut TwelfApp| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| render(app, ctx));
+        };
+
+        app.selected_image = Some(path.clone());
+        frame(&mut app);
+        assert_eq!(
+            app.last_displayed.as_deref(),
+            Some("file:///home/alex/pics/a.jpg")
+        );
+
+        // Zoomed in on the local file, then the same path is selected remotely.
+        app.zoom = 3.0;
+        app.selected_remote = Some(path);
+        frame(&mut app);
+        // A new thing on screen: the panel starts over rather than carrying the
+        // local file's zoom — and player, and animation — across.
+        assert_eq!(app.zoom, 1.0);
+        assert!(
+            app.last_displayed
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("sftp://"))
+        );
+    }
 
     #[test]
     fn zoom_steps_are_symmetric_and_never_collapse() {
