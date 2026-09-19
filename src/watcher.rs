@@ -360,8 +360,10 @@ mod tests {
 
     #[test]
     fn unpaired_halves_and_other_events_yield_no_pair() {
-        // From/To halves arrive when the kernel splits a rename across reads —
-        // they carry one end each, so there is nothing to follow.
+        // notify sends the From and To halves of every rename, and then — when
+        // both ends are inside the watched tree — a Both event carrying the pair.
+        // So a half is never the thing to follow. With no Both after it, it means
+        // a move out of the tree (From) or into it (To): one end, nowhere to go.
         let events = [
             notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
                 .add_path(PathBuf::from("/r/old.jpg")),
@@ -371,6 +373,26 @@ mod tests {
                 .add_path(PathBuf::from("/r/made.jpg")),
         ];
         assert_eq!(pairs_for(&events), Vec::<(PathBuf, PathBuf)>::new());
+    }
+
+    #[test]
+    fn a_rename_as_notify_really_sends_it_is_followed_once() {
+        // The three events one `mv old.jpg new.jpg` produces, in order. The halves
+        // must add nothing, or every ordinary rename would count twice.
+        let rename = |mode: RenameMode| {
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(mode))).set_tracker(7)
+        };
+        let events = [
+            rename(RenameMode::From).add_path(PathBuf::from("/r/old.jpg")),
+            rename(RenameMode::To).add_path(PathBuf::from("/r/new.jpg")),
+            rename(RenameMode::Both)
+                .add_path(PathBuf::from("/r/old.jpg"))
+                .add_path(PathBuf::from("/r/new.jpg")),
+        ];
+        assert_eq!(
+            pairs_for(&events),
+            vec![(PathBuf::from("/r/old.jpg"), PathBuf::from("/r/new.jpg"))]
+        );
     }
 
     #[test]
