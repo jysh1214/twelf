@@ -178,6 +178,8 @@ struct TwelfApp {
     displayed_uris: VecDeque<String>,
     animation: Option<webp::Animation>,
     anim_pending: Option<String>,
+    /// The decode, off this thread, that will answer `anim_pending`.
+    anim_decode: Option<webp::PendingAnimation>,
     video: Option<video::VideoPlayer>,
 }
 
@@ -243,6 +245,7 @@ impl TwelfApp {
             displayed_uris: VecDeque::new(),
             animation: None,
             anim_pending: None,
+            anim_decode: None,
             video: None,
         }
     }

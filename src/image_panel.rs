@@ -27,24 +27,15 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         app.zoom = 1.0;
         app.last_displayed = current_displayed;
         app.animation = None;
+        // Dropping a decode still in flight abandons it.
+        app.anim_decode = None;
         app.anim_pending = uri.clone();
         app.video = open_video(app);
         if let Some(uri) = &uri {
             retain_displayed(app, uri, ctx);
         }
     }
-    // Build the animation once its bytes are available. Remote bytes arrive
-    // asynchronously, so keep retrying each frame until the decode resolves to
-    // an animation or a still image.
-    if let Some(pending) = app.anim_pending.clone() {
-        match build_animation(ctx, &pending) {
-            AnimBuild::Pending => {}
-            AnimBuild::Resolved(anim) => {
-                app.animation = anim;
-                app.anim_pending = None;
-            }
-        }
-    }
+    resolve_animation(app, ctx);
     let zoom_scroll = ctx.input(|i| {
         if i.modifiers.ctrl {
             i.raw_scroll_delta.y
@@ -250,48 +241,70 @@ fn selected_uri(app: &TwelfApp) -> Option<String> {
     }
 }
 
-enum AnimBuild {
-    /// Bytes are not available yet; retry on a later frame.
-    Pending,
-    /// Decided: `Some` plays as an animation, `None` falls back to the still path.
-    Resolved(Option<crate::webp::Animation>),
+/// Work towards a WebP animation for the file in `anim_pending`: start its
+/// decode once the bytes can be had (remote bytes arrive asynchronously, so this
+/// is retried each frame), then take the result when it is in. None of it
+/// happens on this thread; meanwhile, and whenever the answer is "not an
+/// animation", the file shows through the still path.
+fn resolve_animation(app: &mut TwelfApp, ctx: &egui::Context) {
+    let Some(uri) = app.anim_pending.clone() else {
+        return;
+    };
+    if app.anim_decode.is_none() {
+        match animation_source(ctx, &uri) {
+            AnimSource::Ready(source) => {
+                app.anim_decode = Some(crate::webp::PendingAnimation::spawn(
+                    source,
+                    &app.runtime,
+                    ctx,
+                ));
+            }
+            AnimSource::Waiting => {}
+            AnimSource::None => app.anim_pending = None,
+        }
+    }
+    let Some(decoded) = app.anim_decode.as_ref().and_then(|decode| decode.poll()) else {
+        return;
+    };
+    app.anim_decode = None;
+    app.anim_pending = None;
+    if let Some(decoded) = decoded {
+        if decoded.truncated {
+            app.status_message = Some(crate::status_bar::Message::info(format!(
+                "{}: too long to hold in memory — playing the first {} frames",
+                uri.rsplit('/').next().unwrap_or(&uri),
+                decoded.frames.len()
+            )));
+        }
+        app.animation = Some(crate::webp::Animation::new(uri, decoded.frames));
+    }
 }
 
-/// Try to build a multi-frame WebP player for `uri`. Local files read
-/// synchronously; remote files draw bytes from the async SFTP loader cache.
-fn build_animation(ctx: &egui::Context, uri: &str) -> AnimBuild {
+enum AnimSource {
+    Ready(crate::webp::Source),
+    /// A remote file whose bytes are still on their way.
+    Waiting,
+    /// Not something that can be an animation.
+    None,
+}
+
+fn animation_source(ctx: &egui::Context, uri: &str) -> AnimSource {
     if !crate::webp::is_webp(uri) {
-        return AnimBuild::Resolved(None);
+        return AnimSource::None;
     }
     if let Some(path) = uri.strip_prefix("file://") {
-        match std::fs::read(path) {
-            Ok(bytes) => AnimBuild::Resolved(animation_from_bytes(uri, &bytes)),
-            Err(_) => AnimBuild::Resolved(None),
-        }
+        AnimSource::Ready(crate::webp::Source::File(path.into()))
     } else if uri.starts_with("sftp://") {
         match ctx.try_load_bytes(uri) {
             Ok(egui::load::BytesPoll::Ready { bytes, .. }) => {
-                AnimBuild::Resolved(animation_from_bytes(uri, bytes.as_ref()))
+                AnimSource::Ready(crate::webp::Source::Bytes(bytes))
             }
-            Ok(egui::load::BytesPoll::Pending { .. }) => AnimBuild::Pending,
-            Err(_) => AnimBuild::Resolved(None),
+            Ok(egui::load::BytesPoll::Pending { .. }) => AnimSource::Waiting,
+            Err(_) => AnimSource::None,
         }
     } else {
-        AnimBuild::Resolved(None)
+        AnimSource::None
     }
-}
-
-fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animation> {
-    // On the UI thread, so a decoder panic would end the app; caught, it just
-    // falls back to the still path, which is guarded the same way.
-    let frames = crate::decoded::catching_panics(|| {
-        crate::webp::decode_frames(bytes).map_err(|e| e.to_string())
-    })
-    .ok()?;
-    if frames.len() <= 1 {
-        return None;
-    }
-    Some(crate::webp::Animation::new(uri.to_string(), frames))
 }
 
 /// Start a player for the current selection when it is a video file, local or
