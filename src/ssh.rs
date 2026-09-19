@@ -358,11 +358,38 @@ impl Handler for VerifyHostKey {
             ),
             // Handed back, as the default implementation does, so whoever still
             // holds the handle sees the same error.
-            DisconnectReason::Error(e) => (e.to_string(), Err(e)),
+            DisconnectReason::Error(e) => {
+                crate::log!("session ended: {e}");
+                (describe_session_error(&e), Err(e))
+            }
         };
         self.ended.record(why);
         self.ctx.request_repaint();
         outcome
+    }
+}
+
+/// Why a session ended, in words for the menu bar. russh's own are written for
+/// its callers: a server going away surfaced as "early eof", and the peer
+/// falling silent as "Keepalive timeout".
+fn describe_session_error(error: &russh::Error) -> String {
+    use std::io::ErrorKind;
+    match error {
+        russh::Error::KeepaliveTimeout | russh::Error::InactivityTimeout => {
+            "the server stopped responding".to_string()
+        }
+        russh::Error::HUP | russh::Error::Disconnect => {
+            "the server closed the connection".to_string()
+        }
+        russh::Error::IO(io) => match io.kind() {
+            ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe => "the connection was closed".to_string(),
+            ErrorKind::TimedOut => "the connection timed out".to_string(),
+            _ => io.to_string(),
+        },
+        other => other.to_string(),
     }
 }
 
@@ -615,6 +642,29 @@ mod tests {
         assert_eq!(
             judge_host_key("nas", 22, &key(ED25519_B), &files),
             HostKeyVerdict::Trusted
+        );
+    }
+
+    #[test]
+    fn a_session_error_is_put_in_the_users_words() {
+        use std::io::{Error, ErrorKind};
+        // What killing the server side of a session produced, verbatim.
+        let eof = russh::Error::IO(Error::new(ErrorKind::UnexpectedEof, "early eof"));
+        assert_eq!(describe_session_error(&eof), "the connection was closed");
+        let reset = russh::Error::IO(Error::from(ErrorKind::ConnectionReset));
+        assert_eq!(describe_session_error(&reset), "the connection was closed");
+        assert_eq!(
+            describe_session_error(&russh::Error::KeepaliveTimeout),
+            "the server stopped responding"
+        );
+        assert_eq!(
+            describe_session_error(&russh::Error::HUP),
+            "the server closed the connection"
+        );
+        // Anything unforeseen keeps russh's own wording rather than none.
+        assert_eq!(
+            describe_session_error(&russh::Error::DecryptionError),
+            "Failed to decrypt a packet"
         );
     }
 
