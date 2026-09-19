@@ -75,7 +75,10 @@ pub struct SshSettings {
     pub root: String,
 }
 
-fn config_path() -> Option<PathBuf> {
+/// Where the config lives for this user, if the platform has such a place. The
+/// only function here that knows: loading and saving take the path, so tests
+/// can use one of their own and never come near the real file.
+pub fn config_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
     path.push("twelf");
     path.push("config.toml");
@@ -86,22 +89,13 @@ fn config_path() -> Option<PathBuf> {
 /// exists but could not be used, why. Falling back to the defaults without a
 /// word is what made a typo expensive — the app started blank, and the next
 /// save wrote that blank over every favorite in the file.
+#[derive(Default)]
 pub struct Loaded {
     pub config: Config,
     pub problem: Option<String>,
 }
 
-pub fn load() -> Loaded {
-    match config_path() {
-        Some(path) => load_from(&path),
-        None => Loaded {
-            config: Config::default(),
-            problem: None,
-        },
-    }
-}
-
-fn load_from(path: &Path) -> Loaded {
+pub fn load_from(path: &Path) -> Loaded {
     let problem = match std::fs::read_to_string(path) {
         Ok(contents) => match toml::from_str(&contents) {
             Ok(config) => {
@@ -132,12 +126,7 @@ fn load_from(path: &Path) -> Loaded {
 /// Write the config. `set_aside_existing` is for a file `load` could not use:
 /// it is renamed to `config.toml.bad` first, so the hand-edits in it outlive
 /// the defaults about to replace them.
-pub fn save(config: &Config, set_aside_existing: bool) -> Result<(), String> {
-    let path = config_path().ok_or_else(|| "no config directory available".to_string())?;
-    save_to(&path, config, set_aside_existing)
-}
-
-fn save_to(path: &Path, config: &Config, set_aside_existing: bool) -> Result<(), String> {
+pub fn save_to(path: &Path, config: &Config, set_aside_existing: bool) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;

@@ -169,6 +169,12 @@ struct TwelfApp {
     /// The config file exists but could not be loaded. The next save renames it
     /// to `config.toml.bad` instead of writing the defaults over it.
     config_unusable: bool,
+    /// Where the config is loaded from and saved to; `None` when the platform
+    /// offers no config directory.
+    config_file: Option<PathBuf>,
+    /// Keeps a test app's private config directory alive as long as the app.
+    #[cfg(test)]
+    test_dir: Option<tempfile::TempDir>,
     image_prefetch: VecDeque<String>,
     /// Prefetch URIs whose fetch has been started and is still resolving,
     /// capped at `PREFETCH_IN_FLIGHT`.
@@ -185,11 +191,40 @@ struct TwelfApp {
 
 impl TwelfApp {
     fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        Self::build(config::config_path(), runtime)
+    }
+
+    /// An app for a test: its config lives in a directory of its own, which goes
+    /// when the app does, and its runtime has a single worker. The tests used to
+    /// call `new`, which read the developer's real `~/.config/twelf/config.toml`
+    /// — so they depended on the machine they ran on, were one `save_config`
+    /// away from writing to it, and each started a full worker pool.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        let mut app = Self::build(Some(dir.path().join("config.toml")), runtime);
+        app.test_dir = Some(dir);
+        app
+    }
+
+    fn build(config_file: Option<PathBuf>, runtime: tokio::runtime::Runtime) -> Self {
         let (remote_listings_tx, remote_listings_rx) = tokio::sync::mpsc::channel(64);
         let (remote_poll_tx, remote_poll_rx) = tokio::sync::mpsc::channel(64);
         // Read once: loading it per field would drop whatever the other fields
         // hold, which is how a save could lose the favorites.
-        let config::Loaded { config, problem } = config::load();
+        let config::Loaded { config, problem } = config_file
+            .as_deref()
+            .map(config::load_from)
+            .unwrap_or_default();
         let status_message = problem.as_ref().map(|problem| {
             // What happens to the file comes first: the status bar truncates,
             // and the parser's wording is the part that can be long.
@@ -233,13 +268,13 @@ impl TwelfApp {
             remote_poll_running: Arc::new(AtomicBool::new(false)),
             last_remote_poll: None,
             session_holder: Arc::new(Mutex::new(None)),
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime"),
+            runtime,
             cache: Arc::new(cache::ImageCache::new()),
             status_message,
             config_unusable: problem.is_some(),
+            config_file,
+            #[cfg(test)]
+            test_dir: None,
             image_prefetch: VecDeque::new(),
             prefetch_in_flight: Vec::new(),
             displayed_uris: VecDeque::new(),
@@ -648,7 +683,11 @@ impl TwelfApp {
             ssh: self.ssh_dialog.to_settings(),
             favorites: self.favorites.clone(),
         };
-        match config::save(&config, self.config_unusable) {
+        let saved = match &self.config_file {
+            Some(path) => config::save_to(path, &config, self.config_unusable),
+            None => Err("no config directory available".to_string()),
+        };
+        match saved {
             Ok(()) => {
                 self.config_unusable = false;
                 true
@@ -1788,7 +1827,7 @@ mod tests {
 
     #[test]
     fn rename_side_effects_follow_and_scroll_to_the_selection() {
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         let ctx = egui::Context::default();
         app.selected_image = Some(PathBuf::from("/r/old.jpg"));
         app.search_active = true;
@@ -1813,7 +1852,7 @@ mod tests {
 
     #[test]
     fn rename_side_effects_follow_a_remote_selection_too() {
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         let ctx = egui::Context::default();
         app.selected_remote = Some(PathBuf::from("/srv/pics/old.jpg"));
         app.apply_rename_side_effects(
@@ -1837,7 +1876,7 @@ mod tests {
     fn a_scroll_target_the_tree_cannot_show_is_given_up() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.jpg"), b"").unwrap();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.root_node = Some(sidebar::TreeNode::root(dir.path().to_path_buf()));
 
         // Root not listed yet: the row may still appear, so the target waits.
@@ -1877,7 +1916,7 @@ mod tests {
     #[test]
     fn a_rename_on_one_side_leaves_the_same_path_on_the_other_alone() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         // The same library path on this machine and on the server.
         app.selected_image = Some(PathBuf::from("/home/alex/pics/d/x.jpg"));
         app.selected_remote = Some(PathBuf::from("/home/alex/pics/d/x.jpg"));
@@ -1911,7 +1950,7 @@ mod tests {
 
     #[test]
     fn rename_side_effects_leave_an_unrelated_selection_alone() {
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         let ctx = egui::Context::default();
         app.selected_image = Some(PathBuf::from("/r/keep.jpg"));
         app.apply_rename_side_effects(Path::new("/r/a.jpg"), Path::new("/r/b.jpg"), false, &ctx);
@@ -1946,7 +1985,7 @@ mod tests {
         };
 
         // Dialog still open: the error belongs in it.
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.status_message = None;
         app.pending_rename = Some(remote_rename_dialog("/photos/a.jpg", "b.jpg"));
         app.remote_rename = Some(refused());
@@ -1975,7 +2014,7 @@ mod tests {
     #[test]
     fn a_remote_rename_without_a_connection_says_so() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.pending_rename = Some(remote_rename_dialog("/photos/a.jpg", "b.jpg"));
         app.execute_rename(&ctx);
         assert_eq!(
@@ -2000,7 +2039,7 @@ mod tests {
     #[test]
     fn an_unknown_host_key_is_a_question_not_a_failure() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.status_message = None;
         let key = russh::keys::PublicKey::from_openssh(
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDas5exaMxO62/EkqANCSvgMPxGV3gACEVvq2yzyf7p+",
@@ -2023,7 +2062,7 @@ mod tests {
     #[test]
     fn a_failed_connect_with_no_session_to_keep_reports_in_the_menu_bar() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.status_message = None;
         // A local search is nothing of the remote side's, and stays open.
         app.search_active = true;
@@ -2047,7 +2086,7 @@ mod tests {
     fn rewriting_the_displayed_file_makes_the_panel_start_over() {
         let ctx = egui::Context::default();
         let shown = PathBuf::from("/r/plot.png");
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.selected_image = Some(shown.clone());
         app.last_displayed = Some(shown.clone());
 
@@ -2074,7 +2113,7 @@ mod tests {
         for name in ["a-trip.jpg", "b-other.jpg", "c-trip.jpg"] {
             std::fs::write(root.join(name), b"").unwrap();
         }
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.root_node = Some(sidebar::TreeNode::root(root.to_path_buf()));
         app.search_active = true;
         app.search_query = "trip".to_string();
@@ -2100,9 +2139,41 @@ mod tests {
     }
 
     #[test]
+    fn a_test_app_keeps_its_config_to_itself() {
+        let mut app = TwelfApp::for_test();
+        let own = app
+            .test_dir
+            .as_ref()
+            .expect("test dir")
+            .path()
+            .to_path_buf();
+        let file = app.config_file.clone().expect("config file");
+        assert!(file.starts_with(&own));
+        assert_ne!(Some(&file), config::config_path().as_ref());
+        // Starts from defaults whatever the developer's own config says…
+        assert!(app.favorites.is_empty());
+        assert_eq!(app.status_message, None);
+
+        // …and a save lands in its own directory.
+        app.add_favorite(config::Favorite {
+            label: "nas:/photos".to_string(),
+            host: "nas".to_string(),
+            port: "22".to_string(),
+            user: String::new(),
+            key_path: String::new(),
+            root: "/photos".to_string(),
+        });
+        assert_eq!(
+            app.status_message,
+            Some(status_bar::Message::info("Saved favorite nas:/photos"))
+        );
+        assert_eq!(config::load_from(&file).config.favorites.len(), 1);
+    }
+
+    #[test]
     fn a_lost_session_is_reported_and_its_tree_taken_down() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
         app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
         app.session_lost("alex@nas:22", "keepalive timeout", &ctx);
@@ -2118,7 +2189,7 @@ mod tests {
     #[test]
     fn leaving_the_remote_session_takes_everything_of_it_along() {
         let ctx = egui::Context::default();
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
         app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
         app.remote_scroll_target = Some(PathBuf::from("/photos/a.jpg"));
@@ -2157,7 +2228,7 @@ mod tests {
 
     #[test]
     fn leaving_the_session_lets_a_running_delete_finish_and_report() {
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.status_message = None;
         let (delete, worker) = remote::RemoteDelete::running("/photos/trip");
         app.remote_delete = Some(delete);
@@ -2189,7 +2260,7 @@ mod tests {
 
     #[test]
     fn a_clean_delete_on_the_current_session_settles_quietly() {
-        let mut app = TwelfApp::new();
+        let mut app = TwelfApp::for_test();
         app.status_message = None;
         app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
         let (delete, worker) = remote::RemoteDelete::running("/photos/trip");
