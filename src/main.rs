@@ -717,7 +717,9 @@ impl eframe::App for TwelfApp {
                         ui.text_edit_singleline(&mut self.ssh_dialog.host);
                         ui.end_row();
                         ui.label("Port:");
-                        ui.text_edit_singleline(&mut self.ssh_dialog.port);
+                        if ui.text_edit_singleline(&mut self.ssh_dialog.port).changed() {
+                            self.ssh_dialog.port_error = None;
+                        }
                         ui.end_row();
                         ui.label("User:");
                         ui.text_edit_singleline(&mut self.ssh_dialog.user);
@@ -729,6 +731,9 @@ impl eframe::App for TwelfApp {
                         ui.text_edit_singleline(&mut self.ssh_dialog.root);
                         ui.end_row();
                     });
+                if let Some(err) = &self.ssh_dialog.port_error {
+                    ui.colored_label(egui::Color32::RED, err.as_str());
+                }
                 if ui.button("Connect").clicked() {
                     connect_clicked = true;
                 }
@@ -782,11 +787,21 @@ impl eframe::App for TwelfApp {
         if save_favorite {
             self.add_favorite(self.ssh_dialog.to_favorite());
         }
+        // A port that does not parse keeps the dialog open with the reason in
+        // it, and is not written to the config either.
+        let mut port = None;
         if connect_clicked {
+            match ssh::parse_port(&self.ssh_dialog.port) {
+                Ok(parsed) => port = Some(parsed),
+                Err(error) => self.ssh_dialog.port_error = Some(error),
+            }
+        }
+        if let Some(port) = port {
+            self.ssh_dialog.port_error = None;
             self.save_config();
             let req = ssh::ConnectRequest {
                 host: self.ssh_dialog.host.clone(),
-                port: self.ssh_dialog.port.parse().unwrap_or(22),
+                port,
                 user: self.ssh_dialog.user.clone(),
                 key_path: self.ssh_dialog.key_path.clone(),
                 root: self.ssh_dialog.root.clone(),

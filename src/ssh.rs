@@ -41,6 +41,9 @@ pub struct ConnectDialog {
     pub open: bool,
     pub host: String,
     pub port: String,
+    /// Why the last Connect click was refused, shown under the fields until
+    /// the port is edited.
+    pub port_error: Option<String>,
     pub user: String,
     pub key_path: String,
     pub root: String,
@@ -57,6 +60,7 @@ impl ConnectDialog {
             open: false,
             host: s.host,
             port,
+            port_error: None,
             user: s.user,
             key_path: s.key_path,
             root: s.root,
@@ -89,6 +93,7 @@ impl ConnectDialog {
     pub fn load_favorite(&mut self, favorite: &config::Favorite) {
         self.host = favorite.host.clone();
         self.port = favorite.port.clone();
+        self.port_error = None;
         self.user = favorite.user.clone();
         self.key_path = favorite.key_path.clone();
         self.root = favorite.root.clone();
@@ -174,6 +179,21 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
     ))
 }
 
+/// The port typed into the dialog. Blank means 22, as `from_settings` fills
+/// it in; surrounding whitespace (a pasted "2222 ") is forgiven. Anything else
+/// that is not a port is an error rather than a quiet fall-back to 22: that
+/// offered the user's key to a different sshd from the one they asked for.
+pub fn parse_port(text: &str) -> Result<u16, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(22);
+    }
+    match text.parse::<u16>() {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(format!("Port must be a number from 1 to 65535, not {text:?}")),
+    }
+}
+
 pub fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
@@ -210,6 +230,19 @@ mod tests {
         // "~/" expands against $HOME.
         if let Some(home) = std::env::var_os("HOME") {
             assert_eq!(expand_home("~/.ssh/id"), PathBuf::from(home).join(".ssh/id"));
+        }
+    }
+
+    #[test]
+    fn parse_port_refuses_what_is_not_a_port() {
+        assert_eq!(parse_port("2222"), Ok(2222));
+        assert_eq!(parse_port("65535"), Ok(65535));
+        // Blank is the default port; pasted whitespace is not the user's fault.
+        assert_eq!(parse_port(""), Ok(22));
+        assert_eq!(parse_port(" 2222 "), Ok(2222));
+        // None of these may turn into 22.
+        for bad in ["0", "65536", "22222222", "ssh", "22a", "-22"] {
+            assert!(parse_port(bad).is_err(), "{bad:?} should be refused");
         }
     }
 
