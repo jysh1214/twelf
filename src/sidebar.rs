@@ -257,6 +257,22 @@ impl TreeNode {
         false
     }
 
+    /// `relist` every loaded directory in this subtree, top down. For when
+    /// change events were lost and any of them may be out of date. Folders never
+    /// opened are left alone: they list themselves when they are.
+    pub fn relist_all(&mut self) {
+        let path = self.path.clone();
+        self.relist(&path);
+        if let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut self.kind
+        {
+            for child in children.iter_mut().filter(|c| c.is_dir()) {
+                child.relist_all();
+            }
+        }
+    }
+
     fn is_dir(&self) -> bool {
         matches!(self.kind, NodeKind::Dir { .. })
     }
@@ -1025,6 +1041,44 @@ mod tests {
                 root.join("a.jpg"),
                 root.join("new.jpg"),
                 root.join("sub").join("deep.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relisting_everything_catches_up_at_every_loaded_level() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::create_dir_all(root.join("unopened")).unwrap();
+        touch(&root.join("a.jpg"));
+        touch(&root.join("sub").join("deep.png"));
+        let mut tree = listed_tree(root);
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut tree.kind
+        else {
+            unreachable!()
+        };
+        // As if this folder had never been expanded.
+        let unopened = children.iter_mut().find(|c| c.name == "unopened").unwrap();
+        unopened.kind = NodeKind::Dir {
+            children: DirChildren::Unloaded,
+        };
+
+        // Changes whose events never arrived, at both loaded levels.
+        touch(&root.join("b.jpg"));
+        touch(&root.join("sub").join("later.png"));
+        fs::remove_file(root.join("a.jpg")).unwrap();
+        touch(&root.join("unopened").join("hidden.jpg"));
+        tree.relist_all();
+
+        assert_eq!(
+            tree.collect_images(),
+            vec![
+                root.join("b.jpg"),
+                root.join("sub").join("deep.png"),
+                root.join("sub").join("later.png"),
             ]
         );
     }

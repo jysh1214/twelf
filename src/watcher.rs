@@ -51,6 +51,10 @@ fn collect_changes(results: impl Iterator<Item = notify::Result<notify::Event>>)
     let mut changes = Changes::default();
     for res in results {
         match res {
+            // The kernel's event queue overflowed and events were dropped — a bulk
+            // rename or a big copy does it. Which ones cannot be known, so all
+            // that can be said is that everything needs looking at again.
+            Ok(event) if event.need_rescan() => changes.rescan = true,
             Ok(event) => {
                 collect_reload_dirs(&event, &mut changes.dirs);
                 collect_rename_pair(&event, &mut changes.renames);
@@ -74,6 +78,9 @@ pub struct Changes {
     /// changes, so nothing above notices — but whatever is cached for them is
     /// now a picture of the old contents.
     pub rewritten: Vec<PathBuf>,
+    /// Events were lost, so `dirs` and `renames` are not the whole story: the
+    /// tree has to be checked against the disk everywhere it is loaded.
+    pub rescan: bool,
     /// The latest error the watcher reported, such as running out of inotify
     /// watches for a directory created after the watch began. Whatever it
     /// concerned is no longer being watched, so it is the caller's to show.
@@ -219,6 +226,21 @@ mod tests {
                 .rewritten
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn lost_events_ask_for_a_rescan() {
+        let results = vec![
+            Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(PathBuf::from("/r/new.jpg"))),
+            // What notify sends for an inotify queue overflow.
+            Ok(notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)),
+        ];
+        let changes = collect_changes(results.into_iter());
+        assert!(changes.rescan);
+        // What did arrive is still reported.
+        assert_eq!(changes.dirs, vec![PathBuf::from("/r")]);
+        assert!(!collect_changes(std::iter::empty()).rescan);
     }
 
     #[test]

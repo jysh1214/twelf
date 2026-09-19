@@ -1002,7 +1002,16 @@ impl eframe::App for TwelfApp {
                      right-click a folder and Refresh to re-list it"
                 )));
             }
-            if !changes.dirs.is_empty() {
+            if changes.rescan {
+                // Events were dropped, so the directories named below are not
+                // all that changed: check the tree against the disk wherever it
+                // is loaded. Left alone it stayed out of step, silently, until a
+                // Refresh — with the selection possibly on a path that is gone.
+                if let Some(root) = self.root_node.as_mut() {
+                    root.relist_all();
+                }
+                self.search_dirty = true;
+            } else if !changes.dirs.is_empty() {
                 if let Some(root) = self.root_node.as_mut() {
                     for dir in &changes.dirs {
                         root.relist(dir);
