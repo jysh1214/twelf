@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Cap on the blob cache's total size. The schema has always tracked
+/// Cap on one key's blob cache. The schema has always tracked
 /// `last_accessed`, but nothing read it: every distinct remote image ever
 /// viewed stayed on disk forever, and once the partition filled every
 /// subsequent write failed silently.
 const MAX_CACHE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+
+/// Subdirectory of the cache root holding one directory per SSH key.
+const KEYS_DIR: &str = "keys";
 
 pub struct ImageCache {
     inner: Mutex<Option<Inner>>,
@@ -17,8 +20,22 @@ pub struct ImageCache {
 
 struct Inner {
     conn: Connection,
+    /// This cache's own directory: `cache.db` and `blobs/`.
+    dir: PathBuf,
     blobs_dir: PathBuf,
     max_bytes: i64,
+    /// The cache root, when opened through `open_under`: every key's directory
+    /// plus whatever the single-cache layout left behind. `clear` empties it.
+    root: Option<PathBuf>,
+}
+
+/// Why a cache database did not open.
+enum OpenError {
+    /// The file is not a database under this key: corrupt, or another key's.
+    NotADatabase(String),
+    /// Locked by a second instance, an I/O error, no permission — nothing that
+    /// says the contents are bad.
+    Other(String),
 }
 
 impl ImageCache {
@@ -49,6 +66,12 @@ impl ImageCache {
     }
 
     #[cfg(test)]
+    fn initialize_under(&self, root: &Path, key: &[u8]) {
+        let inner = Self::open_under(root, key).expect("open test cache");
+        *self.inner.lock().unwrap() = Some(inner);
+    }
+
+    #[cfg(test)]
     fn initialize_at(&self, dir: &Path, key: &[u8]) {
         self.initialize_at_with_cap(dir, key, MAX_CACHE_BYTES);
     }
@@ -64,10 +87,46 @@ impl ImageCache {
     fn try_open(ssh_key_path: &Path) -> Result<Inner, String> {
         let key_bytes = fs::read(ssh_key_path)
             .map_err(|e| format!("failed to read SSH key {}: {e}", ssh_key_path.display()))?;
-        let key_hex = format!("{:x}", Sha256::digest(&key_bytes));
-        let mut dir = dirs::cache_dir().ok_or_else(|| "no cache dir available".to_string())?;
-        dir.push("twelf");
-        Self::open_at(&dir, &key_hex)
+        let mut root = dirs::cache_dir().ok_or_else(|| "no cache dir available".to_string())?;
+        root.push("twelf");
+        Self::open_under(&root, &key_bytes)
+    }
+
+    /// Open the cache belonging to `key_bytes` under `root`. Each key has a
+    /// directory of its own: the database is encrypted with the key, so one
+    /// shared database could only ever serve one key, and connecting with
+    /// another used to read as corruption and delete the whole cache — every
+    /// time the user switched between favorites with different keys.
+    fn open_under(root: &Path, key_bytes: &[u8]) -> Result<Inner, String> {
+        let key_hex = format!("{:x}", Sha256::digest(key_bytes));
+        let dir = root.join(KEYS_DIR).join(key_dir_name(key_bytes));
+        Self::adopt_legacy(root, &dir, &key_hex);
+        let mut inner = Self::open_at(&dir, &key_hex)?;
+        // As the single-cache layout had it; `open_at` covers `dir` itself.
+        restrict(root, 0o700);
+        inner.root = Some(root.to_path_buf());
+        Ok(inner)
+    }
+
+    /// Move a cache from the single-cache layout (`cache.db` and `blobs/`
+    /// directly under `root`) into `dir`, if this key is the one that opens it.
+    /// Another key's is left where it is, for that key to claim. Best-effort: a
+    /// cache that cannot be moved is just one that starts empty.
+    fn adopt_legacy(root: &Path, dir: &Path, key_hex: &str) {
+        let legacy_db = root.join("cache.db");
+        if !legacy_db.exists() || dir.join("cache.db").exists() {
+            return;
+        }
+        match Self::open_with_key(&legacy_db, key_hex) {
+            Ok(conn) => drop(conn),
+            Err(_) => return,
+        }
+        let moved = fs::create_dir_all(dir)
+            .and_then(|()| fs::rename(&legacy_db, dir.join("cache.db")))
+            .and_then(|()| fs::rename(root.join("blobs"), dir.join("blobs")));
+        if let Err(e) = moved {
+            crate::log!("could not adopt the cache in {}: {e}", root.display());
+        }
     }
 
     fn open_at(dir: &Path, key_hex: &str) -> Result<Inner, String> {
@@ -82,34 +141,51 @@ impl ImageCache {
         restrict(&blobs_dir, 0o700);
         let db_path = dir.join("cache.db");
 
-        match Self::open_with_key(&db_path, key_hex) {
-            Ok(conn) => Ok(Inner { conn, blobs_dir, max_bytes: MAX_CACHE_BYTES }),
-            Err(_) => {
+        let conn = match Self::open_with_key(&db_path, key_hex) {
+            Ok(conn) => conn,
+            // In this key's own directory that can only be corruption, and the
+            // blobs are indexed by nothing else: start the pair over.
+            Err(OpenError::NotADatabase(_)) => {
                 let _ = fs::remove_file(&db_path);
                 if let Ok(iter) = fs::read_dir(&blobs_dir) {
                     for entry in iter.flatten() {
                         let _ = fs::remove_file(entry.path());
                     }
                 }
-                let conn = Self::open_with_key(&db_path, key_hex)
-                    .map_err(|e| format!("failed to open encrypted cache after wipe: {e}"))?;
-                Ok(Inner { conn, blobs_dir, max_bytes: MAX_CACHE_BYTES })
+                Self::open_with_key(&db_path, key_hex).map_err(|e| match e {
+                    OpenError::NotADatabase(e) | OpenError::Other(e) => {
+                        format!("failed to open encrypted cache after wipe: {e}")
+                    }
+                })?
             }
-        }
+            // Any other failure used to wipe too — so a second running instance
+            // holding the lock cost the first one its whole cache. Leave the
+            // files alone and run without a disk cache this session.
+            Err(OpenError::Other(e)) => return Err(e),
+        };
+        Ok(Inner { conn, dir: dir.to_path_buf(), blobs_dir, max_bytes: MAX_CACHE_BYTES, root: None })
     }
 
-    fn open_with_key(db_path: &Path, key_hex: &str) -> Result<Connection, String> {
+    fn open_with_key(db_path: &Path, key_hex: &str) -> Result<Connection, OpenError> {
+        let other = |what: &str, e: rusqlite::Error| OpenError::Other(format!("{what}: {e}"));
         let conn = Connection::open(db_path)
-            .map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
+            .map_err(|e| other(&format!("failed to open {}", db_path.display()), e))?;
         conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\""))
-            .map_err(|e| format!("failed to set key: {e}"))?;
+            .map_err(|e| other("failed to set key", e))?;
+        // The key is only tested by the first read.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok::<(), rusqlite::Error>(()))
-            .map_err(|e| format!("decryption check failed: {e}"))?;
+            .map_err(|e| {
+                if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) {
+                    OpenError::NotADatabase(format!("decryption check failed: {e}"))
+                } else {
+                    other("decryption check failed", e)
+                }
+            })?;
         let entries_exists = conn.prepare("SELECT 1 FROM entries LIMIT 0").is_ok();
         let has_fingerprint = conn.prepare("SELECT mtime FROM entries LIMIT 0").is_ok();
         if entries_exists && !has_fingerprint {
             conn.execute("DROP TABLE entries", [])
-                .map_err(|e| format!("failed to drop outdated table: {e}"))?;
+                .map_err(|e| other("failed to drop outdated table", e))?;
         }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS entries (
@@ -120,7 +196,7 @@ impl ImageCache {
             )",
             [],
         )
-        .map_err(|e| format!("failed to create table: {e}"))?;
+        .map_err(|e| other("failed to create table", e))?;
         Ok(conn)
     }
 
@@ -283,18 +359,33 @@ impl ImageCache {
         }
     }
 
+    /// Empty the cache — all of it, not only the open key's share. Whoever
+    /// clears a cache wants the disk space or the plaintext copies gone, and
+    /// another key's directory can be reached no other way short of connecting
+    /// with that key.
     pub fn clear(&self) {
-        let blobs_dir = {
+        let (dir, blobs_dir, root) = {
             let Ok(guard) = self.inner.lock() else { return };
             let Some(inner) = guard.as_ref() else { return };
             if let Err(e) = inner.conn.execute("DELETE FROM entries", []) {
                 crate::log!("failed to clear cache rows: {e}");
             }
-            inner.blobs_dir.clone()
+            (inner.dir.clone(), inner.blobs_dir.clone(), inner.root.clone())
         };
         if let Ok(iter) = fs::read_dir(&blobs_dir) {
             for entry in iter.flatten() {
                 let _ = fs::remove_file(entry.path());
+            }
+        }
+        let Some(root) = root else { return };
+        // What the single-cache layout left behind, if no key ever claimed it.
+        let _ = fs::remove_file(root.join("cache.db"));
+        let _ = fs::remove_dir_all(root.join("blobs"));
+        if let Ok(iter) = fs::read_dir(root.join(KEYS_DIR)) {
+            for entry in iter.flatten() {
+                if entry.path() != dir {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
             }
         }
     }
@@ -304,6 +395,15 @@ impl ImageCache {
         let Some(inner) = guard.as_ref() else { return 0 };
         sum_bytes(&inner.conn).map(|n| n.max(0) as u64).unwrap_or(0)
     }
+}
+
+/// Directory name for a key's cache. Hashed under its own label rather than
+/// cut from the database key, so the name on disk gives away no part of it.
+fn key_dir_name(key_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"twelf cache directory\0");
+    hasher.update(key_bytes);
+    format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
 /// Tighten `path` to `mode`. Best-effort: a cache that cannot be locked down is
@@ -350,6 +450,99 @@ mod tests {
         let cache = ImageCache::new();
         cache.initialize_at(dir.path(), b"test-key");
         (cache, dir)
+    }
+
+    fn under(root: &Path, key: &[u8]) -> ImageCache {
+        let cache = ImageCache::new();
+        cache.initialize_under(root, key);
+        cache
+    }
+
+    #[test]
+    fn switching_keys_keeps_each_keys_cache() {
+        let root = tempdir().expect("tempdir");
+        under(root.path(), b"key-a").put("sftp://nas/a.jpg", b"from a", Some(1));
+        // Connecting with another key used to delete everything stored so far.
+        under(root.path(), b"key-b").put("sftp://work/b.jpg", b"from b", Some(1));
+        assert_eq!(
+            under(root.path(), b"key-a").get("sftp://nas/a.jpg", Some(1), Some(6)),
+            Some(b"from a".to_vec())
+        );
+        assert_eq!(
+            under(root.path(), b"key-b").get("sftp://work/b.jpg", Some(1), Some(6)),
+            Some(b"from b".to_vec())
+        );
+        // One key cannot read the other's index.
+        assert_eq!(under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(6)), None);
+    }
+
+    #[test]
+    fn a_corrupt_database_is_rebuilt_but_an_unopenable_one_is_left_alone() {
+        let key_hex = format!("{:x}", Sha256::digest(b"test-key"));
+
+        // Garbage where the database should be: start over, blobs included.
+        let corrupt = tempdir().expect("tempdir");
+        fs::create_dir_all(corrupt.path().join("blobs")).unwrap();
+        fs::write(corrupt.path().join("blobs").join("7"), b"orphan").unwrap();
+        fs::write(corrupt.path().join("cache.db"), vec![0x5au8; 4096]).unwrap();
+        assert!(ImageCache::open_at(corrupt.path(), &key_hex).is_ok());
+        assert!(!corrupt.path().join("blobs").join("7").exists());
+
+        // A database that cannot be opened at all says nothing about what is in
+        // the cache: no wipe, just no disk cache this session.
+        let blocked = tempdir().expect("tempdir");
+        fs::create_dir_all(blocked.path().join("blobs")).unwrap();
+        fs::write(blocked.path().join("blobs").join("7"), b"kept").unwrap();
+        fs::create_dir(blocked.path().join("cache.db")).unwrap();
+        assert!(ImageCache::open_at(blocked.path(), &key_hex).is_err());
+        assert!(blocked.path().join("blobs").join("7").exists());
+    }
+
+    #[test]
+    fn the_single_cache_layout_is_adopted_by_its_own_key_only() {
+        let root = tempdir().expect("tempdir");
+        // The old layout: one database and blob folder directly under the root.
+        let legacy = ImageCache::new();
+        legacy.initialize_at(root.path(), b"key-a");
+        legacy.put("sftp://nas/a.jpg", b"hello", Some(1));
+        drop(legacy);
+
+        // Another key leaves it where it is…
+        assert_eq!(under(root.path(), b"key-b").get("sftp://nas/a.jpg", Some(1), Some(5)), None);
+        assert!(root.path().join("cache.db").exists());
+        // …and the key that wrote it takes it along, contents intact.
+        assert_eq!(
+            under(root.path(), b"key-a").get("sftp://nas/a.jpg", Some(1), Some(5)),
+            Some(b"hello".to_vec())
+        );
+        assert!(!root.path().join("cache.db").exists());
+        assert!(!root.path().join("blobs").exists());
+    }
+
+    #[test]
+    fn clear_empties_every_keys_cache() {
+        let root = tempdir().expect("tempdir");
+        let legacy = ImageCache::new();
+        legacy.initialize_at(root.path(), b"key-gone");
+        legacy.put("sftp://old/x.jpg", b"stale", Some(1));
+        drop(legacy);
+        under(root.path(), b"key-a").put("sftp://nas/a.jpg", b"from a", Some(1));
+
+        let current = under(root.path(), b"key-b");
+        current.put("sftp://work/b.jpg", b"from b", Some(1));
+        current.clear();
+
+        assert_eq!(current.total_size_bytes(), 0);
+        assert_eq!(current.get("sftp://work/b.jpg", Some(1), Some(6)), None);
+        assert_eq!(under(root.path(), b"key-a").get("sftp://nas/a.jpg", Some(1), Some(6)), None);
+        assert!(!root.path().join("cache.db").exists());
+        assert!(!root.path().join("blobs").exists());
+        // The open cache keeps working after the clear.
+        current.put("sftp://work/c.jpg", b"again", Some(1));
+        assert_eq!(
+            current.get("sftp://work/c.jpg", Some(1), Some(5)),
+            Some(b"again".to_vec())
+        );
     }
 
     #[test]

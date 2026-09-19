@@ -632,7 +632,12 @@ impl eframe::App for TwelfApp {
                     self.remote_poll_running = Arc::new(AtomicBool::new(false));
                     while self.remote_poll_rx.try_recv().is_ok() {}
                     *self.session_holder.lock().unwrap() = Some(session.clone());
-                    self.cache.initialize(&ssh::expand_home(&info.key_path));
+                    // Off the update loop: opening the cache is sqlite and file
+                    // I/O, and rebuilding a corrupt one unlinks every blob. Until
+                    // it lands the loader uses the previous cache, or none.
+                    let cache = self.cache.clone();
+                    let key_path = ssh::expand_home(&info.key_path);
+                    self.runtime.spawn_blocking(move || cache.initialize(&key_path));
                     self.clear_image_prefetch();
                     self.forget_all_images(ctx);
                     ssh::SshState::Connected { session, info }

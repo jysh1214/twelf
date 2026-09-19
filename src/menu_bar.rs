@@ -38,7 +38,10 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     ui.label(format!("Size: {}", format_bytes(app.cache.total_size_bytes())));
                     ui.separator();
                     if ui.button("Clear Cache").clicked() {
-                        app.cache.clear();
+                        // Every key's blobs go, which can be a lot of unlinking:
+                        // not on the update loop.
+                        let cache = app.cache.clone();
+                        app.runtime.spawn_blocking(move || cache.clear());
                         app.forget_all_images(ctx);
                         ui.close();
                     }
