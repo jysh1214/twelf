@@ -270,6 +270,7 @@ pub fn render_tree(
     new_selection: &mut Option<PathBuf>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
+    refresh_request: &mut Option<PathBuf>,
 ) {
     match &mut node.kind {
         NodeKind::File => {
@@ -316,6 +317,7 @@ pub fn render_tree(
                                 new_selection,
                                 delete_request,
                                 rename_request,
+                                refresh_request,
                             );
                         }
                     }
@@ -331,9 +333,16 @@ pub fn render_tree(
             if resp.fully_closed() && matches!(children, DirChildren::Error(_)) {
                 *children = DirChildren::Unloaded;
             }
-            // No Rename/Delete on the root row — it's the browse entry point.
-            if !is_root {
-                resp.header_response.context_menu(|ui| {
+            resp.header_response.context_menu(|ui| {
+                // The watcher normally makes this unnecessary. It is the way out
+                // when the watch could not be set up, or cannot see the change —
+                // another machine writing to a network mount.
+                if ui.button("Refresh").clicked() {
+                    *refresh_request = Some(path.clone());
+                    ui.close();
+                }
+                // No Rename/Delete on the root row — it's the browse entry point.
+                if !is_root {
                     if ui.button("Rename").clicked() {
                         *rename_request = Some((path.clone(), true));
                         ui.close();
@@ -342,8 +351,8 @@ pub fn render_tree(
                         *delete_request = Some((path.clone(), true));
                         ui.close();
                     }
-                });
-            }
+                }
+            });
         }
     }
 }

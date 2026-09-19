@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 /// A recursive watch on the local root folder. Filesystem changes made outside
-/// the app land as events; `changed_dirs` turns them into the directories whose
+/// the app land as events; `drain_changes` turns them into the directories whose
 /// listing must be re-read. Dropping the handle stops the watch.
 pub struct FsWatcher {
     // Held only to keep the watch alive; dropped with self.
@@ -13,10 +13,11 @@ pub struct FsWatcher {
 }
 
 impl FsWatcher {
-    /// Start watching `root` recursively. `None` (with a log line) when the
-    /// watch cannot be established — e.g. the inotify watch limit on a huge
-    /// tree — in which case the tree just stays manually refreshed.
-    pub fn spawn(root: &std::path::Path, ctx: &egui::Context) -> Option<Self> {
+    /// Start watching `root` recursively. Fails when the watch cannot be
+    /// established — e.g. the inotify watch limit on a huge tree. The reason is
+    /// handed back for the caller to show: the tree then only changes through
+    /// its Refresh action, which the user has to be told.
+    pub fn spawn(root: &std::path::Path, ctx: &egui::Context) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         let mut watcher =
@@ -27,16 +28,12 @@ impl FsWatcher {
                 ctx.request_repaint();
             }) {
                 Ok(w) => w,
-                Err(e) => {
-                    crate::log!("failed to create fs watcher: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e.to_string()),
             };
-        if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
-            crate::log!("failed to watch {}: {e}", root.display());
-            return None;
-        }
-        Some(Self {
+        watcher
+            .watch(root, RecursiveMode::Recursive)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
             _watcher: watcher,
             rx,
         })
@@ -46,30 +43,36 @@ impl FsWatcher {
     /// changed, plus the old→new pair of every paired rename among them.
     /// Non-blocking; empty when nothing happened.
     pub fn drain_changes(&self) -> Changes {
-        let mut changes = Changes {
-            dirs: Vec::new(),
-            renames: Vec::new(),
-        };
-        for res in self.rx.try_iter() {
-            match res {
-                Ok(event) => {
-                    collect_reload_dirs(&event, &mut changes.dirs);
-                    collect_rename_pair(&event, &mut changes.renames);
-                }
-                Err(e) => crate::log!("fs watcher error: {e}"),
-            }
-        }
-        changes
+        collect_changes(self.rx.try_iter())
     }
+}
+
+fn collect_changes(results: impl Iterator<Item = notify::Result<notify::Event>>) -> Changes {
+    let mut changes = Changes::default();
+    for res in results {
+        match res {
+            Ok(event) => {
+                collect_reload_dirs(&event, &mut changes.dirs);
+                collect_rename_pair(&event, &mut changes.renames);
+            }
+            Err(e) => changes.error = Some(e.to_string()),
+        }
+    }
+    changes
 }
 
 /// Changes drained from the watcher: the directories whose listing must be
 /// re-read, and the (old, new) pair of every paired rename event — the pairing
 /// is what lets the app follow its selection when the selected file is renamed
 /// outside it.
+#[derive(Default)]
 pub struct Changes {
     pub dirs: Vec<PathBuf>,
     pub renames: Vec<(PathBuf, PathBuf)>,
+    /// The latest error the watcher reported, such as running out of inotify
+    /// watches for a directory created after the watch began. Whatever it
+    /// concerned is no longer being watched, so it is the caller's to show.
+    pub error: Option<String>,
 }
 
 /// Push the parent of every path in a tree-shape-changing event (create,
@@ -126,6 +129,20 @@ mod tests {
             collect_reload_dirs(event, &mut out);
         }
         out
+    }
+
+    #[test]
+    fn a_watcher_error_is_handed_on_alongside_the_events() {
+        let results = vec![
+            Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(PathBuf::from("/r/new.jpg"))),
+            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+        ];
+        let changes = collect_changes(results.into_iter());
+        assert_eq!(changes.dirs, vec![PathBuf::from("/r")]);
+        assert!(changes.error.is_some());
+        // Quiet when nothing went wrong.
+        assert!(collect_changes(std::iter::empty()).error.is_none());
     }
 
     #[test]

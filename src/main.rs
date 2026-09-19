@@ -617,6 +617,12 @@ impl eframe::App for TwelfApp {
         // open search) reflect the disk immediately.
         let changes = self.fs_watcher.as_ref().map(|w| w.drain_changes());
         if let Some(changes) = changes {
+            if let Some(error) = &changes.error {
+                self.status_message = Some(status_bar::Message::error(format!(
+                    "File watcher: {error}. Some changes may not show up; \
+                     right-click a folder and Refresh to re-list it"
+                )));
+            }
             if !changes.dirs.is_empty() {
                 if let Some(root) = self.root_node.as_mut() {
                     for dir in &changes.dirs {
@@ -1257,6 +1263,7 @@ impl eframe::App for TwelfApp {
                                 &mut new_selection,
                                 &mut delete_request,
                                 &mut rename_request,
+                                &mut refresh_request,
                             );
                         }
                     });
@@ -1330,12 +1337,20 @@ impl eframe::App for TwelfApp {
             };
             self.add_favorite(favorite);
         }
-        // A Refresh action was chosen: drop the folder's cached remote listing
-        // so the next render re-lists it (expanded subfolders re-list lazily).
-        if let Some(path) = refresh_request
-            && let Some(root) = self.remote_root.as_mut()
-        {
-            root.reload(&path);
+        // A Refresh action was chosen: drop the folder's cached listing so the
+        // next render re-lists it (expanded subfolders re-list lazily). Only one
+        // tree renders per frame, so the request came from the one on screen.
+        if let Some(path) = refresh_request {
+            let remote_shown =
+                matches!(self.ssh, ssh::SshState::Connected { .. }) && self.remote_root.is_some();
+            if remote_shown {
+                if let Some(root) = self.remote_root.as_mut() {
+                    root.reload(&path);
+                }
+            } else if let Some(root) = self.root_node.as_mut() {
+                root.reload(&path);
+                self.search_dirty = true;
+            }
         }
         // A Delete action was chosen this frame: park it for the confirm modal.
         if let Some((path, is_dir)) = delete_request {
