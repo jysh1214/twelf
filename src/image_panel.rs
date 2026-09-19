@@ -228,6 +228,14 @@ fn forgettable_keys(uri: &str) -> [String; 2] {
     [uri.to_string(), format!("{uri}#0")]
 }
 
+/// Forget everything cached for the local file at `path` — bytes, decode and
+/// texture — so the next time it is shown it is read from disk again.
+pub fn forget_local_image(ctx: &egui::Context, path: &std::path::Path) {
+    for key in forgettable_keys(&format!("file://{}", path.display())) {
+        ctx.forget_image(&key);
+    }
+}
+
 fn selected_uri(app: &TwelfApp) -> Option<String> {
     if let Some(path) = &app.selected_remote {
         let host = match &app.ssh {

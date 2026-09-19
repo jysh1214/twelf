@@ -832,18 +832,46 @@ fn rebase_path(selected: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     selected.strip_prefix(old).ok().map(|rest| new.join(rest))
 }
 
+/// What a batch of external renames did to the selected path.
+#[derive(Debug, PartialEq)]
+enum Followed {
+    /// The file moved, or a folder above it did: this is where it is now.
+    Moved(PathBuf),
+    /// Something was renamed onto the selected path, which is therefore still
+    /// there with different contents: an editor's atomic save, or a
+    /// backup-then-replace that first moved the old file aside.
+    Replaced,
+}
+
 /// Chase `selected` through a batch of external rename pairs in event order:
 /// a selection under a renamed folder follows the folder, and a file renamed
 /// twice in one batch lands on its final name. `None` when no pair touched it.
-fn follow_renames(selected: Option<&Path>, renames: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+///
+/// A path renamed away and then renamed *onto* again is not followed. Tools
+/// that save by backup-then-replace (exiftool's `a.jpg_original`, `rsync
+/// --backup`, vim with backups) emit (a.jpg → a.jpg_original), (tmp → a.jpg):
+/// following the first pair alone put the selection on the backup — which the
+/// tree does not list — and left the panel showing the pre-edit picture.
+fn follow_renames(selected: Option<&Path>, renames: &[(PathBuf, PathBuf)]) -> Option<Followed> {
     let selected = selected?;
     let mut followed: Option<PathBuf> = None;
+    // Whether `selected` itself names a file again, after whatever left it.
+    let mut replaced = false;
     for (old, new) in renames {
         if let Some(p) = rebase_path(followed.as_deref().unwrap_or(selected), old, new) {
             followed = Some(p);
         }
+        if new == selected {
+            replaced = true;
+        } else if old == selected {
+            replaced = false;
+        }
     }
-    followed
+    if replaced {
+        Some(Followed::Replaced)
+    } else {
+        followed.map(Followed::Moved)
+    }
 }
 
 impl eframe::App for TwelfApp {
@@ -879,10 +907,28 @@ impl eframe::App for TwelfApp {
             // above it): follow it, like an in-app rename does. The target is
             // the local tree's own, so it simply waits if the remote tree or
             // search results are what is on screen right now.
-            if let Some(p) = follow_renames(self.selected_image.as_deref(), &changes.renames) {
-                self.local_scroll_target = Some(p.clone());
-                self.selected_image = Some(p);
-                self.forget_all_images(ctx);
+            //
+            // Only the affected file's cache entries are dropped. Forgetting every
+            // image also threw away whatever the remote tree had loaded, when
+            // that was the one on screen.
+            let followed = follow_renames(self.selected_image.as_deref(), &changes.renames);
+            if followed.is_some()
+                && let Some(path) = &self.selected_image
+            {
+                image_panel::forget_local_image(ctx, path);
+            }
+            match followed {
+                Some(Followed::Moved(p)) => {
+                    self.local_scroll_target = Some(p.clone());
+                    self.selected_image = Some(p);
+                }
+                // Same path, new contents: have the panel rebuild what it made
+                // from the old ones (a video player, an animation) — unless a
+                // remote selection is what it is showing.
+                Some(Followed::Replaced) if self.selected_remote.is_none() => {
+                    self.last_displayed = None;
+                }
+                Some(Followed::Replaced) | None => {}
             }
         }
 
@@ -1606,12 +1652,12 @@ mod tests {
         // The renamed file itself.
         assert_eq!(
             follow_renames(Some(Path::new("/r/a.jpg")), &[pair("/r/a.jpg", "/r/b.jpg")]),
-            Some(PathBuf::from("/r/b.jpg"))
+            Some(Followed::Moved(PathBuf::from("/r/b.jpg")))
         );
         // A selection inside a renamed folder.
         assert_eq!(
             follow_renames(Some(Path::new("/r/d/a.jpg")), &[pair("/r/d", "/r/e")]),
-            Some(PathBuf::from("/r/e/a.jpg"))
+            Some(Followed::Moved(PathBuf::from("/r/e/a.jpg")))
         );
         // Two pairs in one drained batch chain onto the final name.
         assert_eq!(
@@ -1619,7 +1665,38 @@ mod tests {
                 Some(Path::new("/r/a.jpg")),
                 &[pair("/r/a.jpg", "/r/b.jpg"), pair("/r/b.jpg", "/r/c.jpg")]
             ),
-            Some(PathBuf::from("/r/c.jpg"))
+            Some(Followed::Moved(PathBuf::from("/r/c.jpg")))
+        );
+    }
+
+    #[test]
+    fn follow_renames_stays_on_a_path_that_was_renamed_onto() {
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        let selected = Some(Path::new("/r/a.jpg"));
+        // exiftool, rsync --backup, vim: the old file is moved aside, the new
+        // one takes its name. The selection belongs with the name.
+        assert_eq!(
+            follow_renames(
+                selected,
+                &[
+                    pair("/r/a.jpg", "/r/a.jpg_original"),
+                    pair("/r/.tmp1", "/r/a.jpg")
+                ]
+            ),
+            Some(Followed::Replaced)
+        );
+        // An atomic save with no backup: never moved, but no longer the same.
+        assert_eq!(
+            follow_renames(selected, &[pair("/r/.tmp1", "/r/a.jpg")]),
+            Some(Followed::Replaced)
+        );
+        // Replaced and then renamed for good: it did move after all.
+        assert_eq!(
+            follow_renames(
+                selected,
+                &[pair("/r/.tmp1", "/r/a.jpg"), pair("/r/a.jpg", "/r/b.jpg")]
+            ),
+            Some(Followed::Moved(PathBuf::from("/r/b.jpg")))
         );
     }
 
