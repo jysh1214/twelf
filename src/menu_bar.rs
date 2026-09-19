@@ -24,6 +24,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         app.remote_root = None;
                         app.selected_remote = None;
                         *app.session_holder.lock().unwrap() = None;
+                        app.clear_image_prefetch();
                         app.forget_all_images(ctx);
                     }
                     ui.close();

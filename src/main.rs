@@ -332,6 +332,15 @@ impl TwelfApp {
         }
     }
 
+    /// Abandon the prefetch queue along with the session it was built for. Its
+    /// URIs name a host, but the loader reads from whichever session is current:
+    /// left alone, a "Load" queued against one host kept draining against the
+    /// next, hundreds of round trips spent on the wrong machine.
+    fn clear_image_prefetch(&mut self) {
+        self.image_prefetch.clear();
+        self.prefetch_in_flight.clear();
+    }
+
     /// Drop every cached image. Also clears the displayed-URI window, whose
     /// entries have just been forgotten wholesale — leaving them would waste
     /// the window on URIs that no longer hold anything.
@@ -554,6 +563,7 @@ impl eframe::App for TwelfApp {
                     while self.remote_poll_rx.try_recv().is_ok() {}
                     *self.session_holder.lock().unwrap() = Some(session.clone());
                     self.cache.initialize(&ssh::expand_home(&info.key_path));
+                    self.clear_image_prefetch();
                     self.forget_all_images(ctx);
                     ssh::SshState::Connected { session, info }
                 }
@@ -582,6 +592,7 @@ impl eframe::App for TwelfApp {
                     self.last_remote_poll = None;
                     self.remote_poll_running = Arc::new(AtomicBool::new(false));
                     *self.session_holder.lock().unwrap() = None;
+                    self.clear_image_prefetch();
                     self.forget_all_images(ctx);
                     ssh::SshState::Failed { error }
                 }
