@@ -2,6 +2,7 @@ use crate::{TwelfApp, sidebar, ssh};
 use eframe::egui;
 
 pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
+    let mut cancel_connect = false;
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -53,19 +54,29 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     ui.label("Not initialized");
                 }
             });
-            let status = match &app.ssh {
-                ssh::SshState::Disconnected => String::new(),
-                ssh::SshState::Connecting => "Connecting…".to_string(),
-                ssh::SshState::Connected { info, .. } => {
-                    format!("Connected: {}@{}:{}", info.user, info.host, info.port)
+            if let Some(attempt) = &app.connecting {
+                ui.label(format!("Connecting to {}…", attempt.target));
+                if ui.small_button("Cancel").clicked() {
+                    cancel_connect = true;
                 }
-                ssh::SshState::Failed { error } => format!("SSH error: {error}"),
-            };
-            if !status.is_empty() {
-                ui.label(status);
+            } else {
+                let status = match &app.ssh {
+                    ssh::SshState::Disconnected => String::new(),
+                    ssh::SshState::Connected { info, .. } => {
+                        format!("Connected: {}@{}:{}", info.user, info.host, info.port)
+                    }
+                    ssh::SshState::Failed { error } => format!("SSH error: {error}"),
+                };
+                if !status.is_empty() {
+                    ui.label(status);
+                }
             }
         });
     });
+    // Dropping the attempt abandons it; whatever session was current still is.
+    if cancel_connect {
+        app.connecting = None;
+    }
 }
 
 pub(crate) fn format_bytes(n: u64) -> String {

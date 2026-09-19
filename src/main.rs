@@ -113,7 +113,8 @@ struct TwelfApp {
     zoom: f32,
     last_displayed: Option<PathBuf>,
     ssh: ssh::SshState,
-    ssh_rx: Option<tokio::sync::mpsc::Receiver<ssh::ConnectResult>>,
+    /// A Connect click still being resolved. `ssh` is left as it was meanwhile.
+    connecting: Option<ssh::ConnectAttempt>,
     ssh_dialog: ssh::ConnectDialog,
     /// Saved connections, mirrored to `config.toml` whenever they change.
     favorites: Vec<config::Favorite>,
@@ -190,7 +191,7 @@ impl TwelfApp {
             zoom: 1.0,
             last_displayed: None,
             ssh: ssh::SshState::Disconnected,
-            ssh_rx: None,
+            connecting: None,
             ssh_dialog: ssh::ConnectDialog::from_settings(config.ssh),
             favorites: config.favorites,
             remote_root: None,
@@ -380,6 +381,35 @@ impl TwelfApp {
         *self.session_holder.lock().unwrap() = None;
         self.clear_image_prefetch();
         self.forget_all_images(ctx);
+    }
+
+    /// Apply the outcome of a connection attempt to `target`. Success replaces
+    /// the current session. Failure only costs the session when there was none
+    /// worth keeping: a working connection used to be torn down the moment
+    /// Connect was clicked, so a typo in the host lost its expanded tree, and
+    /// the failed attempt then cleared what was left.
+    fn finish_connect(&mut self, target: &str, result: ssh::ConnectResult, ctx: &egui::Context) {
+        match result {
+            Ok((session, info)) => {
+                self.leave_remote_session(ctx);
+                self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
+                *self.session_holder.lock().unwrap() = Some(session.clone());
+                // Off the update loop: opening the cache is sqlite and file
+                // I/O, and rebuilding a corrupt one unlinks every blob. Until
+                // it lands the loader uses the previous cache, or none.
+                let cache = self.cache.clone();
+                let key_path = ssh::expand_home(&info.key_path);
+                self.runtime
+                    .spawn_blocking(move || cache.initialize(&key_path));
+                self.ssh = ssh::SshState::Connected { session, info };
+            }
+            Err(error) if matches!(self.ssh, ssh::SshState::Connected { .. }) => {
+                self.status_message = Some(status_bar::Message::error(format!(
+                    "Could not connect to {target}: {error}"
+                )));
+            }
+            Err(error) => self.ssh = ssh::SshState::Failed { error },
+        }
     }
 
     /// Leave the current session without stopping a delete it is in the middle
@@ -742,30 +772,10 @@ impl eframe::App for TwelfApp {
             }
         }
 
-        if let Some(rx) = self.ssh_rx.as_mut()
-            && let Ok(result) = rx.try_recv()
+        if let Some(result) = self.connecting.as_mut().and_then(|attempt| attempt.poll())
+            && let Some(attempt) = self.connecting.take()
         {
-            self.ssh = match result {
-                Ok((session, info)) => {
-                    self.leave_remote_session(ctx);
-                    self.remote_root =
-                        Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
-                    *self.session_holder.lock().unwrap() = Some(session.clone());
-                    // Off the update loop: opening the cache is sqlite and file
-                    // I/O, and rebuilding a corrupt one unlinks every blob. Until
-                    // it lands the loader uses the previous cache, or none.
-                    let cache = self.cache.clone();
-                    let key_path = ssh::expand_home(&info.key_path);
-                    self.runtime
-                        .spawn_blocking(move || cache.initialize(&key_path));
-                    ssh::SshState::Connected { session, info }
-                }
-                Err(error) => {
-                    self.leave_remote_session(ctx);
-                    ssh::SshState::Failed { error }
-                }
-            };
-            self.ssh_rx = None;
+            self.finish_connect(&attempt.target, result, ctx);
         }
 
         // Periodic remote refresh: merge finished poll listings into the tree
@@ -987,16 +997,9 @@ impl eframe::App for TwelfApp {
                 key_path: self.ssh_dialog.key_path.clone(),
                 root: self.ssh_dialog.root.clone(),
             };
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            self.ssh = ssh::SshState::Connecting;
-            self.ssh_rx = Some(rx);
+            // Replacing an attempt still in flight drops it, which abandons it.
+            self.connecting = Some(ssh::ConnectAttempt::spawn(req, &self.runtime, ctx));
             self.ssh_dialog.open = false;
-            let ctx_clone = ctx.clone();
-            self.runtime.spawn(async move {
-                let result = ssh::connect(req).await;
-                let _ = tx.send(result).await;
-                ctx_clone.request_repaint();
-            });
         }
         // Delete confirmation. A right-click Delete in either tree parks its
         // target in `pending_delete`; nothing is removed until Confirm here.
@@ -1624,6 +1627,27 @@ mod tests {
             Some("Not connected")
         );
         assert!(app.remote_rename.is_none());
+    }
+
+    #[test]
+    fn a_failed_connect_with_no_session_to_keep_reports_in_the_menu_bar() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        app.status_message = None;
+        // A local search is nothing of the remote side's, and stays open.
+        app.search_active = true;
+        app.search_query = "trip".to_string();
+        app.finish_connect(
+            "alex@nas:22",
+            Err("no connection after 20 s".to_string()),
+            &ctx,
+        );
+        assert!(matches!(
+            &app.ssh,
+            ssh::SshState::Failed { error } if error == "no connection after 20 s"
+        ));
+        assert!(app.search_active);
+        assert_eq!(app.status_message, None);
     }
 
     #[test]

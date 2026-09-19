@@ -1,13 +1,14 @@
 use crate::config;
+use eframe::egui;
 use russh::client::{self, Handler};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 use russh_sftp::client::SftpSession;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub enum SshState {
     Disconnected,
-    Connecting,
     Connected {
         #[allow(dead_code)]
         session: Arc<SftpSession>,
@@ -36,6 +37,54 @@ pub struct ConnectRequest {
 }
 
 pub type ConnectResult = Result<(Arc<SftpSession>, ConnInfo), String>;
+
+/// How long a connection attempt may take. russh sets no deadline of its own: a
+/// black-holed address held "Connecting…" for the OS's SYN timeout of about two
+/// minutes, and a host that accepts TCP but never sends a banner held it for
+/// good.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A connection attempt in flight. It is not an `SshState`: whatever session is
+/// current stays current, and usable, until this one succeeds — a mistyped host
+/// should cost nothing but the wait. Dropping the attempt abandons it, which is
+/// both the Cancel button and what a second Connect click does to the first.
+pub struct ConnectAttempt {
+    /// `user@host:port`, for the menu bar and a failure message.
+    pub target: String,
+    rx: tokio::sync::mpsc::Receiver<ConnectResult>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectAttempt {
+    pub fn spawn(
+        req: ConnectRequest,
+        runtime: &tokio::runtime::Runtime,
+        ctx: &egui::Context,
+    ) -> Self {
+        let target = format!("{}@{}:{}", req.user, req.host, req.port);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ctx.clone();
+        let task = runtime.spawn(async move {
+            let result = connect(req).await;
+            let _ = tx.send(result).await;
+            ctx.request_repaint();
+        });
+        Self { target, rx, task }
+    }
+
+    /// The outcome, once it is in (non-blocking).
+    pub fn poll(&mut self) -> Option<ConnectResult> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for ConnectAttempt {
+    fn drop(&mut self) {
+        // Closes the socket with it, rather than leaving a handshake nobody is
+        // waiting for to run on.
+        self.task.abort();
+    }
+}
 
 pub struct ConnectDialog {
     pub open: bool,
@@ -115,6 +164,16 @@ impl Handler for AcceptAnyHostKey {
 }
 
 pub async fn connect(req: ConnectRequest) -> ConnectResult {
+    match tokio::time::timeout(CONNECT_TIMEOUT, establish(req)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "no connection after {} s",
+            CONNECT_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn establish(req: ConnectRequest) -> ConnectResult {
     let key_path = expand_home(&req.key_path);
     let private_key = load_secret_key(&key_path, None).map_err(stringify)?;
     let config = Arc::new(client::Config::default());
@@ -246,6 +305,31 @@ mod tests {
         for bad in ["0", "65536", "22222222", "ssh", "22a", "-22"] {
             assert!(parse_port(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+
+    #[test]
+    fn an_attempt_names_its_target_and_hands_back_its_outcome() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let ctx = egui::Context::default();
+        // Fails at the key file, before anything touches the network.
+        let req = ConnectRequest {
+            host: "nas".to_string(),
+            port: 2222,
+            user: "alex".to_string(),
+            key_path: "/nonexistent/twelf-test-key".to_string(),
+            root: "/photos".to_string(),
+        };
+        let mut attempt = ConnectAttempt::spawn(req, &rt, &ctx);
+        assert_eq!(attempt.target, "alex@nas:2222");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(outcome) = attempt.poll() {
+                break outcome;
+            }
+            assert!(std::time::Instant::now() < deadline, "no outcome within 5s");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(outcome.is_err());
     }
 
     #[test]

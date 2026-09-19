@@ -18,7 +18,7 @@ russh = "0.60"
 russh-sftp = "2.1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs", "time"] }
 toml = "1"
 
 [dev-dependencies]
