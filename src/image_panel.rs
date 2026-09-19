@@ -298,7 +298,7 @@ fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animatio
 /// remote (the remote case downloads over SFTP before decoding).
 fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
     if let Some(path) = &app.selected_remote {
-        let crate::ssh::SshState::Connected { session, info } = &app.ssh else {
+        let crate::ssh::SshState::Connected { session, info, .. } = &app.ssh else {
             return None;
         };
         let uri = format!("sftp://{}{}", info.host, path.display());

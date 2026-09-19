@@ -443,7 +443,7 @@ impl TwelfApp {
         ctx: &egui::Context,
     ) {
         match result {
-            Ok((session, info)) => {
+            Ok((session, info, ended)) => {
                 self.leave_remote_session(ctx);
                 self.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from(&info.root)));
                 *self.session_holder.lock().unwrap() = Some(session.clone());
@@ -454,7 +454,11 @@ impl TwelfApp {
                 let key_path = ssh::expand_home(&info.key_path);
                 self.runtime
                     .spawn_blocking(move || cache.initialize(&key_path));
-                self.ssh = ssh::SshState::Connected { session, info };
+                self.ssh = ssh::SshState::Connected {
+                    session,
+                    info,
+                    ended,
+                };
             }
             // Not a failure yet: ask, and retry if the key is trusted.
             Err(ssh::ConnectError::UnknownHostKey { key }) => {
@@ -535,6 +539,16 @@ impl TwelfApp {
         } else if cancel || !open {
             self.pending_host_key = None;
         }
+    }
+
+    /// The current session is over, as the session itself reported. Say so where
+    /// the connection state is shown, and take the remote tree down with it:
+    /// nothing in it can be listed, opened or changed any more.
+    fn session_lost(&mut self, target: &str, reason: &str, ctx: &egui::Context) {
+        self.leave_remote_session(ctx);
+        self.ssh = ssh::SshState::Failed {
+            error: format!("lost the connection to {target}: {reason}"),
+        };
     }
 
     /// Leave the current session without stopping a delete it is in the middle
@@ -936,6 +950,13 @@ impl eframe::App for TwelfApp {
                 }
                 Some(Followed::Replaced) | None => {}
             }
+        }
+
+        if let ssh::SshState::Connected { info, ended, .. } = &self.ssh
+            && let Some(reason) = ended.take()
+        {
+            let target = format!("{}@{}:{}", info.user, info.host, info.port);
+            self.session_lost(&target, &reason, ctx);
         }
 
         if let Some(result) = self.connecting.as_mut().and_then(|attempt| attempt.poll())
@@ -1977,6 +1998,22 @@ mod tests {
         ));
         assert!(app.search_active);
         assert_eq!(app.status_message, None);
+    }
+
+    #[test]
+    fn a_lost_session_is_reported_and_its_tree_taken_down() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        app.remote_root = Some(remote::RemoteTreeNode::root(PathBuf::from("/photos")));
+        app.selected_remote = Some(PathBuf::from("/photos/a.jpg"));
+        app.session_lost("alex@nas:22", "keepalive timeout", &ctx);
+        assert!(matches!(
+            &app.ssh,
+            ssh::SshState::Failed { error }
+                if error == "lost the connection to alex@nas:22: keepalive timeout"
+        ));
+        assert!(app.remote_root.is_none());
+        assert_eq!(app.selected_remote, None);
     }
 
     #[test]

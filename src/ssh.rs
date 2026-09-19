@@ -1,6 +1,6 @@
 use crate::config;
 use eframe::egui;
-use russh::client::{self, Handler};
+use russh::client::{self, DisconnectReason, Handler};
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 use russh_sftp::client::SftpSession;
@@ -14,6 +14,8 @@ pub enum SshState {
         #[allow(dead_code)]
         session: Arc<SftpSession>,
         info: ConnInfo,
+        /// Where this session reports its own end; see `SessionEnd`.
+        ended: SessionEnd,
     },
     Failed {
         error: String,
@@ -60,7 +62,36 @@ impl From<String> for ConnectError {
     }
 }
 
-pub type ConnectResult = Result<(Arc<SftpSession>, ConnInfo), ConnectError>;
+pub type ConnectResult = Result<(Arc<SftpSession>, ConnInfo, SessionEnd), ConnectError>;
+
+/// How a session tells the app that it is over, and why. Nothing used to: the
+/// russh handle was dropped once SFTP was up, so after a server restart or a
+/// resume from sleep the menu bar went on saying "Connected" while every folder
+/// click stalled for ten seconds and every image went into a 30 s back-off.
+///
+/// One per connection, so a session the app has already left reports into a
+/// slot nobody reads rather than into its successor's.
+#[derive(Clone, Default)]
+pub struct SessionEnd(Arc<Mutex<Option<String>>>);
+
+impl SessionEnd {
+    /// Only the first reason is kept: what follows it is the fallout.
+    fn record(&self, reason: String) {
+        self.0.lock().unwrap().get_or_insert(reason);
+    }
+
+    /// Why the session ended, handed over once; `None` while it is alive.
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+/// How often an otherwise idle session pings the server, and how many pings may
+/// go unanswered. A link that dies silently — a NAT table entry expiring, a
+/// cable — is noticed within about a minute instead of never, and the traffic
+/// keeps such a NAT entry from expiring in the first place.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 3;
 
 /// How long a connection attempt may take. russh sets no deadline of its own: a
 /// black-holed address held "Connecting…" for the OS's SYN timeout of about two
@@ -90,7 +121,7 @@ impl ConnectAttempt {
         let ctx = ctx.clone();
         let request = req.clone();
         let task = runtime.spawn(async move {
-            let result = connect(req).await;
+            let result = connect(req, ctx.clone()).await;
             let _ = tx.send(result).await;
             ctx.request_repaint();
         });
@@ -258,6 +289,9 @@ struct VerifyHostKey {
     port: u16,
     files: Vec<PathBuf>,
     rejected: Arc<Mutex<Option<(HostKeyVerdict, PublicKey)>>>,
+    /// Told when the session ends, with the app woken up to look.
+    ended: SessionEnd,
+    ctx: egui::Context,
 }
 
 impl Handler for VerifyHostKey {
@@ -274,10 +308,34 @@ impl Handler for VerifyHostKey {
         *self.rejected.lock().unwrap() = Some((verdict, server_public_key.clone()));
         Ok(false)
     }
+
+    /// russh calls this however the session ends: the server saying goodbye, an
+    /// I/O error, keepalives going unanswered — or the app itself letting go of
+    /// the session, in which case nobody is reading `ended` any more.
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let (why, outcome) = match reason {
+            DisconnectReason::ReceivedDisconnect(info) if info.message.is_empty() => {
+                ("the server closed the connection".to_string(), Ok(()))
+            }
+            DisconnectReason::ReceivedDisconnect(info) => (
+                format!("the server closed the connection: {}", info.message),
+                Ok(()),
+            ),
+            // Handed back, as the default implementation does, so whoever still
+            // holds the handle sees the same error.
+            DisconnectReason::Error(e) => (e.to_string(), Err(e)),
+        };
+        self.ended.record(why);
+        self.ctx.request_repaint();
+        outcome
+    }
 }
 
-pub async fn connect(req: ConnectRequest) -> ConnectResult {
-    match tokio::time::timeout(CONNECT_TIMEOUT, establish(req)).await {
+pub async fn connect(req: ConnectRequest, ctx: egui::Context) -> ConnectResult {
+    match tokio::time::timeout(CONNECT_TIMEOUT, establish(req, ctx)).await {
         Ok(result) => result,
         Err(_) => Err(ConnectError::Other(format!(
             "no connection after {} s",
@@ -286,16 +344,23 @@ pub async fn connect(req: ConnectRequest) -> ConnectResult {
     }
 }
 
-async fn establish(req: ConnectRequest) -> ConnectResult {
+async fn establish(req: ConnectRequest, ctx: egui::Context) -> ConnectResult {
     let key_path = expand_home(&req.key_path);
     let private_key = load_secret_key(&key_path, None).map_err(stringify)?;
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        ..Default::default()
+    });
+    let ended = SessionEnd::default();
     let rejected = Arc::new(Mutex::new(None));
     let handler = VerifyHostKey {
         host: req.host.clone(),
         port: req.port,
         files: known_hosts_files(),
         rejected: rejected.clone(),
+        ended: ended.clone(),
+        ctx,
     };
     let connected = client::connect(config, (req.host.as_str(), req.port), handler).await;
     let mut session = match connected {
@@ -370,6 +435,7 @@ async fn establish(req: ConnectRequest) -> ConnectResult {
             root,
             key_path: req.key_path,
         },
+        ended,
     ))
 }
 
@@ -518,6 +584,18 @@ mod tests {
             judge_host_key("nas", 22, &key(ED25519_B), &files),
             HostKeyVerdict::Trusted
         );
+    }
+
+    #[test]
+    fn a_session_reports_its_end_once_with_the_first_reason() {
+        let ended = SessionEnd::default();
+        let seen_by_the_app = ended.clone();
+        assert_eq!(seen_by_the_app.take(), None);
+        ended.record("keepalive timeout".to_string());
+        // What breaks next is fallout, not the cause.
+        ended.record("channel closed".to_string());
+        assert_eq!(seen_by_the_app.take().as_deref(), Some("keepalive timeout"));
+        assert_eq!(seen_by_the_app.take(), None);
     }
 
     #[test]
