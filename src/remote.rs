@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 
@@ -663,13 +663,46 @@ async fn stream_to_file(
         .open(remote_file.to_string_lossy().into_owned())
         .await
         .map_err(std::io::Error::other)?;
+    stage_into_place(&mut remote, local, overwrite, cancel, progress).await
+}
+
+/// Create the staging file for `local`, run the transfer through it, and take
+/// it away again unless it was renamed into place. Generic over the reader so
+/// the clean-up can be tested without an SFTP server.
+async fn stage_into_place<R: AsyncRead + Unpin>(
+    remote: &mut R,
+    local: &Path,
+    overwrite: bool,
+    cancel: &AtomicBool,
+    progress: &DownloadProgress,
+) -> std::io::Result<FileOutcome> {
     let part = part_path(local);
-    let mut out = tokio::fs::File::create(&part).await?;
+    let out = tokio::fs::File::create(&part).await?;
+    let outcome = copy_via_part(remote, out, &part, local, overwrite, cancel, progress).await;
+    // Anything short of the rename leaves a staging file that is a copy of
+    // nothing. The error returns used to keep it: a connection dropped 3 GB
+    // into a video left that `.part` in the user's folder for good.
+    if !matches!(outcome, Ok(FileOutcome::Written)) {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    outcome
+}
+
+/// The transfer itself: stream `remote` into the already-created staging file
+/// `out` (at `part`), then rename it over `local`. Removing the staging file
+/// when this does not end in `Written` is `stage_into_place`'s job.
+async fn copy_via_part<R: AsyncRead + Unpin>(
+    remote: &mut R,
+    mut out: tokio::fs::File,
+    part: &Path,
+    local: &Path,
+    overwrite: bool,
+    cancel: &AtomicBool,
+    progress: &DownloadProgress,
+) -> std::io::Result<FileOutcome> {
     let mut buf = vec![0u8; DOWNLOAD_CHUNK];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(out);
-            let _ = tokio::fs::remove_file(&part).await;
             return Ok(FileOutcome::Cancelled);
         }
         let read = remote.read(&mut buf).await?;
@@ -684,10 +717,9 @@ async fn stream_to_file(
     // Re-checked now the transfer is done: the destination may have appeared
     // while it ran, and the user's copy still wins.
     if !may_write(local, overwrite) {
-        let _ = tokio::fs::remove_file(&part).await;
         return Ok(FileOutcome::Skipped);
     }
-    tokio::fs::rename(&part, local).await?;
+    tokio::fs::rename(part, local).await?;
     Ok(FileOutcome::Written)
 }
 
@@ -1163,6 +1195,80 @@ mod tests {
             part_path(Path::new("/dl/trip/a b.jpg")),
             PathBuf::from("/dl/trip/a b.jpg.part")
         );
+    }
+
+    /// Hands over `head`, then fails: a connection dropped mid-transfer.
+    struct DroppedConnection {
+        head: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for DroppedConnection {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(match self.head.take() {
+                Some(bytes) => {
+                    buf.put_slice(&bytes);
+                    Ok(())
+                }
+                None => Err(std::io::Error::other("connection lost")),
+            })
+        }
+    }
+
+    fn stage<R: AsyncRead + Unpin>(
+        remote: &mut R,
+        local: &Path,
+        overwrite: bool,
+        cancelled: bool,
+    ) -> (std::io::Result<FileOutcome>, DownloadProgress) {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let cancel = AtomicBool::new(cancelled);
+        let progress = DownloadProgress::default();
+        let outcome = rt.block_on(stage_into_place(remote, local, overwrite, &cancel, &progress));
+        (outcome, progress)
+    }
+
+    #[test]
+    fn a_completed_transfer_lands_under_its_final_name_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("a.jpg");
+        let (outcome, progress) = stage(&mut &b"pixels"[..], &local, false, false);
+        assert!(matches!(outcome, Ok(FileOutcome::Written)));
+        assert_eq!(std::fs::read(&local).unwrap(), b"pixels");
+        assert!(!part_path(&local).exists());
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn a_transfer_that_fails_midway_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("video.mkv");
+        let mut remote = DroppedConnection { head: Some(b"first chunk".to_vec()) };
+        let (outcome, _) = stage(&mut remote, &local, false, false);
+        assert!(outcome.is_err());
+        // Neither a half-written target nor the `.part` it was staged in.
+        assert!(!local.exists());
+        assert!(!part_path(&local).exists());
+    }
+
+    #[test]
+    fn a_cancelled_or_skipped_transfer_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("a.jpg");
+        let (outcome, _) = stage(&mut &b"pixels"[..], &local, false, true);
+        assert!(matches!(outcome, Ok(FileOutcome::Cancelled)));
+        assert!(!local.exists());
+        assert!(!part_path(&local).exists());
+
+        // A local copy that is already there wins, and stays as it was.
+        std::fs::write(&local, b"mine").unwrap();
+        let (outcome, _) = stage(&mut &b"pixels"[..], &local, false, false);
+        assert!(matches!(outcome, Ok(FileOutcome::Skipped)));
+        assert_eq!(std::fs::read(&local).unwrap(), b"mine");
+        assert!(!part_path(&local).exists());
     }
 
     #[test]
