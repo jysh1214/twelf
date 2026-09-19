@@ -403,6 +403,26 @@ impl TwelfApp {
         self.forget_all_images(ctx);
     }
 
+    /// Give up on a scroll target its tree can no longer show. The target is
+    /// otherwise cleared only by its row rendering, and until then it forces
+    /// every folder above it open each frame — so one that pointed at a file
+    /// renamed to a non-media name, deleted, or moved out of the root left those
+    /// folders impossible to collapse until Home or Open Folder.
+    fn drop_dead_scroll_targets(&mut self) {
+        if let Some(target) = &self.local_scroll_target
+            && let Some(root) = &self.root_node
+            && !root.may_show(target)
+        {
+            self.local_scroll_target = None;
+        }
+        if let Some(target) = &self.remote_scroll_target
+            && let Some(root) = &self.remote_root
+            && !root.may_show(target)
+        {
+            self.remote_scroll_target = None;
+        }
+    }
+
     /// Whether the sidebar is showing the remote tree rather than the local one:
     /// connected, with a remote root to browse.
     fn remote_shown(&self) -> bool {
@@ -1208,6 +1228,7 @@ impl eframe::App for TwelfApp {
         }
 
         self.resolve_remote_deletes();
+        self.drop_dead_scroll_targets();
 
         let sftp = match &self.ssh {
             ssh::SshState::Connected { session, .. } => Some(session.clone()),
@@ -1654,6 +1675,47 @@ mod tests {
             Some(Path::new("/srv/pics/new.jpg"))
         );
         assert_eq!(app.local_scroll_target, None);
+    }
+
+    #[test]
+    fn a_scroll_target_the_tree_cannot_show_is_given_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.jpg"), b"").unwrap();
+        let mut app = TwelfApp::new();
+        app.root_node = Some(sidebar::TreeNode::root(dir.path().to_path_buf()));
+
+        // Root not listed yet: the row may still appear, so the target waits.
+        app.local_scroll_target = Some(dir.path().join("notes.txt"));
+        app.drop_dead_scroll_targets();
+        assert!(app.local_scroll_target.is_some());
+
+        // Listed, and the file — renamed to a non-media name — is not a row.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let root = app.root_node.as_mut().unwrap();
+                let (mut sel, mut del, mut ren, mut refresh) = (None, None, None, None);
+                let mut no_target = None;
+                sidebar::render_tree(
+                    ui,
+                    root,
+                    true,
+                    &None,
+                    &mut no_target,
+                    &mut sel,
+                    &mut del,
+                    &mut ren,
+                    &mut refresh,
+                );
+            });
+        });
+        app.drop_dead_scroll_targets();
+        assert_eq!(app.local_scroll_target, None);
+
+        // A row that is there keeps its target until it renders.
+        app.local_scroll_target = Some(dir.path().join("a.jpg"));
+        app.drop_dead_scroll_targets();
+        assert!(app.local_scroll_target.is_some());
     }
 
     #[test]

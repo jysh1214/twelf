@@ -114,6 +114,28 @@ impl TreeNode {
         }
     }
 
+    /// Whether a file row for `target` can still turn up in this subtree: it is
+    /// listed, or lies under a folder that has not been listed yet. A scroll
+    /// target this is false for would never be consumed — the file was renamed
+    /// to something the tree does not show, deleted, moved out of the root — and
+    /// would go on forcing every folder above it open, since egui ignores clicks
+    /// on a header whose open state is being set from outside.
+    pub fn may_show(&self, target: &Path) -> bool {
+        match &self.kind {
+            NodeKind::File => self.path == target,
+            NodeKind::Dir { children } => {
+                if self.path == target || !target.starts_with(&self.path) {
+                    return false;
+                }
+                match children {
+                    DirChildren::Unloaded => true,
+                    DirChildren::Error(_) => false,
+                    DirChildren::Loaded(children) => children.iter().any(|c| c.may_show(target)),
+                }
+            }
+        }
+    }
+
     /// Remove the node at `target` from this loaded subtree, returning true once
     /// found. A folder whose children aren't loaded (or a path not present) is a
     /// no-op — it isn't on screen to remove.
@@ -808,6 +830,40 @@ mod tests {
         assert!(!root.reload(Path::new("/r/zzz")));
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.reload(Path::new("/r/sub")));
+    }
+
+    #[test]
+    fn a_scroll_target_is_viable_only_while_its_row_can_still_appear() {
+        let mut root = dir_node(
+            "/r",
+            vec![
+                file_node("/r/a.jpg"),
+                dir_node("/r/sub", vec![file_node("/r/sub/b.png")]),
+                TreeNode::root(PathBuf::from("/r/later")),
+            ],
+        );
+        assert!(root.may_show(Path::new("/r/a.jpg")));
+        assert!(root.may_show(Path::new("/r/sub/b.png")));
+        // Under a folder not listed yet: opening it may well turn the row up.
+        assert!(root.may_show(Path::new("/r/later/deep/c.jpg")));
+        // Renamed to something the tree filters out, or deleted: it never will.
+        assert!(!root.may_show(Path::new("/r/a.bak")));
+        assert!(!root.may_show(Path::new("/r/sub/gone.png")));
+        // Moved out of the root altogether (a file manager's trash).
+        assert!(!root.may_show(Path::new("/elsewhere/a.jpg")));
+        // Only file rows consume a target.
+        assert!(!root.may_show(Path::new("/r/sub")));
+        // A folder that failed to list will not show it either.
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(c),
+        } = &mut root.kind
+        else {
+            unreachable!()
+        };
+        c[2].kind = NodeKind::Dir {
+            children: DirChildren::Error("denied".to_string()),
+        };
+        assert!(!root.may_show(Path::new("/r/later/deep/c.jpg")));
     }
 
     #[test]

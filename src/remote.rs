@@ -44,6 +44,26 @@ impl RemoteTreeNode {
         }
     }
 
+    /// The remote tree's `sidebar::TreeNode::may_show`: whether a file row for
+    /// `target` can still turn up. A folder still being listed counts as yes.
+    pub fn may_show(&self, target: &Path) -> bool {
+        match &self.kind {
+            RemoteNodeKind::File => self.path == target,
+            RemoteNodeKind::Dir { children } => {
+                if self.path == target || !target.starts_with(&self.path) {
+                    return false;
+                }
+                match children {
+                    RemoteDirChildren::Unloaded | RemoteDirChildren::Loading => true,
+                    RemoteDirChildren::Error(_) => false,
+                    RemoteDirChildren::Loaded(children) => {
+                        children.iter().any(|c| c.may_show(target))
+                    }
+                }
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1536,6 +1556,29 @@ mod tests {
         assert!(pos("/trip/a.jpg") < pos("/trip"));
         // …and the target directory itself is removed last.
         assert_eq!(order.last().unwrap(), Path::new("/trip"));
+    }
+
+    #[test]
+    fn a_remote_scroll_target_is_viable_only_while_its_row_can_still_appear() {
+        let mut root = rloaded(
+            "/r",
+            vec![
+                rfile("/r/a.jpg"),
+                rloaded("/r/sub", vec![rfile("/r/sub/b.png")]),
+                runloaded("/r/later"),
+            ],
+        );
+        assert!(root.may_show(Path::new("/r/a.jpg")));
+        assert!(root.may_show(Path::new("/r/sub/b.png")));
+        // Not listed yet — or listing right now: the row may still arrive.
+        assert!(root.may_show(Path::new("/r/later/c.jpg")));
+        // Renamed to a name the tree filters out, deleted, or somewhere else.
+        assert!(!root.may_show(Path::new("/r/a.bak")));
+        assert!(!root.may_show(Path::new("/elsewhere/a.jpg")));
+        assert!(!root.may_show(Path::new("/r/sub")));
+        // A listing that came back as an error settles it.
+        assert!(root.apply_listing(Path::new("/r/later"), Err("Timeout".to_string())));
+        assert!(!root.may_show(Path::new("/r/later/c.jpg")));
     }
 
     #[test]
