@@ -605,7 +605,7 @@ impl TwelfApp {
         if let Some(root) = self.root_node.as_mut() {
             root.reload(&parent);
         }
-        self.apply_rename_side_effects(&old, &new, ctx);
+        self.apply_rename_side_effects(&old, &new, false, ctx);
         self.pending_rename = None;
     }
 
@@ -638,7 +638,7 @@ impl TwelfApp {
                     root.reload(parent);
                 }
                 self.pending_rename = None;
-                self.apply_rename_side_effects(&old, &new, ctx);
+                self.apply_rename_side_effects(&old, &new, true, ctx);
             }
             Some(Err(msg)) => match self.pending_rename.as_mut() {
                 Some(pr) => pr.error = Some(msg.clone()),
@@ -656,36 +656,36 @@ impl TwelfApp {
         }
     }
 
-    /// After a successful rename `old`→`new`: follow the selection to the new
-    /// path (including a selected descendant of a renamed folder), scroll the
-    /// tree to it, and close the search so a stale row can't linger.
-    fn apply_rename_side_effects(&mut self, old: &Path, new: &Path, ctx: &egui::Context) {
-        let img = self
-            .selected_image
-            .as_deref()
-            .and_then(|s| rebase_path(s, old, new));
-        let rem = self
-            .selected_remote
-            .as_deref()
-            .and_then(|s| rebase_path(s, old, new));
+    /// After a successful rename `old`→`new` on the local tree, or on the remote
+    /// one when `is_remote`: follow that tree's selection to the new path
+    /// (including a selected descendant of a renamed folder), scroll the tree to
+    /// it, and close the search so a stale row can't linger.
+    ///
+    /// Only the renamed side's selection is followed. Both used to be rebased by
+    /// path prefix, so with the same library path on both machines
+    /// (/home/alex/pics here and on the server) renaming a remote folder rewrote
+    /// the local selection to a path that does not exist locally.
+    fn apply_rename_side_effects(
+        &mut self,
+        old: &Path,
+        new: &Path,
+        is_remote: bool,
+        ctx: &egui::Context,
+    ) {
+        let selection = if is_remote {
+            &mut self.selected_remote
+        } else {
+            &mut self.selected_image
+        };
         // Following the path alone still loses the row from view: the new name
         // may sort somewhere off-screen, a renamed folder gets a fresh
         // collapsing-state id and renders collapsed over the selection, and a
         // rename from search results closes into a tree whose ancestors were
         // never expanded. The scroll target force-opens the chain and centers
         // the row, so the selection visibly survives the rename.
-        let mut moved = false;
-        if let Some(p) = img {
-            self.scroll_target = Some(p.clone());
-            self.selected_image = Some(p);
-            moved = true;
-        }
-        if let Some(p) = rem {
-            self.scroll_target = Some(p.clone());
-            self.selected_remote = Some(p);
-            moved = true;
-        }
-        if moved {
+        if let Some(p) = selection.as_deref().and_then(|s| rebase_path(s, old, new)) {
+            *selection = Some(p.clone());
+            self.scroll_target = Some(p);
             self.forget_all_images(ctx);
         }
         self.search_active = false;
@@ -1522,7 +1522,12 @@ mod tests {
         let ctx = egui::Context::default();
         app.selected_image = Some(PathBuf::from("/r/old.jpg"));
         app.search_active = true;
-        app.apply_rename_side_effects(Path::new("/r/old.jpg"), Path::new("/r/new.jpg"), &ctx);
+        app.apply_rename_side_effects(
+            Path::new("/r/old.jpg"),
+            Path::new("/r/new.jpg"),
+            false,
+            &ctx,
+        );
         assert_eq!(app.selected_image.as_deref(), Some(Path::new("/r/new.jpg")));
         // The tree must also walk open and scroll to the followed selection —
         // the new name may sort off-screen, and a rename from search results
@@ -1539,6 +1544,7 @@ mod tests {
         app.apply_rename_side_effects(
             Path::new("/srv/pics/old.jpg"),
             Path::new("/srv/pics/new.jpg"),
+            true,
             &ctx,
         );
         assert_eq!(
@@ -1552,11 +1558,46 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_on_one_side_leaves_the_same_path_on_the_other_alone() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        // The same library path on this machine and on the server.
+        app.selected_image = Some(PathBuf::from("/home/alex/pics/d/x.jpg"));
+        app.selected_remote = Some(PathBuf::from("/home/alex/pics/d/x.jpg"));
+        let (old, new) = (
+            Path::new("/home/alex/pics/d"),
+            Path::new("/home/alex/pics/e"),
+        );
+
+        app.apply_rename_side_effects(old, new, true, &ctx);
+        assert_eq!(
+            app.selected_remote.as_deref(),
+            Some(Path::new("/home/alex/pics/e/x.jpg"))
+        );
+        // The local folder was not renamed; its file is where it was.
+        assert_eq!(
+            app.selected_image.as_deref(),
+            Some(Path::new("/home/alex/pics/d/x.jpg"))
+        );
+
+        app.selected_remote = Some(PathBuf::from("/home/alex/pics/d/x.jpg"));
+        app.apply_rename_side_effects(old, new, false, &ctx);
+        assert_eq!(
+            app.selected_image.as_deref(),
+            Some(Path::new("/home/alex/pics/e/x.jpg"))
+        );
+        assert_eq!(
+            app.selected_remote.as_deref(),
+            Some(Path::new("/home/alex/pics/d/x.jpg"))
+        );
+    }
+
+    #[test]
     fn rename_side_effects_leave_an_unrelated_selection_alone() {
         let mut app = TwelfApp::new();
         let ctx = egui::Context::default();
         app.selected_image = Some(PathBuf::from("/r/keep.jpg"));
-        app.apply_rename_side_effects(Path::new("/r/a.jpg"), Path::new("/r/b.jpg"), &ctx);
+        app.apply_rename_side_effects(Path::new("/r/a.jpg"), Path::new("/r/b.jpg"), false, &ctx);
         assert_eq!(
             app.selected_image.as_deref(),
             Some(Path::new("/r/keep.jpg"))
