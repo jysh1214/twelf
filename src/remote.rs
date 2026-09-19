@@ -1047,6 +1047,21 @@ impl RemoteRename {
     }
 }
 
+#[cfg(test)]
+impl RemoteRename {
+    /// A rename that has already come back with `result`, for tests of what the
+    /// app does with it.
+    pub(crate) fn finished(old: &str, new: &str, result: Result<(), String>) -> Self {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        Self {
+            target: PathBuf::from(old),
+            renamed: PathBuf::from(new),
+            rx,
+            result: Some(result),
+        }
+    }
+}
+
 /// Spawn a single SFTP rename of `old` to `new` on the runtime. The result (Ok or
 /// the server's error string) is sent once and read from the handle via `poll`.
 pub fn spawn_remote_rename(

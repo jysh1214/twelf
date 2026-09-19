@@ -502,15 +502,21 @@ impl TwelfApp {
             if self.remote_rename.is_some() {
                 return;
             }
-            if let ssh::SshState::Connected { session, .. } = &self.ssh {
-                self.remote_rename = Some(remote::spawn_remote_rename(
-                    session.clone(),
-                    &self.runtime,
-                    old,
-                    new,
-                    ctx,
-                ));
-            }
+            // Said in the dialog, as `execute_delete` does. Returning quietly left
+            // a Rename button that did nothing, with no clue why.
+            let ssh::SshState::Connected { session, .. } = &self.ssh else {
+                if let Some(pr) = self.pending_rename.as_mut() {
+                    pr.error = Some("Not connected".to_string());
+                }
+                return;
+            };
+            self.remote_rename = Some(remote::spawn_remote_rename(
+                session.clone(),
+                &self.runtime,
+                old,
+                new,
+                ctx,
+            ));
             // Keep `pending_rename` open; the poll loop resolves success/error.
             return;
         }
@@ -531,6 +537,53 @@ impl TwelfApp {
         }
         self.apply_rename_side_effects(&old, &new, ctx);
         self.pending_rename = None;
+    }
+
+    /// Settle an in-flight remote rename. Success refreshes the folder and
+    /// follows the selection. A failure goes into the dialog if it is still
+    /// open — and into the status bar if it is not: the dialog can be closed
+    /// while the request is in flight, and the server's refusal used to vanish
+    /// with it, leaving a rename that had silently not happened.
+    fn resolve_remote_rename(&mut self, ctx: &egui::Context) {
+        if let Some(rr) = self.remote_rename.as_mut() {
+            rr.poll();
+        }
+        if !self.remote_rename.as_ref().is_some_and(|r| r.is_finished()) {
+            if self.remote_rename.is_some() {
+                ctx.request_repaint();
+            }
+            return;
+        }
+        let rr = self.remote_rename.take().expect("just checked finished");
+        match rr.result() {
+            Some(Ok(())) => {
+                // Both paths come from the handle, captured at spawn. Reading
+                // the new name back out of `pending_rename` meant the dialog
+                // being closed mid-flight skipped the side effects entirely.
+                let old = rr.target().to_path_buf();
+                let new = rr.renamed().to_path_buf();
+                if let Some(parent) = old.parent()
+                    && let Some(root) = self.remote_root.as_mut()
+                {
+                    root.reload(parent);
+                }
+                self.pending_rename = None;
+                self.apply_rename_side_effects(&old, &new, ctx);
+            }
+            Some(Err(msg)) => match self.pending_rename.as_mut() {
+                Some(pr) => pr.error = Some(msg.clone()),
+                None => {
+                    let name = rr
+                        .target()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    self.status_message =
+                        Some(status_bar::Message::error(format!("Rename {name}: {msg}")));
+                }
+            },
+            None => {}
+        }
     }
 
     /// After a successful rename `old`→`new`: follow the selection to the new
@@ -1388,38 +1441,7 @@ impl eframe::App for TwelfApp {
                 });
             }
         }
-        // Resolve an in-flight remote rename: refresh on success, surface the
-        // server's error in the still-open dialog on failure.
-        if let Some(rr) = self.remote_rename.as_mut() {
-            rr.poll();
-        }
-        if self.remote_rename.as_ref().is_some_and(|r| r.is_finished()) {
-            let rr = self.remote_rename.take().expect("just checked finished");
-            match rr.result() {
-                Some(Ok(())) => {
-                    // Both paths come from the handle, captured at spawn. Reading
-                    // the new name back out of `pending_rename` meant the dialog
-                    // being closed mid-flight skipped the side effects entirely.
-                    let old = rr.target().to_path_buf();
-                    let new = rr.renamed().to_path_buf();
-                    if let Some(parent) = old.parent()
-                        && let Some(root) = self.remote_root.as_mut()
-                    {
-                        root.reload(parent);
-                    }
-                    self.pending_rename = None;
-                    self.apply_rename_side_effects(&old, &new, ctx);
-                }
-                Some(Err(msg)) => {
-                    if let Some(pr) = self.pending_rename.as_mut() {
-                        pr.error = Some(msg.clone());
-                    }
-                }
-                None => {}
-            }
-        } else if self.remote_rename.is_some() {
-            ctx.request_repaint();
-        }
+        self.resolve_remote_rename(ctx);
         image_panel::render(self, ctx);
     }
 }
@@ -1541,6 +1563,70 @@ mod tests {
         );
         // No scroll either — nothing moved, so the tree must not jump.
         assert_eq!(app.scroll_target, None);
+    }
+
+    fn remote_rename_dialog(path: &str, name: &str) -> PendingRename {
+        PendingRename {
+            path: PathBuf::from(path),
+            is_dir: false,
+            is_remote: true,
+            name: name.to_string(),
+            needs_focus: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_remote_rename_is_reported_wherever_it_can_be_seen() {
+        let ctx = egui::Context::default();
+        let refused = || {
+            remote::RemoteRename::finished(
+                "/photos/a.jpg",
+                "/photos/b.jpg",
+                Err("Permission denied".to_string()),
+            )
+        };
+
+        // Dialog still open: the error belongs in it.
+        let mut app = TwelfApp::new();
+        app.status_message = None;
+        app.pending_rename = Some(remote_rename_dialog("/photos/a.jpg", "b.jpg"));
+        app.remote_rename = Some(refused());
+        app.resolve_remote_rename(&ctx);
+        assert_eq!(
+            app.pending_rename
+                .as_ref()
+                .and_then(|pr| pr.error.as_deref()),
+            Some("Permission denied")
+        );
+        assert_eq!(app.status_message, None);
+
+        // Dialog closed while the request was in flight: the status bar has it.
+        app.pending_rename = None;
+        app.remote_rename = Some(refused());
+        app.resolve_remote_rename(&ctx);
+        assert_eq!(
+            app.status_message,
+            Some(status_bar::Message::error(
+                "Rename a.jpg: Permission denied"
+            ))
+        );
+        assert!(app.remote_rename.is_none());
+    }
+
+    #[test]
+    fn a_remote_rename_without_a_connection_says_so() {
+        let ctx = egui::Context::default();
+        let mut app = TwelfApp::new();
+        app.pending_rename = Some(remote_rename_dialog("/photos/a.jpg", "b.jpg"));
+        app.execute_rename(&ctx);
+        assert_eq!(
+            app.pending_rename
+                .as_ref()
+                .and_then(|pr| pr.error.as_deref()),
+            Some("Not connected")
+        );
+        assert!(app.remote_rename.is_none());
     }
 
     #[test]
