@@ -10,9 +10,28 @@ pub fn navigate(image_list: &[PathBuf], current: &Path, delta: i32) -> Option<Pa
     Some(image_list[new_idx].clone())
 }
 
+/// Where an arrow key lands when the current selection is not in `image_list`
+/// at all — a selection made in the tree, with the search results now on
+/// screen: forward enters the list at its top, backward at its bottom.
+pub fn enter(image_list: &[PathBuf], delta: i32) -> Option<PathBuf> {
+    if delta >= 0 {
+        image_list.first().cloned()
+    } else {
+        image_list.last().cloned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entering_a_list_starts_at_the_end_being_walked_from() {
+        let l = list();
+        assert_eq!(enter(&l, 1), Some(PathBuf::from("a.jpg")));
+        assert_eq!(enter(&l, -1), Some(PathBuf::from("c.jpg")));
+        assert_eq!(enter(&[], 1), None);
+    }
 
     fn list() -> Vec<PathBuf> {
         ["a.jpg", "b.jpg", "c.jpg"]

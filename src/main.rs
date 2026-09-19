@@ -278,26 +278,49 @@ impl TwelfApp {
         }
     }
 
+    /// The files the arrow keys step through, in order: what the sidebar is
+    /// showing. While search results are up that is the results, not the tree
+    /// behind them — stepping through the tree moved the selection to a
+    /// neighbour that was usually not a hit, off the list on screen, or did
+    /// nothing at all when the hit's folder had never been expanded.
+    fn navigation_list(&self) -> Vec<PathBuf> {
+        let searching = self.search_active && !self.search_query.trim().is_empty();
+        if self.remote_shown() {
+            if searching {
+                let hits = self.remote_search.as_ref().and_then(|walk| walk.hits());
+                hits.map(sidebar::hit_files).unwrap_or_default()
+            } else {
+                let root = self.remote_root.as_ref();
+                root.map(|r| r.collect_images()).unwrap_or_default()
+            }
+        } else if searching {
+            let hits = self.search_cache.as_ref().map(|(_, hits)| hits.as_slice());
+            hits.map(sidebar::hit_files).unwrap_or_default()
+        } else {
+            let root = self.root_node.as_ref();
+            root.map(|r| r.collect_images()).unwrap_or_default()
+        }
+    }
+
     fn navigate_image(&mut self, delta: i32) {
         let remote_mode = self.remote_shown();
-        let (current, list) = if remote_mode {
-            let Some(current) = self.selected_remote.clone() else {
-                return;
-            };
-            let Some(root) = self.remote_root.as_ref() else {
-                return;
-            };
-            (current, root.collect_images())
+        let searching = self.search_active && !self.search_query.trim().is_empty();
+        let current = if remote_mode {
+            self.selected_remote.clone()
         } else {
-            let Some(current) = self.selected_image.clone() else {
-                return;
-            };
-            let Some(root) = self.root_node.as_ref() else {
-                return;
-            };
-            (current, root.collect_images())
+            self.selected_image.clone()
         };
-        if let Some(new) = nav::navigate(&list, &current, delta) {
+        let list = self.navigation_list();
+        let new = match &current {
+            Some(current) => nav::navigate(&list, current, delta).or_else(|| {
+                // A selection from before the search is not among the results;
+                // the arrows then enter the list rather than doing nothing.
+                searching.then(|| nav::enter(&list, delta)).flatten()
+            }),
+            None if searching => nav::enter(&list, delta),
+            None => None,
+        };
+        if let Some(new) = new {
             if remote_mode {
                 self.remote_scroll_target = Some(new.clone());
                 self.selected_remote = Some(new);
@@ -1998,6 +2021,38 @@ mod tests {
         ));
         assert!(app.search_active);
         assert_eq!(app.status_message, None);
+    }
+
+    #[test]
+    fn arrow_keys_step_through_the_search_results_while_they_are_shown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for name in ["a-trip.jpg", "b-other.jpg", "c-trip.jpg"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        let mut app = TwelfApp::new();
+        app.root_node = Some(sidebar::TreeNode::root(root.to_path_buf()));
+        app.search_active = true;
+        app.search_query = "trip".to_string();
+        app.search_cache = Some(("trip".to_string(), sidebar::search_tree(root, "trip")));
+        // Selected in the tree before the search; not one of the results.
+        app.selected_image = Some(root.join("b-other.jpg"));
+
+        // Forward enters the results at the top…
+        app.navigate_image(1);
+        assert_eq!(app.selected_image, Some(root.join("a-trip.jpg")));
+        // …and then walks them, skipping what the search filtered out.
+        app.navigate_image(1);
+        assert_eq!(app.selected_image, Some(root.join("c-trip.jpg")));
+        assert_eq!(app.local_scroll_target, Some(root.join("c-trip.jpg")));
+        app.navigate_image(1);
+        assert_eq!(app.selected_image, Some(root.join("a-trip.jpg")));
+
+        // With the query cleared the tree is back on screen, and nothing of it
+        // is loaded yet: the arrows have nothing to step through.
+        app.search_query.clear();
+        app.navigate_image(1);
+        assert_eq!(app.selected_image, Some(root.join("a-trip.jpg")));
     }
 
     #[test]

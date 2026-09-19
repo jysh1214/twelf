@@ -75,6 +75,23 @@ impl SearchHit {
     }
 }
 
+/// Every file among `hits`, in the order the results list shows them: what the
+/// arrow keys step through while search results are on screen.
+pub fn hit_files(hits: &[SearchHit]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_hit_files(hits, &mut out);
+    out
+}
+
+fn collect_hit_files(hits: &[SearchHit], out: &mut Vec<PathBuf>) {
+    for hit in hits {
+        match &hit.kind {
+            SearchKind::File => out.push(hit.path.clone()),
+            SearchKind::Dir { children, .. } => collect_hit_files(children, out),
+        }
+    }
+}
+
 impl TreeNode {
     pub fn root(path: PathBuf) -> Self {
         let name = path.display().to_string();
@@ -830,6 +847,27 @@ mod tests {
         assert!(!root.reload(Path::new("/r/zzz")));
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.reload(Path::new("/r/sub")));
+    }
+
+    #[test]
+    fn hit_files_lists_the_results_in_display_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("b-trip")).unwrap();
+        touch(&root.join("a-trip.jpg"));
+        touch(&root.join("b-trip").join("one.jpg"));
+        touch(&root.join("b-trip").join("two.png"));
+        touch(&root.join("c-other.jpg"));
+        let files = hit_files(&search_tree(root, "trip"));
+        // The matching file, then the matching folder's contents; not c-other.
+        assert_eq!(
+            files,
+            vec![
+                root.join("a-trip.jpg"),
+                root.join("b-trip").join("one.jpg"),
+                root.join("b-trip").join("two.png"),
+            ]
+        );
     }
 
     #[test]
