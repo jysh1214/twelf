@@ -1,3 +1,4 @@
+use crate::selection::{ClickKind, RowClick, Shown};
 use crate::sidebar;
 use eframe::egui;
 use futures::future::join_all;
@@ -837,7 +838,8 @@ const REMOTE_DELETE_CONCURRENCY: usize = 8;
 /// and dropping the handle flips `cancel`; `rx` fires once when it finishes and
 /// `failed` counts entries that could not be removed.
 pub struct RemoteDelete {
-    target: PathBuf,
+    /// What is being deleted: one file or folder, or several files.
+    targets: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
     failed: Arc<AtomicUsize>,
     rx: std::sync::mpsc::Receiver<()>,
@@ -859,9 +861,27 @@ impl RemoteDelete {
         self.failed.load(Ordering::Relaxed)
     }
 
-    /// The path being deleted — for the status label and the post-delete refresh.
-    pub fn target(&self) -> &Path {
-        &self.target
+    /// What is being deleted, in a few words: the name, or how many files.
+    pub fn label(&self) -> String {
+        match self.targets.as_slice() {
+            [one] => one
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            many => format!("{} files", many.len()),
+        }
+    }
+
+    /// The folders whose listings the delete changes, each once.
+    pub fn parents(&self) -> Vec<&Path> {
+        let mut parents: Vec<&Path> = Vec::new();
+        for parent in self.targets.iter().filter_map(|t| t.parent()) {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+        parents
     }
 }
 
@@ -896,6 +916,10 @@ impl DeleteProbe {
 #[cfg(test)]
 impl RemoteDelete {
     pub(crate) fn running(target: &str) -> (Self, DeleteProbe) {
+        Self::running_many(&[target])
+    }
+
+    pub(crate) fn running_many(targets: &[&str]) -> (Self, DeleteProbe) {
         let cancel = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -906,7 +930,7 @@ impl RemoteDelete {
         };
         (
             Self {
-                target: PathBuf::from(target),
+                targets: targets.iter().map(PathBuf::from).collect(),
                 cancel,
                 failed,
                 rx,
@@ -917,13 +941,15 @@ impl RemoteDelete {
     }
 }
 
-/// Spawn a recursive delete of `target` on the runtime. A directory is enumerated
-/// in full and then removed deepest-first, so each dir is empty when removed
-/// (SFTP `remove_dir` only deletes empty dirs). Cancel by dropping the handle.
+/// Spawn a delete on the runtime: of one folder when `is_dir`, of the files in
+/// `targets` otherwise (a multiple selection is files only). A directory is
+/// enumerated in full and then removed deepest-first, so each dir is empty when
+/// removed (SFTP `remove_dir` only deletes empty dirs). Cancel by dropping the
+/// handle.
 pub fn spawn_remote_delete(
     sftp: Arc<SftpSession>,
     runtime: &tokio::runtime::Runtime,
-    target: PathBuf,
+    targets: Vec<PathBuf>,
     is_dir: bool,
     ctx: &egui::Context,
 ) -> RemoteDelete {
@@ -933,13 +959,15 @@ pub fn spawn_remote_delete(
     let cancel_task = cancel.clone();
     let failed_task = failed.clone();
     let ctx_task = ctx.clone();
-    let target_task = target.clone();
+    let targets_task = targets.clone();
     runtime.spawn(async move {
         let sem = Semaphore::new(REMOTE_DELETE_CONCURRENCY);
         if is_dir {
-            let mut entries =
-                collect_remote_paths(&sftp, &target_task, &cancel_task, &sem, 0).await;
-            entries.push((target_task.clone(), true));
+            let mut entries = Vec::new();
+            for dir in &targets_task {
+                entries.extend(collect_remote_paths(&sftp, dir, &cancel_task, &sem, 0).await);
+                entries.push((dir.clone(), true));
+            }
             for (path, path_is_dir) in deletion_order(entries) {
                 if cancel_task.load(Ordering::Relaxed) {
                     break;
@@ -954,18 +982,25 @@ pub fn spawn_remote_delete(
                     failed_task.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        } else if sftp
-            .remove_file(target_task.to_string_lossy().into_owned())
-            .await
-            .is_err()
-        {
-            failed_task.fetch_add(1, Ordering::Relaxed);
+        } else {
+            for file in &targets_task {
+                if cancel_task.load(Ordering::Relaxed) {
+                    break;
+                }
+                if sftp
+                    .remove_file(file.to_string_lossy().into_owned())
+                    .await
+                    .is_err()
+                {
+                    failed_task.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         let _ = tx.send(());
         ctx_task.request_repaint();
     });
     RemoteDelete {
-        target,
+        targets,
         cancel,
         failed,
         rx,
@@ -1131,7 +1166,8 @@ pub fn render_remote_tree(
     node: &mut RemoteTreeNode,
     is_root: bool,
     host: &str,
-    selected_remote: &mut Option<PathBuf>,
+    shown: Shown<'_>,
+    new_selection: &mut Option<RowClick>,
     scroll_target: &mut Option<PathBuf>,
     prefetch: &mut VecDeque<String>,
     download_request: &mut Option<(PathBuf, bool)>,
@@ -1146,14 +1182,16 @@ pub fn render_remote_tree(
 ) {
     match &mut node.kind {
         RemoteNodeKind::File => {
-            let is_selected = selected_remote.as_deref() == Some(node.path.as_path());
-            let response = ui.selectable_label(is_selected, &node.name);
+            let response = ui.selectable_label(shown.is_selected(&node.path), &node.name);
             if scroll_target.as_deref() == Some(node.path.as_path()) {
                 sidebar::scroll_row_into_view(ui, &response);
                 *scroll_target = None;
             }
             if response.clicked() {
-                *selected_remote = Some(node.path.clone());
+                *new_selection = Some(RowClick {
+                    path: node.path.clone(),
+                    kind: ClickKind::from_modifiers(ui.input(|i| i.modifiers)),
+                });
             }
             response.context_menu(|ui| {
                 if ui.button("Download").clicked() {
@@ -1164,7 +1202,13 @@ pub fn render_remote_tree(
                     *rename_request = Some((node.path.clone(), false));
                     ui.close();
                 }
-                if ui.button("Delete").clicked() {
+                // As in the local tree: on a row of a multiple selection,
+                // Delete is for all of it.
+                let label = match shown.target_count(&node.path) {
+                    1 => "Delete".to_string(),
+                    count => format!("Delete {count} files"),
+                };
+                if ui.button(label).clicked() {
                     *delete_request = Some((node.path.clone(), false));
                     ui.close();
                 }
@@ -1205,7 +1249,8 @@ pub fn render_remote_tree(
                             child,
                             false,
                             host,
-                            selected_remote,
+                            shown,
+                            new_selection,
                             scroll_target,
                             prefetch,
                             download_request,
@@ -1535,6 +1580,21 @@ mod tests {
         // An absent target under a loaded root.
         let mut root = rloaded("/r", vec![]);
         assert!(!root.merge_listing(Path::new("/r/gone"), vec![]));
+    }
+
+    #[test]
+    fn a_delete_of_several_files_is_labelled_and_refreshes_each_folder_once() {
+        let (one, _probe) = RemoteDelete::running("/photos/trip");
+        assert_eq!(one.label(), "trip");
+        assert_eq!(one.parents(), [Path::new("/photos")]);
+
+        let (many, _probe) =
+            RemoteDelete::running_many(&["/photos/a.jpg", "/photos/b.jpg", "/photos/sub/c.jpg"]);
+        assert_eq!(many.label(), "3 files");
+        assert_eq!(
+            many.parents(),
+            [Path::new("/photos"), Path::new("/photos/sub")]
+        );
     }
 
     #[test]

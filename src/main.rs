@@ -10,6 +10,7 @@ mod lru;
 mod menu_bar;
 mod nav;
 mod remote;
+mod selection;
 mod sftp_loader;
 mod sidebar;
 mod ssh;
@@ -78,7 +79,10 @@ const PREFETCH_IN_FLIGHT: usize = 8;
 /// modal is open; `is_remote` selects the local-fs vs SFTP backend, and `error`
 /// keeps a failed attempt on screen instead of closing the dialog on silence.
 struct PendingDelete {
-    path: PathBuf,
+    /// What to delete: one file or folder, or the files of a multiple
+    /// selection. Never empty.
+    paths: Vec<PathBuf>,
+    /// A folder, deleted with everything inside it; only ever a single one.
     is_dir: bool,
     is_remote: bool,
     error: Option<String>,
@@ -140,6 +144,11 @@ struct TwelfApp {
     favorites: Vec<config::Favorite>,
     remote_root: Option<remote::RemoteTreeNode>,
     selected_remote: Option<PathBuf>,
+    /// Files selected besides the one on display, per tree: Ctrl-click adds or
+    /// removes one, Shift-click takes a range. The whole selection of a tree is
+    /// its `selected_*` plus these.
+    marked_local: selection::Marked,
+    marked_remote: selection::Marked,
     remote_download: Option<remote::RemoteDownload>,
     remote_delete: Option<remote::RemoteDelete>,
     /// Deletes started on a session the app has since left (a reconnect, Open
@@ -258,6 +267,8 @@ impl TwelfApp {
             favorites: config.favorites,
             remote_root: None,
             selected_remote: None,
+            marked_local: selection::Marked::default(),
+            marked_remote: selection::Marked::default(),
             remote_download: None,
             remote_delete: None,
             detached_deletes: Vec::new(),
@@ -320,6 +331,23 @@ impl TwelfApp {
         }
     }
 
+    /// Apply a click on a file row to its tree's selection: plain selects the
+    /// row alone, Ctrl adds or removes it, Shift takes the run from the last row
+    /// clicked. That run follows the rows as the sidebar lists them — the tree,
+    /// or the search results when those are what is on screen.
+    fn apply_row_click(&mut self, click: &selection::RowClick, is_remote: bool) {
+        let order = self.navigation_list();
+        if is_remote {
+            self.selected_remote =
+                self.marked_remote
+                    .click(click, self.selected_remote.as_deref(), &order);
+        } else {
+            self.selected_image =
+                self.marked_local
+                    .click(click, self.selected_image.as_deref(), &order);
+        }
+    }
+
     /// The files the arrow keys step through, in order: what the sidebar is
     /// showing. While search results are up that is the results, not the tree
     /// behind them — stepping through the tree moved the selection to a
@@ -368,14 +396,39 @@ impl TwelfApp {
             None => None,
         };
         if let Some(new) = new {
+            // Stepping with the arrows is a single selection again.
             if remote_mode {
+                self.marked_remote.clear();
                 self.remote_scroll_target = Some(new.clone());
                 self.selected_remote = Some(new);
             } else {
+                self.marked_local.clear();
                 self.local_scroll_target = Some(new.clone());
                 self.selected_image = Some(new);
             }
         }
+    }
+
+    /// A Delete was chosen on `path` in the tree on screen: open the confirm
+    /// dialog for it. Chosen on a row of a multiple selection it is for all of
+    /// the selection; on any other row, or on a folder, for that one alone.
+    fn request_delete(&mut self, path: PathBuf, is_dir: bool) {
+        let is_remote = self.remote_shown();
+        let paths = if is_dir {
+            vec![path]
+        } else if is_remote {
+            self.marked_remote
+                .targets(&path, self.selected_remote.as_deref())
+        } else {
+            self.marked_local
+                .targets(&path, self.selected_image.as_deref())
+        };
+        self.pending_delete = Some(PendingDelete {
+            paths,
+            is_dir,
+            is_remote,
+            error: None,
+        });
     }
 
     /// Carry out a confirmed delete. Local deletes run here synchronously; a
@@ -387,7 +440,7 @@ impl TwelfApp {
         let Some(pd) = self.pending_delete.as_ref() else {
             return;
         };
-        let path = pd.path.clone();
+        let paths = pd.paths.clone();
         let is_dir = pd.is_dir;
         let is_remote = pd.is_remote;
 
@@ -411,28 +464,53 @@ impl TwelfApp {
             self.remote_delete = Some(remote::spawn_remote_delete(
                 session,
                 &self.runtime,
-                path.clone(),
+                paths.clone(),
                 is_dir,
                 ctx,
             ));
             self.pending_delete = None;
-            self.clear_after_delete(&path, true, ctx);
+            for path in &paths {
+                self.clear_after_delete(path, true, ctx);
+            }
             return;
         }
-        let result = if is_dir {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if let Err(e) = result {
-            self.fail_delete(&e.to_string());
-            return;
+        // Each on its own: one file that cannot be removed should not keep the
+        // rest, and what did go has to leave the tree and the selection either
+        // way. The dialog stays up over whatever is left, with the reason.
+        let mut left = Vec::new();
+        let mut first_error = None;
+        for path in paths {
+            let result = if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(root) = self.root_node.as_mut() {
+                        root.remove_path(&path);
+                    }
+                    self.clear_after_delete(&path, false, ctx);
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| e.to_string());
+                    left.push(path);
+                }
+            }
         }
-        if let Some(root) = self.root_node.as_mut() {
-            root.remove_path(&path);
+        match first_error {
+            None => self.pending_delete = None,
+            Some(error) => {
+                let message = match left.len() {
+                    1 => error,
+                    count => format!("{count} files could not be deleted: {error}"),
+                };
+                if let Some(pd) = self.pending_delete.as_mut() {
+                    pd.paths = left;
+                }
+                self.fail_delete(&message);
+            }
         }
-        self.pending_delete = None;
-        self.clear_after_delete(&path, false, ctx);
     }
 
     /// Drop everything that belongs to the remote session the app is on, so
@@ -449,6 +527,7 @@ impl TwelfApp {
     fn leave_remote_session(&mut self, ctx: &egui::Context) {
         self.remote_root = None;
         self.selected_remote = None;
+        self.marked_remote.clear();
         self.remote_scroll_target = None;
         self.search_active = false;
         self.search_query.clear();
@@ -655,10 +734,10 @@ impl TwelfApp {
         if self.remote_delete.as_ref().is_some_and(|d| d.is_finished())
             && let Some(del) = self.remote_delete.take()
         {
-            if let Some(parent) = del.target().parent()
-                && let Some(root) = self.remote_root.as_mut()
-            {
-                root.reload(parent);
+            if let Some(root) = self.remote_root.as_mut() {
+                for parent in del.parents() {
+                    root.reload(parent);
+                }
             }
             finished.push(del);
         }
@@ -673,13 +752,9 @@ impl TwelfApp {
         for del in finished {
             let failed = del.failed();
             if failed > 0 {
-                let name = del
-                    .target()
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
                 self.status_message = Some(status_bar::Message::error(format!(
-                    "Delete {name}: {failed} item(s) could not be removed"
+                    "Delete {}: {failed} item(s) could not be removed",
+                    del.label()
                 )));
             }
         }
@@ -758,11 +833,12 @@ impl TwelfApp {
     /// server deselected the local file of the same path — still there, and
     /// nothing to do with it. `apply_rename_side_effects` had the same flaw.
     fn clear_after_delete(&mut self, deleted: &Path, is_remote: bool, ctx: &egui::Context) {
-        let selection = if is_remote {
-            &mut self.selected_remote
+        let (selection, marked) = if is_remote {
+            (&mut self.selected_remote, &mut self.marked_remote)
         } else {
-            &mut self.selected_image
+            (&mut self.selected_image, &mut self.marked_local)
         };
+        marked.remove_where(|p| p.starts_with(deleted));
         if selection.as_deref().is_some_and(|p| p.starts_with(deleted)) {
             *selection = None;
             self.forget_all_images(ctx);
@@ -886,6 +962,7 @@ impl TwelfApp {
     /// row in the tree to go with it — and a Rename or Delete dialog about it is
     /// closed, since there is nothing left for it to act on.
     fn local_files_gone(&mut self, gone: impl Fn(&Path) -> bool, ctx: &egui::Context) {
+        self.marked_local.remove_where(&gone);
         if let Some(path) = self.selected_image.clone()
             && gone(&path)
         {
@@ -893,12 +970,13 @@ impl TwelfApp {
             self.selected_image = None;
             self.local_scroll_target = None;
         }
-        if self
-            .pending_delete
-            .as_ref()
-            .is_some_and(|p| !p.is_remote && gone(&p.path))
+        if let Some(pending) = self.pending_delete.as_mut()
+            && !pending.is_remote
         {
-            self.pending_delete = None;
+            pending.paths.retain(|path| !gone(path));
+            if pending.paths.is_empty() {
+                self.pending_delete = None;
+            }
         }
         if self
             .pending_rename
@@ -922,10 +1000,13 @@ impl TwelfApp {
     ) {
         if let Some(pending) = self.pending_delete.as_mut()
             && pending.is_remote == is_remote
-            && let Some(now) = moved_to(&pending.path)
         {
-            pending.path = now;
-            pending.error = None;
+            for path in &mut pending.paths {
+                if let Some(now) = moved_to(path) {
+                    *path = now;
+                    pending.error = None;
+                }
+            }
         }
         if let Some(pending) = self.pending_rename.as_mut()
             && pending.is_remote == is_remote
@@ -953,6 +1034,12 @@ impl TwelfApp {
         ctx: &egui::Context,
     ) {
         self.rebase_pending_dialogs(is_remote, |path| rebase_path(path, old, new));
+        let marked = if is_remote {
+            &mut self.marked_remote
+        } else {
+            &mut self.marked_local
+        };
+        marked.rebase(|path| rebase_path(path, old, new));
         let (selection, scroll_target) = if is_remote {
             (&mut self.selected_remote, &mut self.remote_scroll_target)
         } else {
@@ -1122,6 +1209,11 @@ impl eframe::App for TwelfApp {
                     || (changes.removed.iter().any(|r| path.starts_with(r)) && !path.exists())
             };
             self.local_files_gone(gone, ctx);
+            self.marked_local
+                .rebase(|path| match follow_renames(Some(path), &changes.renames) {
+                    Some(Followed::Moved(now)) => Some(now),
+                    _ => None,
+                });
             self.rebase_pending_dialogs(false, |path| {
                 match follow_renames(Some(path), &changes.renames) {
                     Some(Followed::Moved(now)) => Some(now),
@@ -1408,11 +1500,12 @@ impl eframe::App for TwelfApp {
         let mut confirm_delete = false;
         let mut cancel_delete = false;
         if let Some(pd) = &self.pending_delete {
-            let name = pd
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| pd.path.display().to_string());
+            let display_name = |path: &PathBuf| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            };
+            let name = pd.paths.first().map(display_name).unwrap_or_default();
             let mut open = true;
             egui::Window::new("Delete")
                 .open(&mut open)
@@ -1423,8 +1516,25 @@ impl eframe::App for TwelfApp {
                         ui.label(format!(
                             "Delete folder \"{name}\" and everything inside it?"
                         ));
-                    } else {
+                    } else if pd.paths.len() == 1 {
                         ui.label(format!("Delete \"{name}\"?"));
+                    } else {
+                        // Enough names to recognise the selection by, not a list
+                        // that pushes the buttons off the screen.
+                        const NAMED: usize = 8;
+                        ui.label(format!("Delete these {} files?", pd.paths.len()));
+                        for path in pd.paths.iter().take(NAMED) {
+                            ui.label(egui::RichText::new(display_name(path)).weak());
+                        }
+                        if pd.paths.len() > NAMED {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "…and {} more",
+                                    pd.paths.len() - NAMED
+                                ))
+                                .weak(),
+                            );
+                        }
                     }
                     ui.label(egui::RichText::new("This cannot be undone.").italics());
                     if let Some(err) = &pd.error {
@@ -1530,6 +1640,11 @@ impl eframe::App for TwelfApp {
         // Set by a Delete context-menu action in either tree (path, is_dir);
         // consumed after the panel into `pending_delete`.
         let mut delete_request: Option<(PathBuf, bool)> = None;
+        // A file row clicked in the local or the remote sidebar this frame, with
+        // how (plain, Ctrl, Shift); applied after the panel, where the list the
+        // rows were shown in can be asked for.
+        let mut clicked_local: Option<selection::RowClick> = None;
+        let mut clicked_remote: Option<selection::RowClick> = None;
         // Set by a Rename context-menu action in either tree (path, is_dir);
         // consumed after the panel into `pending_rename`.
         let mut rename_request: Option<(PathBuf, bool)> = None;
@@ -1561,14 +1676,9 @@ impl eframe::App for TwelfApp {
                     }
                 };
                 if let (Some(sftp), Some(remote_root)) = (sftp, self.remote_root.as_mut()) {
-                    let mut new_remote_selection: Option<PathBuf> = None;
                     if let Some(del) = self.remote_delete.as_ref() {
-                        let name = del
-                            .target()
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        ui.label(egui::RichText::new(format!("Deleting {name}…")).italics());
+                        let what = del.label();
+                        ui.label(egui::RichText::new(format!("Deleting {what}…")).italics());
                         ctx.request_repaint();
                     }
                     if self.search_active {
@@ -1617,7 +1727,11 @@ impl eframe::App for TwelfApp {
                                 remote_root,
                                 true,
                                 &remote_host,
-                                &mut self.selected_remote,
+                                selection::Shown {
+                                    primary: self.selected_remote.as_deref(),
+                                    marked: &self.marked_remote,
+                                },
+                                &mut clicked_remote,
                                 &mut self.remote_scroll_target,
                                 &mut self.image_prefetch,
                                 &mut download_request,
@@ -1645,9 +1759,12 @@ impl eframe::App for TwelfApp {
                                 sidebar::render_search_results(
                                     ui,
                                     hits,
-                                    &self.selected_remote,
+                                    selection::Shown {
+                                        primary: self.selected_remote.as_deref(),
+                                        marked: &self.marked_remote,
+                                    },
                                     &mut self.remote_scroll_target,
-                                    &mut new_remote_selection,
+                                    &mut clicked_remote,
                                     Some(&mut download_request),
                                     &mut delete_request,
                                     &mut rename_request,
@@ -1658,13 +1775,7 @@ impl eframe::App for TwelfApp {
                             ctx.request_repaint();
                         }
                     });
-                    if let Some(path) = new_remote_selection {
-                        self.selected_remote = Some(path);
-                    }
                 } else {
-                    // Captures the clicked image path — deferred to dodge the borrow
-                    // on `&mut self.root_node` taken by the renderers.
-                    let mut new_selection: Option<PathBuf> = None;
                     if self.search_active {
                         sidebar::search_bar(ui, &mut self.search_query, open_search);
                     }
@@ -1723,9 +1834,12 @@ impl eframe::App for TwelfApp {
                                 sidebar::render_search_results(
                                     ui,
                                     hits,
-                                    &self.selected_image,
+                                    selection::Shown {
+                                        primary: self.selected_image.as_deref(),
+                                        marked: &self.marked_local,
+                                    },
                                     &mut self.local_scroll_target,
-                                    &mut new_selection,
+                                    &mut clicked_local,
                                     None,
                                     &mut delete_request,
                                     &mut rename_request,
@@ -1736,20 +1850,26 @@ impl eframe::App for TwelfApp {
                                 ui,
                                 root_node,
                                 true,
-                                &self.selected_image,
+                                selection::Shown {
+                                    primary: self.selected_image.as_deref(),
+                                    marked: &self.marked_local,
+                                },
                                 &mut self.local_scroll_target,
-                                &mut new_selection,
+                                &mut clicked_local,
                                 &mut delete_request,
                                 &mut rename_request,
                                 &mut refresh_request,
                             );
                         }
                     });
-                    if let Some(path) = new_selection {
-                        self.selected_image = Some(path);
-                    }
                 }
             });
+        if let Some(click) = clicked_local {
+            self.apply_row_click(&click, false);
+        }
+        if let Some(click) = clicked_remote {
+            self.apply_row_click(&click, true);
+        }
         // A Download action was chosen: pick a local destination and spawn the
         // copy — a recursive walk into a picked folder for a directory, a save
         // dialog prefilled with the file's name for a single file. The picker
@@ -1832,13 +1952,7 @@ impl eframe::App for TwelfApp {
         }
         // A Delete action was chosen this frame: park it for the confirm modal.
         if let Some((path, is_dir)) = delete_request {
-            let is_remote = self.remote_shown();
-            self.pending_delete = Some(PendingDelete {
-                path,
-                is_dir,
-                is_remote,
-                error: None,
-            });
+            self.request_delete(path, is_dir);
         }
         // A Rename action was chosen this frame: open the name-entry dialog.
         // Refused while one is still in flight — the second dialog could not be
@@ -2021,7 +2135,7 @@ mod tests {
         app.selected_image = Some(PathBuf::from("/r/d/a.jpg"));
         app.local_scroll_target = Some(PathBuf::from("/r/d/a.jpg"));
         app.pending_delete = Some(PendingDelete {
-            path: PathBuf::from("/r/d/a.jpg"),
+            paths: vec![PathBuf::from("/r/d/a.jpg")],
             is_dir: false,
             is_remote: false,
             error: None,
@@ -2120,11 +2234,15 @@ mod tests {
                 let root = app.root_node.as_mut().unwrap();
                 let (mut sel, mut del, mut ren, mut refresh) = (None, None, None, None);
                 let mut no_target = None;
+                let nothing = selection::Marked::default();
                 sidebar::render_tree(
                     ui,
                     root,
                     true,
-                    &None,
+                    selection::Shown {
+                        primary: None,
+                        marked: &nothing,
+                    },
                     &mut no_target,
                     &mut sel,
                     &mut del,
@@ -2146,7 +2264,7 @@ mod tests {
     fn open_dialogs_follow_their_target_when_it_is_renamed() {
         let mut app = TwelfApp::for_test();
         app.pending_delete = Some(PendingDelete {
-            path: PathBuf::from("/r/d/a.jpg"),
+            paths: vec![PathBuf::from("/r/d/a.jpg")],
             is_dir: false,
             is_remote: false,
             error: Some("No such file or directory".to_string()),
@@ -2167,7 +2285,7 @@ mod tests {
             _ => None,
         });
         let delete = app.pending_delete.as_ref().unwrap();
-        assert_eq!(delete.path, PathBuf::from("/r/e/a.jpg"));
+        assert_eq!(delete.paths, [PathBuf::from("/r/e/a.jpg")]);
         // The earlier failure was about the old path; it no longer applies.
         assert_eq!(delete.error, None);
         let rename = app.pending_rename.as_ref().unwrap();
@@ -2180,8 +2298,8 @@ mod tests {
             rebase_path(path, Path::new("/r/e"), Path::new("/r/zzz"))
         });
         assert_eq!(
-            app.pending_delete.as_ref().unwrap().path,
-            PathBuf::from("/r/e/a.jpg")
+            app.pending_delete.as_ref().unwrap().paths,
+            [PathBuf::from("/r/e/a.jpg")]
         );
     }
 
@@ -2190,15 +2308,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = TwelfApp::for_test();
         app.pending_delete = Some(PendingDelete {
-            path: PathBuf::from("/r/d/a.jpg"),
+            paths: vec![PathBuf::from("/r/d/a.jpg")],
             is_dir: false,
             is_remote: false,
             error: None,
         });
         app.apply_rename_side_effects(Path::new("/r/d"), Path::new("/r/e"), false, &ctx);
         assert_eq!(
-            app.pending_delete.as_ref().unwrap().path,
-            PathBuf::from("/r/e/a.jpg")
+            app.pending_delete.as_ref().unwrap().paths,
+            [PathBuf::from("/r/e/a.jpg")]
         );
     }
 
@@ -2414,6 +2532,124 @@ mod tests {
         app.last_displayed = remote_uri.clone();
         app.local_files_rewritten(std::slice::from_ref(&shown), &ctx);
         assert_eq!(app.last_displayed, remote_uri);
+    }
+
+    #[test]
+    fn shift_and_ctrl_clicks_build_a_selection_along_the_listed_rows() {
+        use selection::{ClickKind, RowClick};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "notes.txt"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        let mut app = TwelfApp::for_test();
+        app.root_node = Some(sidebar::TreeNode::root(root.to_path_buf()));
+        // List the root, as opening the folder does.
+        app.root_node.as_mut().unwrap().list_for_test();
+        let click = |name: &str, kind| RowClick {
+            path: root.join(name),
+            kind,
+        };
+
+        app.apply_row_click(&click("a.jpg", ClickKind::Plain), false);
+        app.apply_row_click(&click("c.jpg", ClickKind::Range), false);
+        // Shown: the row clicked last. Selected: the run, which skips nothing
+        // listed and includes nothing that is not (notes.txt is no row at all).
+        assert_eq!(app.selected_image, Some(root.join("c.jpg")));
+        for name in ["a.jpg", "b.jpg"] {
+            assert!(app.marked_local.contains(&root.join(name)), "{name}");
+        }
+        assert!(!app.marked_local.contains(&root.join("d.jpg")));
+
+        app.apply_row_click(&click("d.jpg", ClickKind::Toggle), false);
+        assert_eq!(app.selected_image, Some(root.join("d.jpg")));
+        assert!(app.marked_local.contains(&root.join("c.jpg")));
+
+        // The arrow keys go back to one row; the other tree was never involved.
+        app.navigate_image(-1);
+        assert_eq!(app.selected_image, Some(root.join("c.jpg")));
+        assert!(!app.marked_local.contains(&root.join("a.jpg")));
+        assert_eq!(app.selected_remote, None);
+    }
+
+    /// A test app over a temp folder holding `names`, its root listed.
+    fn app_over(names: &[&str]) -> (TwelfApp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in names {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let mut app = TwelfApp::for_test();
+        let mut root = sidebar::TreeNode::root(dir.path().to_path_buf());
+        root.list_for_test();
+        app.root_node = Some(root);
+        (app, dir)
+    }
+
+    #[test]
+    fn delete_on_a_selected_row_removes_the_whole_selection() {
+        use selection::{ClickKind, RowClick};
+        let ctx = egui::Context::default();
+        let (mut app, dir) = app_over(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let at = |name: &str| dir.path().join(name);
+        let click = |name: &str, kind| RowClick {
+            path: at(name),
+            kind,
+        };
+        app.apply_row_click(&click("a.jpg", ClickKind::Plain), false);
+        app.apply_row_click(&click("c.jpg", ClickKind::Range), false);
+
+        // Right-click → Delete on one of the three selected rows.
+        app.request_delete(at("b.jpg"), false);
+        let pending = app.pending_delete.as_ref().expect("dialog");
+        assert_eq!(pending.paths, [at("a.jpg"), at("b.jpg"), at("c.jpg")]);
+
+        app.execute_delete(&ctx);
+        assert!(app.pending_delete.is_none());
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            assert!(!at(name).exists(), "{name} should be gone");
+        }
+        assert!(at("d.jpg").exists());
+        // Out of the tree and out of the selection as well.
+        assert_eq!(app.navigation_list(), [at("d.jpg")]);
+        assert_eq!(app.selected_image, None);
+        assert!(!app.marked_local.contains(&at("a.jpg")));
+    }
+
+    #[test]
+    fn delete_on_a_row_outside_the_selection_is_for_that_row_only() {
+        use selection::{ClickKind, RowClick};
+        let (mut app, dir) = app_over(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let at = |name: &str| dir.path().join(name);
+        let click = |name: &str, kind| RowClick {
+            path: at(name),
+            kind,
+        };
+        app.apply_row_click(&click("a.jpg", ClickKind::Plain), false);
+        app.apply_row_click(&click("b.jpg", ClickKind::Toggle), false);
+        app.request_delete(at("d.jpg"), false);
+        assert_eq!(app.pending_delete.as_ref().unwrap().paths, [at("d.jpg")]);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_deleted_stays_in_the_dialog_with_the_reason() {
+        let ctx = egui::Context::default();
+        let (mut app, dir) = app_over(&["a.jpg", "b.jpg"]);
+        let at = |name: &str| dir.path().join(name);
+        // b.jpg vanishes between the dialog opening and Delete being pressed.
+        app.pending_delete = Some(PendingDelete {
+            paths: vec![at("a.jpg"), at("b.jpg")],
+            is_dir: false,
+            is_remote: false,
+            error: None,
+        });
+        std::fs::remove_file(at("b.jpg")).unwrap();
+
+        app.execute_delete(&ctx);
+        // What could be deleted was; the rest is still there to see.
+        assert!(!at("a.jpg").exists());
+        let pending = app.pending_delete.as_ref().expect("dialog stays up");
+        assert_eq!(pending.paths, [at("b.jpg")]);
+        assert!(pending.error.is_some());
     }
 
     #[test]

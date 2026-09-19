@@ -1,3 +1,4 @@
+use crate::selection::{ClickKind, RowClick, Shown};
 use eframe::egui;
 use std::collections::HashSet;
 use std::fs;
@@ -273,6 +274,16 @@ impl TreeNode {
         }
     }
 
+    /// List this directory the way rendering it open would, for tests that need
+    /// a loaded tree without a UI pass.
+    #[cfg(test)]
+    pub fn list_for_test(&mut self) {
+        let path = self.path.clone();
+        if let NodeKind::Dir { children } = &mut self.kind {
+            *children = list_children(&path);
+        }
+    }
+
     fn is_dir(&self) -> bool {
         matches!(self.kind, NodeKind::Dir { .. })
     }
@@ -452,9 +463,9 @@ pub fn render_tree(
     ui: &mut egui::Ui,
     node: &mut TreeNode,
     is_root: bool,
-    selected_image: &Option<PathBuf>,
+    shown: Shown<'_>,
     scroll_target: &mut Option<PathBuf>,
-    new_selection: &mut Option<PathBuf>,
+    new_selection: &mut Option<RowClick>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
     refresh_request: &mut Option<PathBuf>,
@@ -466,7 +477,7 @@ pub fn render_tree(
                 ui,
                 &node.path,
                 &node.name,
-                selected_image,
+                shown,
                 scroll_target,
                 new_selection,
                 None,
@@ -499,7 +510,7 @@ pub fn render_tree(
                                 ui,
                                 child,
                                 false,
-                                selected_image,
+                                shown,
                                 scroll_target,
                                 new_selection,
                                 delete_request,
@@ -561,21 +572,25 @@ fn render_file_row(
     ui: &mut egui::Ui,
     path: &Path,
     name: &str,
-    selected_image: &Option<PathBuf>,
+    shown: Shown<'_>,
     scroll_target: &mut Option<PathBuf>,
-    new_selection: &mut Option<PathBuf>,
+    new_selection: &mut Option<RowClick>,
     download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
 ) {
-    let is_selected = selected_image.as_deref() == Some(path);
-    let response = ui.selectable_label(is_selected, name);
+    let response = ui.selectable_label(shown.is_selected(path), name);
     if scroll_target.as_deref() == Some(path) {
         scroll_row_into_view(ui, &response);
         *scroll_target = None;
     }
     if response.clicked() {
-        *new_selection = Some(path.to_path_buf());
+        // Shift and Ctrl make it a range or a toggle; the app works out what
+        // that selects, since a range runs along the rows as they are listed.
+        *new_selection = Some(RowClick {
+            path: path.to_path_buf(),
+            kind: ClickKind::from_modifiers(ui.input(|i| i.modifiers)),
+        });
     }
     response.context_menu(|ui| {
         if let Some(download_request) = download_request
@@ -588,7 +603,13 @@ fn render_file_row(
             *rename_request = Some((path.to_path_buf(), false));
             ui.close();
         }
-        if ui.button("Delete").clicked() {
+        // On a row that is part of a multiple selection, Delete is for all of
+        // it; the app expands the request the same way.
+        let label = match shown.target_count(path) {
+            1 => "Delete".to_string(),
+            count => format!("Delete {count} files"),
+        };
+        if ui.button(label).clicked() {
             *delete_request = Some((path.to_path_buf(), false));
             ui.close();
         }
@@ -606,9 +627,9 @@ fn render_file_row(
 pub fn render_search_results(
     ui: &mut egui::Ui,
     hits: &[SearchHit],
-    selected_image: &Option<PathBuf>,
+    shown: Shown<'_>,
     scroll_target: &mut Option<PathBuf>,
-    new_selection: &mut Option<PathBuf>,
+    new_selection: &mut Option<RowClick>,
     download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
@@ -617,7 +638,7 @@ pub fn render_search_results(
         ui,
         hits,
         false,
-        selected_image,
+        shown,
         scroll_target,
         new_selection,
         download_request,
@@ -633,9 +654,9 @@ fn render_search_hits(
     ui: &mut egui::Ui,
     hits: &[SearchHit],
     in_matched: bool,
-    selected_image: &Option<PathBuf>,
+    shown: Shown<'_>,
     scroll_target: &mut Option<PathBuf>,
-    new_selection: &mut Option<PathBuf>,
+    new_selection: &mut Option<RowClick>,
     mut download_request: Option<&mut Option<(PathBuf, bool)>>,
     delete_request: &mut Option<(PathBuf, bool)>,
     rename_request: &mut Option<(PathBuf, bool)>,
@@ -647,7 +668,7 @@ fn render_search_hits(
                     ui,
                     &hit.path,
                     &hit.name,
-                    selected_image,
+                    shown,
                     scroll_target,
                     new_selection,
                     download_request.as_deref_mut(),
@@ -668,7 +689,7 @@ fn render_search_hits(
                         ui,
                         children,
                         in_matched || *matched,
-                        selected_image,
+                        shown,
                         scroll_target,
                         new_selection,
                         download_request.as_deref_mut(),

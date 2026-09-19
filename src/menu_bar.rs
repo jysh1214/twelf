@@ -22,6 +22,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                         };
                         app.root_node = Some(sidebar::TreeNode::root(path));
                         app.selected_image = None;
+                        app.marked_local.clear();
                         app.local_scroll_target = None;
                         // Browsing locally now. Without this the menu bar went on
                         // saying "Connected" over a local tree, with the session
