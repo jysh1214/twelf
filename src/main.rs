@@ -1107,7 +1107,7 @@ impl eframe::App for TwelfApp {
                 }
                 for (i, favorite) in self.favorites.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button(fonts::DISMISS).clicked() {
                             remove_favorite = Some(i);
                         }
                         // Full width so the whole row is the target, and long

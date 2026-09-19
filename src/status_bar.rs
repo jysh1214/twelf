@@ -76,7 +76,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                 // Dismissable so a failure notice can't be missed, and can't
                 // linger past the point the user has taken it in.
                 if let Some(msg) = app.status_message.as_ref() {
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button(crate::fonts::DISMISS).clicked() {
                         dismiss_message = true;
                     }
                     let mut text = egui::RichText::new(&msg.text);
