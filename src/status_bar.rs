@@ -83,7 +83,9 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
                     if let Some(color) = msg.color(ui.visuals()) {
                         text = text.color(color);
                     }
-                    ui.add(egui::Label::new(text).truncate());
+                    // The bar has one line and truncates; the rest is a hover away.
+                    ui.add(egui::Label::new(text).truncate())
+                        .on_hover_text(&msg.text);
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(egui::Label::new(path_text.unwrap_or_default()).truncate());

@@ -77,6 +77,8 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
     // Dropping the attempt abandons it; whatever session was current still is.
     if cancel_connect {
         app.connecting = None;
+        // The label was drawn before the attempt was dropped.
+        ctx.request_repaint();
     }
 }
 

@@ -189,9 +189,11 @@ impl TwelfApp {
         // hold, which is how a save could lose the favorites.
         let config::Loaded { config, problem } = config::load();
         let status_message = problem.as_ref().map(|problem| {
+            // What happens to the file comes first: the status bar truncates,
+            // and the parser's wording is the part that can be long.
             status_bar::Message::error(format!(
-                "config.toml was not loaded ({problem}); using defaults. \
-                 It will be kept as config.toml.bad"
+                "config.toml was not loaded and will be kept as config.toml.bad; \
+                 using defaults ({problem})"
             ))
         });
         Self {
@@ -511,6 +513,10 @@ impl TwelfApp {
                     }
                 });
             });
+        if trust || cancel || !open {
+            // The prompt goes, or gains an error, after it was drawn.
+            ctx.request_repaint();
+        }
         if trust && let Some(mut pending) = self.pending_host_key.take() {
             let request = &pending.request;
             match ssh::trust_host_key(&request.host, request.port, &pending.key) {
@@ -1127,6 +1133,15 @@ impl eframe::App for TwelfApp {
                 }
             });
         self.ssh_dialog.open = dialog_open;
+        // Everything below changes what the dialog should show, after this
+        // frame's dialog has already been laid out. Nothing else asks for another
+        // frame, so the port error (or the loaded favorite) stayed unpainted
+        // until the next input event — forever, for a click made with the
+        // keyboard and the mouse at rest.
+        if connect_clicked || save_favorite || load_favorite.is_some() || remove_favorite.is_some()
+        {
+            ctx.request_repaint();
+        }
         if let Some(i) = remove_favorite
             && i < self.favorites.len()
         {
