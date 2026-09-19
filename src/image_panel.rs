@@ -53,7 +53,7 @@ pub fn render(app: &mut TwelfApp, ctx: &egui::Context) {
         }
     });
     if zoom_scroll != 0.0 {
-        app.zoom = (app.zoom * (1.0 + zoom_scroll * 0.01)).clamp(0.1, 10.0);
+        app.zoom = zoom_after_scroll(app.zoom, zoom_scroll);
     }
     let recenter_image =
         (app.zoom - prev_zoom).abs() > f32::EPSILON || app.last_displayed != prev_displayed;
@@ -178,6 +178,15 @@ fn draw_seek_bar(ui: &mut egui::Ui, player: &mut crate::video::VideoPlayer, dura
     }
 }
 
+/// The zoom after Ctrl-scrolling by `delta` points. Exponential in the delta, so
+/// equal scrolls up and down cancel out and no delta can reach zero. The linear
+/// `1 + delta * 0.01` it replaces went to zero or below on a fast wheel (three
+/// notches in one frame is -120) and slammed the zoom to its minimum, and a
+/// notch up then down multiplied out to 1.4 * 0.6 = 0.84, never back to 1.
+fn zoom_after_scroll(zoom: f32, delta: f32) -> f32 {
+    (zoom * (delta * 0.01).exp()).clamp(0.1, 10.0)
+}
+
 /// Record `uri` as the newest displayed image and forget whatever drops out of
 /// the window.
 fn retain_displayed(app: &mut TwelfApp, uri: &str, ctx: &egui::Context) {
@@ -296,6 +305,20 @@ fn open_video(app: &TwelfApp) -> Option<crate::video::VideoPlayer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_steps_are_symmetric_and_never_collapse() {
+        // A notch up and a notch down land back where they started.
+        let up = zoom_after_scroll(1.0, 40.0);
+        assert!(up > 1.0);
+        assert!((zoom_after_scroll(up, -40.0) - 1.0).abs() < 1e-6);
+        // Several notches in one frame zoom out further, not to the floor.
+        let out = zoom_after_scroll(1.0, -120.0);
+        assert!(out > 0.1 && out < zoom_after_scroll(1.0, -40.0));
+        // The limits still hold.
+        assert_eq!(zoom_after_scroll(9.0, 400.0), 10.0);
+        assert_eq!(zoom_after_scroll(0.2, -400.0), 0.1);
+    }
 
     fn fill_window() -> VecDeque<String> {
         let mut displayed = VecDeque::new();
