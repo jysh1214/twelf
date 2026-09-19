@@ -782,7 +782,7 @@ impl TwelfApp {
             return;
         }
         if let Some(root) = self.root_node.as_mut() {
-            root.reload(&parent);
+            root.relist(&parent);
         }
         self.apply_rename_side_effects(&old, &new, false, ctx);
         self.pending_rename = None;
@@ -956,7 +956,7 @@ impl eframe::App for TwelfApp {
             if !changes.dirs.is_empty() {
                 if let Some(root) = self.root_node.as_mut() {
                     for dir in &changes.dirs {
-                        root.reload(dir);
+                        root.relist(dir);
                     }
                 }
                 // Only flag the search stale; re-walking here would run the
@@ -1632,8 +1632,10 @@ impl eframe::App for TwelfApp {
             self.add_favorite(favorite);
         }
         // A Refresh action was chosen: drop the folder's cached listing so the
-        // next render re-lists it (expanded subfolders re-list lazily). Only one
-        // tree renders per frame, so the request came from the one on screen.
+        // next render re-lists it (expanded subfolders re-list lazily). Unlike
+        // the merge a watcher event gets, this forgets everything below too:
+        // Refresh is for when the tree cannot be trusted to have kept up. Only
+        // one tree renders per frame, so the request came from the one on screen.
         if let Some(path) = refresh_request {
             if self.remote_shown() {
                 if let Some(root) = self.remote_root.as_mut() {

@@ -176,8 +176,9 @@ impl TreeNode {
     }
 
     /// Mark the directory at `target` not-yet-loaded so the next render re-lists
-    /// it — used to refresh a folder after one of its entries is renamed. A no-op
-    /// for an absent or not-yet-loaded path.
+    /// it, forgetting everything loaded below as well — the Refresh action, for
+    /// when the tree cannot be trusted to have kept up. Changes the app knows
+    /// about go through `relist`. A no-op for an absent or not-yet-loaded path.
     pub fn reload(&mut self, target: &Path) -> bool {
         if self.path == target {
             if let NodeKind::Dir { children } = &mut self.kind {
@@ -203,6 +204,61 @@ impl TreeNode {
         false
     }
 
+    /// Re-read the directory at `target` now and merge the result into the
+    /// tree: an entry that is still there keeps its node, and with it whatever
+    /// is loaded below; new entries appear and vanished ones go, in the new
+    /// listing's order. This is what a change on disk calls for.
+    ///
+    /// `reload` — forget the listing, re-read it when next rendered — left the
+    /// folder unloaded for the rest of the frame, and arrow-key navigation runs
+    /// before rendering: while files were being copied into the viewed folder
+    /// the selection could not be found in the tree and every key press was
+    /// dropped. It also threw away every expanded folder below, to be re-read.
+    ///
+    /// A no-op for a directory that is not loaded: it lists itself when opened.
+    /// One whose listing had failed is given its retry.
+    pub fn relist(&mut self, target: &Path) -> bool {
+        if self.path == target {
+            let NodeKind::Dir { children } = &mut self.kind else {
+                return false;
+            };
+            return match children {
+                DirChildren::Loaded(old) => {
+                    let old = std::mem::take(old);
+                    *children = match list_children(target) {
+                        DirChildren::Loaded(new) => DirChildren::Loaded(merge_children(old, new)),
+                        failed => failed,
+                    };
+                    true
+                }
+                DirChildren::Error(_) => {
+                    *children = DirChildren::Unloaded;
+                    true
+                }
+                DirChildren::Unloaded => false,
+            };
+        }
+        if !target.starts_with(&self.path) {
+            return false;
+        }
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        for child in children {
+            if target.starts_with(&child.path) && child.relist(target) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_dir(&self) -> bool {
+        matches!(self.kind, NodeKind::Dir { .. })
+    }
+
     fn child(path: PathBuf) -> Self {
         let name = path
             .file_name()
@@ -217,6 +273,20 @@ impl TreeNode {
         };
         Self { path, name, kind }
     }
+}
+
+/// Membership and order come from the new listing; a surviving entry keeps its
+/// old node (and so what is loaded below it) unless it flipped between file and
+/// folder. The remote tree merges its polled listings the same way.
+fn merge_children(old: Vec<TreeNode>, new: Vec<TreeNode>) -> Vec<TreeNode> {
+    let mut old_by_path: std::collections::HashMap<PathBuf, TreeNode> =
+        old.into_iter().map(|n| (n.path.clone(), n)).collect();
+    new.into_iter()
+        .map(|n| match old_by_path.remove(&n.path) {
+            Some(o) if o.is_dir() == n.is_dir() => o,
+            _ => n,
+        })
+        .collect()
 }
 
 fn is_visible(path: &Path) -> bool {
@@ -847,6 +917,85 @@ mod tests {
         assert!(!root.reload(Path::new("/r/zzz")));
         let mut unloaded = TreeNode::root(PathBuf::from("/r"));
         assert!(!unloaded.reload(Path::new("/r/sub")));
+    }
+
+    /// A tree over `root` with the root and `sub` listed, as after expanding both.
+    fn listed_tree(root: &Path) -> TreeNode {
+        let mut tree = TreeNode::root(root.to_path_buf());
+        tree.kind = NodeKind::Dir {
+            children: list_children(root),
+        };
+        let NodeKind::Dir {
+            children: DirChildren::Loaded(children),
+        } = &mut tree.kind
+        else {
+            panic!("root lists");
+        };
+        for child in children.iter_mut().filter(|c| c.is_dir()) {
+            child.kind = NodeKind::Dir {
+                children: list_children(&child.path),
+            };
+        }
+        tree
+    }
+
+    #[test]
+    fn relisting_merges_the_disk_into_the_tree_without_unloading_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        touch(&root.join("a.jpg"));
+        touch(&root.join("gone.jpg"));
+        touch(&root.join("sub").join("deep.png"));
+        let mut tree = listed_tree(root);
+
+        // An import in progress: a file arrives, another is removed.
+        touch(&root.join("new.jpg"));
+        fs::remove_file(root.join("gone.jpg")).unwrap();
+        assert!(tree.relist(root));
+
+        // Listed afresh, and at no point unloaded — so the arrow keys, which
+        // run before the tree is rendered, can still find their place in it.
+        // The expanded subfolder kept what it had loaded.
+        assert_eq!(
+            tree.collect_images(),
+            vec![
+                root.join("a.jpg"),
+                root.join("new.jpg"),
+                root.join("sub").join("deep.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn relisting_leaves_unopened_folders_alone_and_retries_failed_ones() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let mut tree = TreeNode::root(root.to_path_buf());
+        // Never opened: nothing to bring up to date.
+        assert!(!tree.relist(root));
+        assert!(matches!(
+            tree.kind,
+            NodeKind::Dir {
+                children: DirChildren::Unloaded
+            }
+        ));
+        // A listing that failed earlier gets another go at the next render.
+        tree.kind = NodeKind::Dir {
+            children: DirChildren::Error("denied".to_string()),
+        };
+        assert!(tree.relist(root));
+        assert!(matches!(
+            tree.kind,
+            NodeKind::Dir {
+                children: DirChildren::Unloaded
+            }
+        ));
+        // A folder that has meanwhile vanished becomes an error, not a panic.
+        let mut tree = listed_tree(root);
+        fs::remove_dir_all(root.join("sub")).unwrap();
+        assert!(tree.relist(&root.join("sub")));
     }
 
     #[test]
