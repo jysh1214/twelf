@@ -85,7 +85,7 @@ impl ImageLoader for DecodedImageLoader {
         let ctx_clone = ctx.clone();
         // Decode is CPU-bound; keep it off the async workers and the UI thread.
         self.handle.spawn_blocking(move || {
-            let decoded = decode_image(&uri_owned, bytes.as_ref());
+            let decoded = catching_panics(|| decode_image(&uri_owned, bytes.as_ref()));
             let mut state = state_clone.lock().unwrap();
             state.pending.remove(&uri_owned);
             match decoded {
@@ -124,6 +124,17 @@ impl ImageLoader for DecodedImageLoader {
     }
 }
 
+/// Run a decoder, turning a panic into an ordinary failure. Decoders meet files
+/// from anywhere, and the image and HEIC crates have panicked on malformed ones
+/// before. On the blocking pool tokio swallows the panic along with the rest of
+/// the task — the clean-up included, so the URI stayed `pending` for good: a
+/// spinner that never resolves, a prefetch slot never freed, and a repaint
+/// requested every frame. On the UI thread it simply ends the app.
+pub(crate) fn catching_panics<T>(decode: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
+        .unwrap_or_else(|_| Err("the decoder panicked".to_string()))
+}
+
 /// Whether this loader decodes `uri`; see `DecodedImageLoader`.
 fn handles(uri: &str) -> bool {
     uri.starts_with("sftp://") || (uri.starts_with("file://") && !crate::heic::is_heic(uri))
@@ -131,7 +142,7 @@ fn handles(uri: &str) -> bool {
 
 fn decode_image(uri: &str, bytes: &[u8]) -> Result<ColorImage, String> {
     if crate::heic::is_heic(uri) {
-        crate::heic::decode_bytes(bytes).map_err(|e| e.to_string())
+        crate::heic::decode_bytes(bytes)
     } else {
         use image::ImageDecoder as _;
         // `image::load_from_memory` never looks at the EXIF orientation, so a
@@ -217,6 +228,18 @@ mod tests {
         let portrait = decode_image("file:///a.jpg", &jpeg_with_orientation(6)).expect("decode");
         assert_eq!(portrait.size, [8, 16]);
         assert!(is_red(portrait[(4, 2)]) && is_blue(portrait[(4, 13)]));
+    }
+
+    #[test]
+    fn a_decoder_panic_is_a_failed_decode() {
+        let panicked: Result<ColorImage, String> = catching_panics(|| panic!("malformed chunk"));
+        assert_eq!(panicked.unwrap_err(), "the decoder panicked");
+        // Ordinary outcomes pass straight through.
+        assert_eq!(catching_panics(|| Ok::<_, String>(7)), Ok(7));
+        assert_eq!(
+            catching_panics(|| Err::<u8, _>("truncated".to_string())),
+            Err("truncated".to_string())
+        );
     }
 
     #[test]

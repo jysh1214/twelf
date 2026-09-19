@@ -282,7 +282,12 @@ fn build_animation(ctx: &egui::Context, uri: &str) -> AnimBuild {
 }
 
 fn animation_from_bytes(uri: &str, bytes: &[u8]) -> Option<crate::webp::Animation> {
-    let frames = crate::webp::decode_frames(bytes).ok()?;
+    // On the UI thread, so a decoder panic would end the app; caught, it just
+    // falls back to the still path, which is guarded the same way.
+    let frames = crate::decoded::catching_panics(|| {
+        crate::webp::decode_frames(bytes).map_err(|e| e.to_string())
+    })
+    .ok()?;
     if frames.len() <= 1 {
         return None;
     }
